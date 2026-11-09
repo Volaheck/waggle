@@ -62,6 +62,18 @@ describe("text helpers", () => {
     }
   });
 
+  it("lets a project's money-making through, but never amounts of money", () => {
+    for (const value of ["Merlin зарабатывает на приложениях в RuStore", "приложение уже приносит доход", "the app brings some income", "first paying users"]) {
+      expect(hasForbiddenTopic(value), value).toBe(false);
+    }
+    for (const value of ["потратил 500 долларов", "доход 50к рублей", "заработал $300", "€20 в месяц", "3 млн ₽", "spent 500 dollars", "made 200 USD"]) {
+      expect(hasForbiddenTopic(value), value).toBe(true);
+    }
+    for (const value of ["3 рубрики", "5 europeans", "версия 0.4", "в 2 раза быстрее", "150 агентов"]) {
+      expect(hasForbiddenTopic(value), value).toBe(false);
+    }
+  });
+
   it("extracts and normalizes urls", () => {
     expect(extractUrls("смотри https://github.com/example/atlas, и https://atlas.example.app/.")).toEqual(["https://github.com/example/atlas", "https://atlas.example.app/"]);
     expect(normalizeUrl("https://www.GitHub.com/x/y/?utm_source=tg")).toEqual({ norm: "github.com/x/y", domain: "github.com" });

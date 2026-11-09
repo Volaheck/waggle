@@ -10,17 +10,19 @@ export function normalizeValue(value: string): string {
 /**
  * Word stems matched from the start of a word, so «налог» does not fire on «аналог».
  * Words a tech chat uses in another sense stay out of both lists: health check, flutter doctor, tech debt, cost savings.
+ * How a project makes money is project news, so «доход», «заработок» and «income» are allowed;
+ * personal money (salaries, debts, savings) and any amount of money are not (see MONEY_AMOUNT).
  */
 const FORBIDDEN_STEMS = [
   "политик", "путин", "зеленск", "трамп", "войн", "всу", "мобилиз", "оппозиц", "санкци",
   "здоров", "болезн", "болеет", "диагноз", "лечени", "таблетк", "депресс", "терапи", "врач",
-  "зарплат", "доход", "ипотек", "налог", "сбережен", "заработ", "задолж",
+  "зарплат", "ипотек", "налог", "сбережен", "задолж",
   "девушк", "развод", "отношени", "свидани", "секс",
   "адрес", "улиц", "квартир", "прописк",
   "религи", "национальн", "ориентац",
   "politic", "putin", "zelensk", "mobiliz", "mobilis", "sanction",
   "illness", "disease", "diagnosis", "diagnosed", "medicat", "depression", "depressed", "therap", "hospital", "pregnan", "mental health",
-  "salar", "income", "mortgage",
+  "salar", "mortgage",
   "girlfriend", "boyfriend", "divorc", "sexual",
   "home address", "apartment",
   "religio", "nationalit", "ethnic",
@@ -37,8 +39,12 @@ const FORBIDDEN_PATTERN = new RegExp(
   "u",
 );
 
+/** An amount of money: «$500», «500 долларов», «50к рублей», «€20», «3 млн ₽». */
+const MONEY_AMOUNT =
+  /[$€£₽]\s?\d|\d[\d\s.,]*\s?(?:k|к|тыс\.?|млн|млрд)?\s?(?:[$€£₽]|руб(?:л|\.|(?!\p{L}))|р\.|долл|бакс|евро(?!\p{L})|usd(?!\p{L})|eur(?:os?)?(?!\p{L})|rub(?!\p{L})|dollars?|bucks)/iu;
+
 export function hasForbiddenTopic(value: string): boolean {
-  return FORBIDDEN_PATTERN.test(normalizeValue(value));
+  return FORBIDDEN_PATTERN.test(normalizeValue(value)) || MONEY_AMOUNT.test(value);
 }
 
 const URL_PATTERN = /\bhttps?:\/\/[^\s<>"'`)\]]+/gi;
