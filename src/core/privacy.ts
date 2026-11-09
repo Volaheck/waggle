@@ -40,6 +40,14 @@ const PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z 
 const KEYED_SECRET = /(?<![\p{L}\p{N}_])((?:[A-Za-z0-9]+_)*(?:api[_-]?key|token|secret|password|passwd|pwd)|пароль|токен)(\s*[:=]\s*)(?!\[)([\x21-\x7E]{8,})/giu;
 /** TON (EQ…/UQ…), Ethereum, Bitcoin (bc1…, 1…/3…) and TRON (T…) addresses: on-chain they show a balance and its whole history. */
 const WALLET = /\b(?:(?:EQ|UQ|Ef|Uf|kQ|0Q)[A-Za-z0-9_-]{46}|0x[0-9a-fA-F]{40}|bc1[02-9ac-hj-np-z]{25,71}|[13T][1-9A-HJ-NP-Za-km-z]{25,34})(?![A-Za-z0-9_-])/gu;
+/**
+ * A full name with a patronymic next to a date («Иванов Пётр Сергеевич 03.04.1990»): the core of a doxxing post,
+ * the kind people-lookup services print. A name with a patronymic alone, or a date alone, stays.
+ */
+const NAME_AND_DATE = /(?<!\p{L})((?:[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?[ \u00A0]+){2}[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)[ \u00A0]*(?:,|г\.р\.|—|-)?[ \u00A0]*\d{1,2}\.\d{1,2}\.(?:19|20)\d{2}(?!\d)/gu;
+const PATRONYMIC = /(?:ович|евич|ич|овна|евна|ична|инична)$/u;
+/** «дата рождения: 03.04.1990», «д.р. 03.04.1990». */
+const BIRTH_DATE = /((?:дата рождения|д\.[ \u00A0]?р\.|date of birth|DOB|born)[ \u00A0]*[:\-—]?[ \u00A0]*)\d{1,2}[./]\d{1,2}[./](?:19|20)\d{2}/giu;
 const EMAIL = /(?<![\p{L}\p{N}._%+-])[\p{L}\p{N}._%+-]+@[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)*\.\p{L}{2,}/gu;
 const IBAN = /\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b/gu;
 /**
@@ -98,9 +106,15 @@ function maskKeyedSecret(whole: string, key: string, separator: string, value: s
   return looksLikeOne ? `${key}${separator}[secret]${value.slice(secret.length)}` : whole;
 }
 
+function maskNameAndDate(whole: string, name: string): string {
+  return name.split(/[ \u00A0]+/u).some((word) => PATRONYMIC.test(word)) ? "[person]" : whole;
+}
+
 function maskPlainText(text: string): string {
   return text
     .replace(PRIVATE_KEY, "[secret]")
+    .replace(NAME_AND_DATE, maskNameAndDate)
+    .replace(BIRTH_DATE, "$1[birthdate]")
     .replace(CONTACT_PLAIN, "[phone]")
     .replace(SECRET, "[secret]")
     .replace(KEYED_SECRET, maskKeyedSecret)

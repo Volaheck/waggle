@@ -277,6 +277,8 @@ describe("masking personal data before a prompt", () => {
       ["-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjEAAAAA -----END OPENSSH PRIVATE KEY----- ок", "[secret] ок"],
       ["тел-89161234567, ИНН-770708389312, счёт-40817810099910004312", "тел-[phone], ИНН-[number], счёт-[number]"],
       ["card-4111 1111 1111 1111 и WhatsApp-79161234567", "card-[card] и WhatsApp-[phone]"],
+      ["пробили: Иванов Пётр Сергеевич 03.04.1990, телефон 79161234567", "пробили: [person], телефон [phone]"],
+      ["дата рождения: 03.04.1990, д.р. 3.4.1990", "дата рождения: [birthdate], д.р. [birthdate]"],
     ];
     for (const [text, masked] of cases) expect(maskPersonalData(text)).toBe(masked);
   });
@@ -289,6 +291,7 @@ describe("masking personal data before a prompt", () => {
       "Наша группа https://t.me/+5bX9kLmN2pQrStUv и чат по номеру не публикуем",
       "Релиз 2026-11-20 18:00, лог 2026-11-09 10:36:05, считаем 1 2 3 4 5 6 7 8 9 10, бюджет 15 000 000 000",
       "Главный ключ: JavaScript и TypeScript, token: Ethereum, хэштег 3dprintingenthusiastsforever",
+      "Даниил Константинович написал 09.11.2026, встреча Иван Петров 10.11.2026",
       "https://medium.com/@author/post, v1.2.3, 3.14159265358979, 10.0.19045.1234, claude-sonnet-4-5-20250929, claude-3-5-sonnet-20241022",
     ]) {
       expect(maskPersonalData(text)).toBe(text);
