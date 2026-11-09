@@ -131,7 +131,9 @@ function upgradeOf(error: unknown, fallbackChatId?: number): { from: number; to:
 
 export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: MembershipCache; assistant?: Assistant } {
   const { sql, config } = deps;
-  const assistant = deps.anthropic ? createAssistant({ sql, anthropic: deps.anthropic, config, limits: deps.answerLimits }) : undefined;
+  // Answers are off without a key or with a zero cap; a mention then gets the help text instead.
+  const assistant =
+    deps.anthropic && config.REPLIES_MONTHLY_BUDGET_USD > 0 ? createAssistant({ sql, anthropic: deps.anthropic, config, limits: deps.answerLimits }) : undefined;
   const bot = new Bot<BotContext>(config.BOT_TOKEN);
   const membership = new MembershipCache(bot.api);
   const kit = createKit(bot, sql, config, membership);
@@ -376,7 +378,7 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
         const user = person ? await kit.identity(person, chatId) : undefined;
         if (!isCommand) {
           const replied = realReply(message);
-          await saveMessage(sql, {
+          const isNew = await saveMessage(sql, {
             chatId,
             msgId: message.message_id,
             userId: user?.id ?? null,
@@ -389,7 +391,8 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
             mediaType: mediaTypeOf(message),
           });
           // A member who mentions the bot or replies to it gets an answer, in the background (see assistant.ts).
-          if (assistant && person && !message.forward_origin && isAddressedToBot(message, ctx.me)) {
+          // A redelivered update must not buy a second answer.
+          if (assistant && isNew && person && !message.forward_origin && isAddressedToBot(message, ctx.me)) {
             assistant.answer(ctx.api, { chatId, chatTitle: ctx.chat.title ?? null, message, from: person, me: ctx.me });
           }
         }
@@ -589,7 +592,7 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
       return;
     }
     const username = bot.botInfo.username;
-    if (text.toLowerCase().includes(`@${username.toLowerCase()}`)) await kit.show(ctx, HELP_TEXT);
+    if (!assistant && text.toLowerCase().includes(`@${username.toLowerCase()}`)) await kit.show(ctx, HELP_TEXT);
   });
 
   // Registered last: a button from an older version (or a removed feature) gets an answer instead of an endless spinner.

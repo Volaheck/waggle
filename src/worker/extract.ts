@@ -216,7 +216,7 @@ export function isPassDue(pending: PendingStats, lastRunAt: Date | null, interva
 
 const skippedKey = (chatId: number) => `extraction_skipped:${chatId}`;
 
-async function skippedMessageIds(sql: Sql, chatId: number): Promise<number[]> {
+export async function skippedMessageIds(sql: Sql, chatId: number): Promise<number[]> {
   const [state] = await sql<{ value: { msg_ids?: number[] } }[]>`SELECT value FROM app_state WHERE key = ${skippedKey(chatId)}`;
   return state?.value.msg_ids ?? [];
 }

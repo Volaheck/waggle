@@ -10,6 +10,7 @@ import { maskPersonalData } from "../core/privacy.js";
 import { listProjects } from "../core/projects.js";
 import { truncate } from "../core/text.js";
 import { peopleOfChat } from "../core/users.js";
+import { skippedMessageIds } from "../worker/extract.js";
 import { chatBudgetUsd } from "../worker/scheduler.js";
 import { realReply } from "./kit.js";
 
@@ -59,6 +60,10 @@ const REQUEST_TIMEOUT_MS = 60_000;
 /** One person, one answer per this interval: what they write meanwhile waits and is answered together after it. */
 const PER_MEMBER_GAP_MS = 4_000;
 const PER_CHAT_PER_HOUR = 20;
+/** One member cannot take the whole chat's hour. */
+const PER_MEMBER_PER_HOUR = 6;
+/** Refusals for different members in one chat within an hour: the cause is in the shared context, so the chat waits. */
+const CHAT_REFUSALS_BEFORE_SILENCE = 2;
 /** After the model refused someone, their mentions are ignored for this long. */
 const REFUSAL_COOLDOWN_MS = 60 * 60_000;
 /** Notes like "the budget is used up" are said at most this often per chat. */
@@ -81,6 +86,8 @@ const PAUSED_NOTE = "⏸ I'm paused in this chat until a bot owner resumes me.";
 const REFUSED_NOTE = "🐝 I'll pass on this one.";
 const FAILED_NOTE = "🐝 Something went wrong on my side; try again a bit later.";
 const BUSY_NOTE = "🐝 I've answered a lot here this hour; ask me again a little later.";
+const MEMBER_BUSY_NOTE = "🐝 That's plenty of questions from you for this hour; the hive needs a breather.";
+const CHAT_BUDGET_NOTE = "🐝 This chat's AI budget is used up for this month, so I'll be quiet until next month.";
 
 export interface AssistantDeps {
   sql: Sql;
@@ -131,13 +138,20 @@ export function questionText(message: Message, me: UserFromGetMe): string {
   return text.replace(new RegExp(`@${me.username}\\b`, "gi"), "").replace(/\s+/g, " ").trim();
 }
 
+/** Text from members can't open or close a section of the prompt. */
+function safe(text: string): string {
+  return text.replace(/</g, "‹").replace(/>/g, "›");
+}
+
 function line(text: string, max: number): string {
-  return truncate(maskPersonalData(text.replace(/\s+/g, " ").trim()), max);
+  return safe(truncate(maskPersonalData(text.replace(/\s+/g, " ").trim()), max));
 }
 
 /** Everything the app knows about the chat, as the reply prompt's data. */
 export async function buildReplyContext(sql: Sql, question: Question, timezone: string, recentAnswers: RecentAnswer[] = []): Promise<string> {
   const { chatId, message, me } = question;
+  // Messages the chronicler skipped because the model refused them are kept out here too.
+  const skipped = await skippedMessageIds(sql, chatId);
   const [people, facts, projects, chronicle, recent] = await Promise.all([
     peopleOfChat(sql, chatId),
     sql<{ user_id: number; kind: string; value: string }[]>`
@@ -152,7 +166,8 @@ export async function buildReplyContext(sql: Sql, question: Question, timezone: 
     sql<{ msg_id: number; text: string; media_type: string | null; reply_to_bot: boolean; reply_to_msg_id: number | null; display_name: string | null }[]>`
       SELECT m.msg_id, m.text, m.media_type, m.reply_to_bot, m.reply_to_msg_id, u.display_name
       FROM messages m LEFT JOIN users u ON u.id = m.user_id
-      WHERE m.chat_id = ${chatId} AND m.msg_id < ${message.message_id} AND (btrim(m.text) <> '' OR m.media_type IS NOT NULL)
+      WHERE m.chat_id = ${chatId} AND m.msg_id < ${message.message_id} AND m.msg_id <> ALL(${skipped}::bigint[])
+        AND (btrim(m.text) <> '' OR m.media_type IS NOT NULL)
       ORDER BY m.msg_id DESC LIMIT ${CONTEXT_MESSAGES}`,
   ]);
 
@@ -164,21 +179,21 @@ export async function buildReplyContext(sql: Sql, question: Question, timezone: 
   }
   // peopleOfChat lists the most recently active first.
   const members = people.slice(0, MAX_MEMBERS).map((person) => {
-    const who = `${person.display_name}${person.username ? ` (@${person.username})` : ""}`;
+    const who = safe(`${person.display_name}${person.username ? ` (@${person.username})` : ""}`);
     if (person.opted_out) return `- ${who}: asked not to collect anything about them`;
     let room = MAX_FACTS_PER_MEMBER;
     const card = [...(factsOf.get(person.id) ?? new Map<string, string[]>())].flatMap(([kind, values]) => {
       const kept = values.slice(0, Math.max(0, room));
       room -= kept.length;
-      return kept.length ? [`${kind.replace("_", " ")}: ${kept.join(", ")}`] : [];
+      return kept.length ? [`${kind.replace("_", " ")}: ${safe(kept.join(", "))}`] : [];
     });
-    return `- ${who}${person.tagline ? ` — ${person.tagline}` : ""}${card.length ? ` | ${card.join("; ")}` : ""}`;
+    return `- ${who}${person.tagline ? ` — ${safe(person.tagline)}` : ""}${card.length ? ` | ${card.join("; ")}` : ""}`;
   });
 
   const catalog = projects.slice(0, MAX_PROJECTS).map((project, index) => {
     const links = [project.links.repo, project.links.site, ...(project.links.other ?? [])].filter(Boolean).join(" ");
     const signals = project.recent_signals.map((signal) => signal.note).slice(0, 3);
-    return [
+    return safe([
       `${index + 1}. ${project.name} — ${project.status.replace("_", " ")}, ${project.score} rating points, ${project.votes} vote(s)`,
       project.authors.length ? `by ${project.authors.map((author) => author.display_name).join(", ")}` : "",
       project.tagline ? `“${project.tagline}”` : "",
@@ -187,31 +202,31 @@ export async function buildReplyContext(sql: Sql, question: Question, timezone: 
       signals.length ? `recent: ${signals.join("; ")}` : "",
     ]
       .filter(Boolean)
-      .join("; ");
+      .join("; "));
   });
 
   const day = (date: Date) => date.toLocaleDateString("en-CA", { timeZone: timezone });
-  const topics = chronicle.map((entry) => `- ${day(entry.period_to)}: ${entry.title} — ${entry.summary}`);
+  const topics = chronicle.map((entry) => `- ${day(entry.period_to)}: ${safe(`${entry.title} — ${entry.summary}`)}`);
   const latest = recent
     .reverse()
-    .map((row) => `[${row.msg_id}] ${row.display_name ?? "someone"}${row.reply_to_bot ? " ↩Waggle" : row.reply_to_msg_id ? ` ↩${row.reply_to_msg_id}` : ""}${row.media_type ? ` [${row.media_type}]` : ""}: ${line(row.text, 500)}`);
+    .map((row) => `[${row.msg_id}] ${safe(row.display_name ?? "someone")}${row.reply_to_bot ? " ↩Waggle" : row.reply_to_msg_id ? ` ↩${row.reply_to_msg_id}` : ""}${row.media_type ? ` [${row.media_type}]` : ""}: ${line(row.text, 500)}`);
 
   const replied = realReply(message);
   const repliedToBot = replied?.from?.id === me.id ? (replied.text ?? replied.caption ?? "") : "";
   const asker = `${question.from.first_name}${question.from.last_name ? ` ${question.from.last_name}` : ""}${question.from.username ? ` (@${question.from.username})` : ""}`;
 
   return [
-    `<chat title="${(question.chatTitle ?? "").replace(/"/g, "'")}" today="${day(new Date())}" />`,
+    `<chat title="${safe(question.chatTitle ?? "").replace(/"/g, "'")}" today="${day(new Date())}" />`,
     `<members>\n${members.join("\n") || "(none yet)"}\n</members>`,
     `<projects rating="best first">\n${catalog.join("\n") || "(none yet)"}\n</projects>`,
     `<chronicle days="${CHRONICLE_DAYS}" order="newest first">\n${topics.join("\n") || "(nothing yet)"}\n</chronicle>`,
     `<recent_messages>\n${latest.join("\n") || "(none)"}\n</recent_messages>`,
     recentAnswers.length
-      ? `<your_recent_answers>\n${recentAnswers.map((answer) => `- to ${answer.to}: ${line(answer.text, 600)}`).join("\n")}\n</your_recent_answers>`
+      ? `<your_recent_answers>\n${recentAnswers.map((answer) => `- to ${safe(answer.to)}: ${line(answer.text, 600)}`).join("\n")}\n</your_recent_answers>`
       : "",
     repliedToBot ? `<your_message_they_reply_to>\n${line(repliedToBot, 1500)}\n</your_message_they_reply_to>` : "",
     `<if_insulted motif="${INSULT_MOTIFS[Math.floor(Math.random() * INSULT_MOTIFS.length)]}" />`,
-    `<question from="${asker.replace(/"/g, "'")}">\n${line(questionText(message, me), 1500)}\n</question>`,
+    `<question from="${safe(asker).replace(/"/g, "'")}">\n${line(questionText(message, me), 1500)}\n</question>`,
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -233,6 +248,8 @@ export function createAssistant(deps: AssistantDeps): Assistant {
   const refusedUntil = new Map<string, number>();
   const lastNoteAt = new Map<string, number>();
   const answersIn = new Map<number, RecentAnswer[]>();
+  const memberAnswers = new Map<string, number[]>();
+  const chatRefusals = new Map<number, number[]>();
 
   const noteOnce = (key: string, interval: number) => {
     const now = Date.now();
@@ -248,48 +265,71 @@ export function createAssistant(deps: AssistantDeps): Assistant {
   const waiting = new Map<string, Question>();
 
   /** Takes a slot for an answer, or says why there is none. The gap between one member's answers is kept by the queue. */
-  const takeSlot = (chatId: number, memberKey: string): "ok" | "refused" | "busy" => {
+  const takeSlot = (chatId: number, memberKey: string): "ok" | "refused" | "busy" | "member-busy" => {
     const now = Date.now();
-    if ((refusedUntil.get(memberKey) ?? 0) > now) return "refused";
+    if ((refusedUntil.get(memberKey) ?? 0) > now || (refusedUntil.get(`chat:${chatId}`) ?? 0) > now) return "refused";
+    const mine = (memberAnswers.get(memberKey) ?? []).filter((at) => now - at < HOUR_MS);
+    if (mine.length >= PER_MEMBER_PER_HOUR) return "member-busy";
     const recent = (chatAnswers.get(chatId) ?? []).filter((at) => now - at < HOUR_MS);
     if (recent.length >= chatPerHour) return "busy";
     recent.push(now);
     chatAnswers.set(chatId, recent);
+    mine.push(now);
+    memberAnswers.set(memberKey, mine);
     lastAnswerAt.set(memberKey, now);
     return "ok";
+  };
+
+  /** A refusal silences the member for a while; refusals for several members silence the chat (the cause is shared). */
+  const noteRefusal = (chatId: number, memberKey: string) => {
+    const now = Date.now();
+    refusedUntil.set(memberKey, now + REFUSAL_COOLDOWN_MS);
+    const refusals = [...(chatRefusals.get(chatId) ?? []).filter((at) => now - at < HOUR_MS), now];
+    chatRefusals.set(chatId, refusals);
+    if (refusals.length >= CHAT_REFUSALS_BEFORE_SILENCE) refusedUntil.set(`chat:${chatId}`, now + REFUSAL_COOLDOWN_MS);
   };
 
   const handle = async (api: Api, question: Question) => {
     const { chatId, message, from, me } = question;
     const memberKey = `${chatId}:${from.id}`;
+    // In a forum topic the answer, the typing indicator and any note stay in the member's topic.
+    const thread = message.is_topic_message && message.message_thread_id ? { message_thread_id: message.message_thread_id } : {};
     const send = (text: string) =>
-      api.sendMessage(chatId, text, { reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true }, link_preview_options: { is_disabled: true } });
+      api.sendMessage(chatId, text, {
+        ...thread,
+        reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
+        link_preview_options: { is_disabled: true },
+      });
 
-    if (config.REPLIES_MONTHLY_BUDGET_USD <= 0) return;
-    if (!questionText(message, me)) {
-      if (takeSlot(chatId, memberKey) === "ok") await send(GREETING);
-      return;
-    }
     const chat = await getChat(sql, chatId);
     if (!chat || chat.status !== "approved") return;
     if (chat.chronicle_paused_at) {
       if (noteOnce(`paused:${chatId}`, PAUSED_NOTE_INTERVAL_MS)) await send(PAUSED_NOTE);
       return;
     }
+    if (!questionText(message, me)) {
+      // Only a bare mention is greeted, once an hour per member; a sticker or a GIF in reply to the bot is not a question.
+      if (!realReply(message) && noteOnce(`greet:${memberKey}`, HOUR_MS)) await send(GREETING);
+      return;
+    }
     const slot = takeSlot(chatId, memberKey);
-    // A member the model refused gets silence; a busy chat hears once why it waits.
+    // A member the model refused gets silence; a busy chat or a member who asked a lot hears once why they wait.
     if (slot === "busy" && noteOnce(`busy:${chatId}`, HOUR_MS)) await send(BUSY_NOTE);
+    if (slot === "member-busy" && noteOnce(`member-busy:${memberKey}`, HOUR_MS)) await send(MEMBER_BUSY_NOTE);
     if (slot !== "ok") return;
-    try {
-      if ((await repliesSpendUsd(sql)) >= config.REPLIES_MONTHLY_BUDGET_USD) throw new BudgetExceededError(0, config.REPLIES_MONTHLY_BUDGET_USD);
-      await assertBudget(sql, config.MONTHLY_LLM_BUDGET_USD, { id: chatId, limitUsd: chatBudgetUsd(chat, config.CHAT_MONTHLY_BUDGET_USD) });
-    } catch (error) {
-      if (!(error instanceof BudgetExceededError)) throw error;
+    if ((await repliesSpendUsd(sql)) >= config.REPLIES_MONTHLY_BUDGET_USD) {
       if (noteOnce(`budget:${chatId}`, NOTE_INTERVAL_MS)) await send(BUDGET_NOTE);
       return;
     }
+    try {
+      await assertBudget(sql, config.MONTHLY_LLM_BUDGET_USD, { id: chatId, limitUsd: chatBudgetUsd(chat, config.CHAT_MONTHLY_BUDGET_USD) });
+    } catch (error) {
+      if (!(error instanceof BudgetExceededError)) throw error;
+      if (noteOnce(`budget:${chatId}`, NOTE_INTERVAL_MS)) await send(CHAT_BUDGET_NOTE);
+      return;
+    }
 
-    await api.sendChatAction(chatId, "typing").catch(() => {});
+    await api.sendChatAction(chatId, "typing", thread).catch(() => {});
     const context = await buildReplyContext(sql, question, config.DISPLAY_TIMEZONE, answersIn.get(chatId) ?? []);
     const response = await anthropic.messages.create(
       {
@@ -304,7 +344,7 @@ export function createAssistant(deps: AssistantDeps): Assistant {
     );
     await recordUsage(sql, "reply", config.REPLY_MODEL, response.usage, chatId);
     if (response.stop_reason === "refusal") {
-      refusedUntil.set(memberKey, Date.now() + REFUSAL_COOLDOWN_MS);
+      noteRefusal(chatId, memberKey);
       log(`[reply] ${chat.title ?? chatId}: the model refused (msg ${message.message_id})`);
       await send(REFUSED_NOTE);
       return;
@@ -319,8 +359,10 @@ export function createAssistant(deps: AssistantDeps): Assistant {
   const answerOne = (api: Api, question: Question) =>
     handle(api, question).catch(async (error: unknown) => {
       log(`[reply] chat ${question.chatId}: ${error instanceof Error ? error.message : String(error)}`);
+      const { message } = question;
+      const thread = message.is_topic_message && message.message_thread_id ? { message_thread_id: message.message_thread_id } : {};
       await api
-        .sendMessage(question.chatId, FAILED_NOTE, { reply_parameters: { message_id: question.message.message_id, allow_sending_without_reply: true } })
+        .sendMessage(question.chatId, FAILED_NOTE, { ...thread, reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true } })
         .catch(() => {});
     });
 

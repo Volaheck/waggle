@@ -27,8 +27,9 @@ export interface StoredMessage {
   media_type: string | null;
 }
 
-export async function saveMessage(sql: Sql, message: IncomingMessage): Promise<void> {
-  await sql`
+/** Returns false when the message was stored already (Telegram delivered the update again). */
+export async function saveMessage(sql: Sql, message: IncomingMessage): Promise<boolean> {
+  const inserted = await sql`
     INSERT INTO messages (chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, reply_to_bot, is_forward, forward_source, media_type)
     VALUES (${message.chatId}, ${message.msgId}, ${message.userId}, ${message.sentAt}, ${message.text},
             ${message.replyToMsgId}, ${message.replyToBot ?? false}, ${message.isForward}, ${message.forwardSource}, ${message.mediaType})
@@ -42,6 +43,7 @@ export async function saveMessage(sql: Sql, message: IncomingMessage): Promise<v
           first_seen_at = least(coalesce(members.first_seen_at, excluded.first_seen_at), excluded.first_seen_at),
           left_at = NULL`;
   }
+  return inserted.count > 0;
 }
 
 export async function updateEditedMessage(sql: Sql, chatId: number, msgId: number, text: string, editedAt: Date): Promise<void> {

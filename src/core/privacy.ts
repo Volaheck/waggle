@@ -45,10 +45,9 @@ const IBAN = /\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b/gu;
 /**
  * A run of digits, or digit groups joined by single spaces, dashes or brackets, with an optional leading +.
  * Dots, colons and commas do not join groups, so dates, times, versions and decimals are left alone. A run right
- * after a letter or a slash is part of a word or a path, after «1.» part of a decimal and after «sonnet-» part of an
- * identifier (claude-sonnet-4-5-20250929); after «тел.» it is not.
+ * after a letter or a slash is part of a word or a path, and after «1.» part of a decimal; after «тел.» or «тел-» it is not.
  */
-const DIGIT_RUN = /(?<![\p{L}\p{N}_@#/])(?<!\d\.)(?<!\p{L}-)\+?(?:\(\d+\)|\d+)(?:[   -]?(?:\(\d+\)|\d+))*/gu;
+const DIGIT_RUN = /(?<![\p{L}\p{N}_@#/])(?<!\d\.)\+?(?:\(\d+\)|\d+)(?:[   -]?(?:\(\d+\)|\d+))*/gu;
 
 /** Shorter numbers are amounts, counts, years and local extensions: nothing to protect, and the chronicle may need them. */
 const LONG_NUMBER_DIGITS = 10;
@@ -56,6 +55,8 @@ const LONG_NUMBER_DIGITS = 10;
 const YEARS = /^(?:(?:19|20)\d{2}[   -]?)+$/u;
 /** «2026-11-20 18» of «2026-11-20 18:00»: a date and an hour. */
 const DATE_AND_HOUR = /^\d{4}-\d{2}-\d{2}(?:[   ]\d{1,2})?$/u;
+/** «4-5-20250929» of claude-sonnet-4-5-20250929: a model's version and release date. */
+const VERSION_AND_DATE = /^\d{1,2}(?:-\d{1,2})*-(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])$/u;
 /** «1 2 3 4 5», «1 000 000 000»: a list or an amount; no document or account number is written in groups this short. */
 const SMALL_SPACED_NUMBERS = /^\d{1,3}(?:[   ]\d{1,3})+$/u;
 
@@ -74,7 +75,7 @@ function passesLuhn(digits: string): boolean {
 
 function maskDigits(run: string): string {
   const digits = run.replace(/\D/g, "");
-  if (digits.length < LONG_NUMBER_DIGITS || YEARS.test(run) || DATE_AND_HOUR.test(run)) return run;
+  if (digits.length < LONG_NUMBER_DIGITS || YEARS.test(run) || DATE_AND_HOUR.test(run) || VERSION_AND_DATE.test(run)) return run;
   if (run.startsWith("+") || run.includes("(")) return digits.length <= 15 ? "[phone]" : "[number]";
   if ((digits.length === 11 && /^[78]/.test(digits)) || (digits.length === 10 && digits.startsWith("9"))) return "[phone]";
   if (SMALL_SPACED_NUMBERS.test(run)) return run;

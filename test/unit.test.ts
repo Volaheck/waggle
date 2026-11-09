@@ -275,6 +275,8 @@ describe("masking personal data before a prompt", () => {
       ["password: hunter2abc, API_KEY=abc123def456ghi. пароль: qwerty123!", "password: [secret], API_KEY=[secret]. пароль: [secret]!"],
       ["AIzaSyD-1234567890abcdefghijklmnopqrstu", "[secret]"],
       ["-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjEAAAAA -----END OPENSSH PRIVATE KEY----- ок", "[secret] ок"],
+      ["тел-89161234567, ИНН-770708389312, счёт-40817810099910004312", "тел-[phone], ИНН-[number], счёт-[number]"],
+      ["card-4111 1111 1111 1111 и WhatsApp-79161234567", "card-[card] и WhatsApp-[phone]"],
     ];
     for (const [text, masked] of cases) expect(maskPersonalData(text)).toBe(masked);
   });
@@ -287,7 +289,7 @@ describe("masking personal data before a prompt", () => {
       "Наша группа https://t.me/+5bX9kLmN2pQrStUv и чат по номеру не публикуем",
       "Релиз 2026-11-20 18:00, лог 2026-11-09 10:36:05, считаем 1 2 3 4 5 6 7 8 9 10, бюджет 15 000 000 000",
       "Главный ключ: JavaScript и TypeScript, token: Ethereum, хэштег 3dprintingenthusiastsforever",
-      "https://medium.com/@author/post, v1.2.3, 3.14159265358979, 10.0.19045.1234, claude-sonnet-4-5-20250929",
+      "https://medium.com/@author/post, v1.2.3, 3.14159265358979, 10.0.19045.1234, claude-sonnet-4-5-20250929, claude-3-5-sonnet-20241022",
     ]) {
       expect(maskPersonalData(text)).toBe(text);
     }
