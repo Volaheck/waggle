@@ -99,7 +99,7 @@ describe("the chronicler's two calls", () => {
       expect(EXTRACTION_SYSTEM_PROMPT).not.toContain(kind);
     }
     expect(EXTRACTION_SYSTEM_PROMPT).not.toMatch(/alias|private note/i);
-    expect(NOTES_SYSTEM_PROMPT).toContain('about is "consent"');
+    expect(NOTES_SYSTEM_PROMPT).toContain('with about "consent"');
     expect(NOTES_SYSTEM_PROMPT).toContain("Aliases (aliases)");
     expect(NOTES_SYSTEM_PROMPT).toContain("its id (d4)");
   });

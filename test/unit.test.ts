@@ -6,7 +6,7 @@ import { rankCards } from "../src/core/merge.js";
 import { assistantNote, replyEffort, replySystemPrompt } from "../src/bot/assistant.js";
 import { buildExtractionPrompt, EXTRACTION_SYSTEM_PROMPT, isPassDue } from "../src/worker/extract.js";
 import { CONSOLIDATION_SYSTEM_PROMPT } from "../src/worker/consolidate.js";
-import { NOTES_SYSTEM_PROMPT } from "../src/worker/notes-extract.js";
+import { NOTES_SYSTEM_PROMPT, namesForRefs } from "../src/worker/notes-extract.js";
 import { factCore, isNearDuplicate, isSameFact } from "../src/core/facts.js";
 import { detectLanguage } from "../src/core/language.js";
 import { maskPersonalData } from "../src/core/privacy.js";
@@ -355,5 +355,17 @@ describe("answer prompt", () => {
     expect(assistantNote("English", "memberBusy")).toContain("breather");
     expect(assistantNote(null, "refused")).toBe("🐝 I'll pass on this one.");
     expect(assistantNote("Ukrainian", "busy")).toContain("ask me again");
+  });
+});
+
+describe("notes written by the model", () => {
+  it("name people instead of participant refs, and file objections to being read as consent", () => {
+    const users = new Map([[7, { display_name: "Kit" }], [12, { display_name: "Gleb" }]]);
+    expect(namesForRefs("u7 teased u12 about u99", users)).toBe("Kit teased Gleb about u99");
+    expect(namesForRefs(null, users)).toBeNull();
+    expect(namesForRefs("menu12 stays", users)).toBe("menu12 stays");
+    expect(NOTES_SYSTEM_PROMPT).toContain("never by refs like u7");
+    expect(NOTES_SYSTEM_PROMPT).toContain("old history included, is about_bot with about \"consent\", never a stance");
+    expect(NOTES_SYSTEM_PROMPT).toContain("never their job, employer or a change of profession");
   });
 });
