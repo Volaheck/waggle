@@ -26,6 +26,8 @@ export interface Chat {
   chronicle_resumed_at: Date | null;
   /** Whether the bot may speak up uninvited here; an owner turns it off. */
   interjections: boolean;
+  /** Whether the bot suggests an improvement to itself here once a week (src/worker/ideas.ts); an owner turns it off. */
+  ideas: boolean;
 }
 
 /** Rows imported before multi-chat support carry this chat id until an owner attaches them. */
@@ -75,6 +77,12 @@ export async function resumeChronicle(sql: Sql, chatId: number): Promise<boolean
 /** An owner lets the bot speak up uninvited in a chat, or stops it; undefined for an unknown chat. */
 export async function setInterjections(sql: Sql, chatId: number, on: boolean): Promise<Chat | undefined> {
   const [chat] = await sql<Chat[]>`UPDATE chats SET interjections = ${on} WHERE id = ${chatId} RETURNING *`;
+  return chat;
+}
+
+/** An owner lets the bot post its weekly idea in a chat, or stops it; undefined for an unknown chat. */
+export async function setIdeas(sql: Sql, chatId: number, on: boolean): Promise<Chat | undefined> {
+  const [chat] = await sql<Chat[]>`UPDATE chats SET ideas = ${on} WHERE id = ${chatId} RETURNING *`;
   return chat;
 }
 

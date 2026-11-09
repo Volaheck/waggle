@@ -149,6 +149,7 @@ async function moveChatData(tx: Queryable, from: number, to: number): Promise<Ch
 
   // The gaps and the daily cap of the bot's interjections go on counting under the new id.
   await tx`UPDATE interjections SET chat_id = ${to}, msg_id = ${shiftedId(tx, "msg_id")} WHERE chat_id = ${from}`;
+  await tx`UPDATE ideas SET chat_id = ${to}, msg_id = ${shiftedId(tx, "msg_id")}, evidence_msg_ids = ${shiftedIds(tx, "evidence_msg_ids")} WHERE chat_id = ${from}`;
   await tx`UPDATE llm_usage SET chat_id = ${to} WHERE chat_id = ${from}`;
   await tx`UPDATE users SET current_chat_id = ${to} WHERE current_chat_id = ${from}`;
 
