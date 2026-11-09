@@ -1,0 +1,51 @@
+[
+  {
+    "slug": "atlas",
+    "name": "Atlas",
+    "tagline": "Minimal habit tracker for iOS",
+    "status": "запущен",
+    "stack": ["Swift", "SwiftUI"],
+    "links": { "repo": "https://github.com/anna-dev-example/atlas", "site": null, "other": [] },
+    "authors": ["Anna Petrova"],
+    "source_msg_ids": [],
+    "first_seen_msg_id": null,
+    "confidence": 1
+  },
+  {
+    "slug": "pixel-chess",
+    "name": "Pixel Chess",
+    "tagline": "Online chess with pixel-art boards",
+    "status": "в работе",
+    "stack": ["Go", "PostgreSQL"],
+    "links": { "repo": null, "site": "https://pixel-chess.example.com", "other": [] },
+    "authors": ["Mike"],
+    "source_msg_ids": [],
+    "first_seen_msg_id": null,
+    "confidence": 1
+  },
+  {
+    "slug": "dreamforge",
+    "name": "Dreamforge",
+    "tagline": "Cosy exploration game with hand-made islands",
+    "status": "в работе",
+    "stack": ["Unity", "Blender"],
+    "links": { "repo": null, "site": null, "other": [] },
+    "authors": ["Sam", "Lena"],
+    "author_roles": { "Sam": "code", "Lena": "art" },
+    "source_msg_ids": [],
+    "first_seen_msg_id": null,
+    "confidence": 1
+  },
+  {
+    "slug": "lighthouse",
+    "name": "Lighthouse",
+    "tagline": "Design system starter kit",
+    "status": "идея",
+    "stack": ["Figma"],
+    "links": { "repo": null, "site": null, "other": [] },
+    "authors": ["Kate"],
+    "source_msg_ids": [],
+    "first_seen_msg_id": null,
+    "confidence": 1
+  }
+]

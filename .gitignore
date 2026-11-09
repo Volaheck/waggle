@@ -1,0 +1,11 @@
+node_modules
+web/node_modules
+dist
+web/dist
+.env
+backups
+
+# Real community data (members' cards, catalog, notes) never goes to git.
+private/
+seed/*.json
+!seed/example-*.json

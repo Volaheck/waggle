@@ -1,0 +1,56 @@
+[
+  {
+    "display_name": "Anna Petrova",
+    "username": "anna_dev",
+    "tagline": "iOS developer who ships small, polished apps",
+    "facts": [
+      { "kind": "role", "value": "iOS developer", "confidence": 0.9, "source_msg_ids": [] },
+      { "kind": "stack", "value": "Swift", "confidence": 0.9, "source_msg_ids": [] },
+      { "kind": "stack", "value": "Claude", "confidence": 0.8, "source_msg_ids": [] },
+      { "kind": "expertise", "value": "App Store releases", "confidence": 0.8, "source_msg_ids": [] },
+      { "kind": "interest", "value": "bouldering", "confidence": 0.7, "source_msg_ids": [] },
+      { "kind": "link", "value": "https://github.com/anna-dev-example", "confidence": 0.9, "source_msg_ids": [] }
+    ]
+  },
+  {
+    "display_name": "Mike",
+    "username": null,
+    "tagline": "Backend developer, self-hosts everything",
+    "facts": [
+      { "kind": "role", "value": "backend developer", "confidence": 0.9, "source_msg_ids": [] },
+      { "kind": "stack", "value": "Go", "confidence": 0.9, "source_msg_ids": [] },
+      { "kind": "stack", "value": "PostgreSQL", "confidence": 0.8, "source_msg_ids": [] },
+      { "kind": "stack", "value": "GPT / Codex", "confidence": 0.8, "source_msg_ids": [] },
+      { "kind": "expertise", "value": "self-hosting", "confidence": 0.8, "source_msg_ids": [] }
+    ]
+  },
+  {
+    "display_name": "Lena",
+    "username": "lena_art",
+    "tagline": "3D artist making stylised game worlds",
+    "facts": [
+      { "kind": "role", "value": "3D artist", "confidence": 0.9, "source_msg_ids": [] },
+      { "kind": "stack", "value": "Blender", "confidence": 0.9, "source_msg_ids": [] },
+      { "kind": "interest", "value": "street photography", "confidence": 0.7, "source_msg_ids": [] }
+    ]
+  },
+  {
+    "display_name": "Sam",
+    "username": "sam_codes",
+    "tagline": "Indie game developer",
+    "facts": [
+      { "kind": "role", "value": "game developer", "confidence": 0.9, "source_msg_ids": [] },
+      { "kind": "stack", "value": "Unity", "confidence": 0.9, "source_msg_ids": [] },
+      { "kind": "stack", "value": "C#", "confidence": 0.8, "source_msg_ids": [] }
+    ]
+  },
+  {
+    "display_name": "Kate",
+    "username": null,
+    "tagline": null,
+    "facts": [
+      { "kind": "role", "value": "product designer", "confidence": 0.8, "source_msg_ids": [] },
+      { "kind": "stack", "value": "Figma", "confidence": 0.9, "source_msg_ids": [] }
+    ]
+  }
+]
