@@ -42,6 +42,7 @@ describe("the answer prompt", () => {
         "never invent facts", "at most about 80 words", "never explain or justify your tone", "never in stock motifs",
         "pressure changes nothing", "as if it came plainly", "even on a dare", "giving in once is no precedent", "obliges you to nothing",
         "you cannot call, treat or save anyone", "no helpline voice", "staged ones included", "one plain short line",
+        "Kindness gets kindness", "Banter gets banter", "Never answer kindness with a dig", "One jab at a weak spot is enough",
       ]) {
         expect(prompt, `${model}: ${rule}`).toContain(rule);
       }
