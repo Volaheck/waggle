@@ -1,7 +1,7 @@
 import { Bot, GrammyError, InlineKeyboard } from "grammy";
 import type { Message, User as TelegramUser } from "grammy/types";
 import { migrateChat } from "../core/chat-migration.js";
-import { allChats, approvedChats, attachLegacyData, chatsOfUser, getChat, isApproved, legacyStats, registerChat, setChatStatus, setCurrentChat } from "../core/chats.js";
+import { allChats, approvedChats, attachLegacyData, chatsOfUser, getChat, isApproved, legacyStats, registerChat, resumeChronicle, setChatStatus, setCurrentChat } from "../core/chats.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
 import { monthSpendUsd } from "../core/llm.js";
@@ -264,7 +264,9 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
       await ctx.answerCallbackQuery({ text: "Approved" });
       if (record.status !== "approved") await approve(chatId, owner.id);
       const offer = await legacyOffer(chatId);
-      return kit.show(ctx, `✅ Chat <b>${title}</b> approved.${offer ? "\nThere's imported history — attach it to this chat?" : ""}`, offer, { edit: true });
+      // A chat approved again keeps a pause from before; the owner has to know, or the chronicle silently stays off.
+      const paused = record.chronicle_paused_at ? `\n⏸ The chronicler is still paused here: ${escapeHtml(record.chronicle_pause_reason ?? "")}. Resume it in /chats.` : "";
+      return kit.show(ctx, `✅ Chat <b>${title}</b> approved.${offer ? "\nThere's imported history — attach it to this chat?" : ""}${paused}`, offer, { edit: true });
     }
     if (ctx.match[1] === "chatno") {
       await ctx.answerCallbackQuery({ text: "Rejected" });
@@ -287,6 +289,24 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     );
   });
 
+  // The chronicler paused itself in a chat after repeated refusals by the model; only an owner turns it back on.
+  bot.callbackQuery(/^chatresume:c(\d+)$/, async (ctx) => {
+    const owner = await kit.identity(ctx.from);
+    if (!kit.isOwner(owner)) return ctx.answerCallbackQuery({ text: "That's up to the bot owner" });
+    const chatId = -Number(ctx.match[1]);
+    const record = await getChat(sql, chatId);
+    if (!record) return ctx.answerCallbackQuery({ text: "I don't know that chat" });
+    const resumed = await resumeChronicle(sql, chatId);
+    await ctx.answerCallbackQuery({ text: resumed ? "Resumed" : "It's running already" });
+    const title = escapeHtml(record.title ?? String(chatId));
+    return kit.show(
+      ctx,
+      `▶️ The chronicler is back on in <b>${title}</b>. Messages saved during the pause go into its next pass; the refused ones stay skipped.`,
+      undefined,
+      { edit: true },
+    );
+  });
+
   bot.command("chats", async (ctx) => {
     if (!ctx.from || !kit.isPrivate(ctx)) return;
     const owner = await kit.identity(ctx.from);
@@ -295,15 +315,20 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     if (chats.length === 0) return void (await kit.show(ctx, "I haven't been added anywhere yet. Add the bot to a group and I'll send you an approval request."));
     const labels: Record<string, string> = { pending: "⏳ pending", approved: "✅ active", rejected: "🚫 rejected", left: "👋 left" };
     for (const chat of chats) {
+      const paused = chat.status === "approved" && chat.chronicle_paused_at !== null;
       const keyboard =
         chat.status === "pending"
           ? chatButtons(chat.id)
-          : chat.status === "approved"
-            ? await legacyOffer(chat.id)
-            : chat.status === "rejected"
-              ? new InlineKeyboard().text("✅ Approve after all", `chatok:${encodeChat(chat.id)}`)
-              : undefined;
-      await kit.show(ctx, `<b>${escapeHtml(chat.title ?? String(chat.id))}</b> · ${labels[chat.status]}\n<code>${chat.id}</code>`, keyboard);
+          : paused
+            ? resumeButton(chat.id)
+            : chat.status === "approved"
+              ? await legacyOffer(chat.id)
+              : chat.status === "rejected"
+                ? new InlineKeyboard().text("✅ Approve after all", `chatok:${encodeChat(chat.id)}`)
+                : undefined;
+      const label = paused ? "⏸ chronicler paused" : labels[chat.status];
+      const why = paused && chat.chronicle_pause_reason ? `\n${escapeHtml(chat.chronicle_pause_reason)}` : "";
+      await kit.show(ctx, `<b>${escapeHtml(chat.title ?? String(chat.id))}</b> · ${label}\n<code>${chat.id}</code>${why}`, keyboard);
     }
   });
 
@@ -523,6 +548,9 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
         ...[
           `💬 <b>${escapeHtml(chat.title ?? String(chat.id))}</b>`,
           `Messages: ${counts?.messages}, waiting for the chronicler: ${counts?.pending}. Last run — ${lastLine}`,
+          chat.chronicle_paused_at
+            ? `⏸ The chronicler is paused here: ${escapeHtml(chat.chronicle_pause_reason ?? "an owner's decision")}. Resume it in /chats`
+            : "",
           later(passRetry) ? `The chronicler failed; next attempt ${later(passRetry)}` : "",
           later(cleanupRetry) ? `⚠️ The weekly card clean-up failed; next attempt ${later(cleanupRetry)}` : "",
           skipped?.messages ? `⚠️ Skipped in the last 30 days: ${countOf(skipped.messages, "message")} the chronicler could not process` : "",
@@ -597,9 +625,14 @@ export async function registerCommands(bot: Bot<BotContext>, ownerTgIds: number[
 }
 
 /** Owners are the configured ADMIN_TG_IDS only; `sql` is unused and kept for existing callers. */
-export async function notifyAdmins(bot: Bot<BotContext>, _sql: Sql, adminTgIds: number[], text: string): Promise<void> {
+export function resumeButton(chatId: number): InlineKeyboard {
+  return new InlineKeyboard().text("▶️ Resume the chronicler", `chatresume:${encodeChat(chatId)}`);
+}
+
+export async function notifyAdmins(bot: Bot<BotContext>, _sql: Sql, adminTgIds: number[], text: string, offer?: { resumeChatId: number }): Promise<void> {
+  const reply_markup = offer ? resumeButton(offer.resumeChatId) : undefined;
   for (const tgId of new Set(adminTgIds)) {
-    await bot.api.sendMessage(tgId, text).catch(() => {});
+    await bot.api.sendMessage(tgId, text, { reply_markup }).catch(() => {});
   }
 }
 

@@ -1,18 +1,22 @@
 import type Anthropic from "@anthropic-ai/sdk";
-import { approvedChats, type Chat } from "../core/chats.js";
+import { approvedChats, pauseChronicle, type Chat } from "../core/chats.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
 import { BudgetExceededError } from "../core/llm.js";
 import { clearExpiredTexts } from "../core/messages.js";
+import { messageLink } from "../core/text.js";
 import { isConsolidationDue, nextConsolidationRetryAt, runConsolidation } from "./consolidate.js";
-import { isPassDue, lastSuccessfulRunAt, pendingStats, runExtractionPass } from "./extract.js";
+import { isPassDue, lastSuccessfulRunAt, latestRunId, pendingStats, refusalsAfter, refusalsSince, runExtractionPass, type SkippedRange } from "./extract.js";
 
 export interface SchedulerOptions {
   sql: Sql;
   anthropic: Anthropic;
   config: Pick<Config, "EXTRACTION_MODEL" | "MONTHLY_LLM_BUDGET_USD" | "CHAT_MONTHLY_BUDGET_USD" | "EXTRACTION_INTERVAL_HOURS"> & Partial<Pick<Config, "ADMIN_TG_IDS">>;
   checkEveryMs?: number;
-  notifyAdmins: (text: string) => Promise<void>;
+  /** A message to the bot owners; `resumeChatId` adds a button that resumes the chronicler paused in that chat. */
+  notifyAdmins: (text: string, offer?: { resumeChatId: number }) => Promise<void>;
+  /** The chat as Anthropic's end user (chatEndUserId), sent with every request made for it. */
+  endUserIdOf?: (chatId: number) => string;
   log?: (line: string) => void;
 }
 
@@ -20,6 +24,24 @@ const HOUR_MS = 60 * 60 * 1000;
 const MAX_RETRY_MS = 24 * HOUR_MS;
 const ALERT_COOLDOWN_MS = 12 * HOUR_MS;
 const RETENTION_CHECK_MS = HOUR_MS;
+/**
+ * Within REFUSAL_WINDOW_MS of one chat, this many refused slices, or this many refused calls (when the model refuses
+ * everything, for instance, and nothing gets narrowed down to a slice), pause the chronicler there until an owner resumes it.
+ * One refused message costs 2–4 calls while it is narrowed down, so a single one only brings a warning.
+ */
+export const REFUSED_SLICES_BEFORE_PAUSE = 2;
+export const REFUSED_CALLS_BEFORE_PAUSE = 6;
+const REFUSAL_WINDOW_MS = 7 * 24 * HOUR_MS;
+
+function describeRanges(chatId: number, ranges: SkippedRange[]): string {
+  return ranges
+    .map((range) => {
+      const ids = range.firstMsgId === range.lastMsgId ? `${range.firstMsgId}` : `${range.firstMsgId}–${range.lastMsgId}`;
+      const link = messageLink(chatId, range.firstMsgId);
+      return link ? `${ids} (${link})` : ids;
+    })
+    .join(", ");
+}
 
 export function chatBudgetUsd(chat: Chat, fallback: number): number {
   return chat.monthly_budget_usd === null ? fallback : Number(chat.monthly_budget_usd);
@@ -71,6 +93,37 @@ export function createChatProcessor(options: SchedulerOptions, signals?: StopSig
     await options.notifyAdmins(text).catch((error) => log(`[extract] could not notify admins: ${String(error)}`));
   };
 
+  /**
+   * After a pass, whatever its outcome (done, failed, cut off by the budget): if the model refused anything, the owners
+   * hear about it; when refusals pile up within a week (counted from the last resume), the chronicler stops in this chat
+   * until an owner resumes it, so the account does not keep collecting refusals for content nobody looked at.
+   */
+  /** Returns whether it paused the chat. */
+  const reviewRefusals = async (chat: Chat, title: string, afterRunId: number): Promise<boolean> => {
+    const now = await refusalsAfter(sql, chat.id, afterRunId);
+    if (now.calls === 0) return false;
+    const windowStart = Math.max(Date.now() - REFUSAL_WINDOW_MS, chat.chronicle_resumed_at?.getTime() ?? 0);
+    const week = await refusalsSince(sql, chat.id, new Date(windowStart));
+    const skippedCount = now.slices.reduce((sum, range) => sum + range.messages, 0);
+    const what = now.slices.length
+      ? `Claude refused to process ${skippedCount} message(s) in “${title}”, so the chronicler skipped them: ${describeRanges(chat.id, now.slices)}`
+      : `Claude refused ${now.calls} request(s) with messages from “${title}”; the chronicler narrows it down in the next pass`;
+    const notify = (text: string, offer?: { resumeChatId: number }) =>
+      options.notifyAdmins(text, offer).catch((error) => log(`[extract] could not notify admins: ${String(error)}`));
+    if (week.slices < REFUSED_SLICES_BEFORE_PAUSE && week.calls < REFUSED_CALLS_BEFORE_PAUSE) {
+      await notify(`⚠️ ${what}. If it keeps refusing messages from this chat, I'll pause the chronicler there until you resume it.`);
+      return false;
+    }
+    const reason = `Claude refused ${week.calls} request(s) with this chat's messages in a week`;
+    if (!(await pauseChronicle(sql, chat.id, reason))) return false;
+    log(`[extract] ${title}: chronicler paused — ${reason}`);
+    await notify(
+      `⏸ I paused the chronicler in “${title}”. ${what}; in all, Claude refused ${week.calls} request(s) with this chat's messages in a week, and repeated refusals can count against the Anthropic account. New messages are still saved, but nothing goes to Claude until you resume it.`,
+      { resumeChatId: chat.id },
+    );
+    return true;
+  };
+
   const reportBudget = (error: BudgetExceededError, title: string) => {
     const where = error.chatId === undefined ? "in all chats" : `in “${title}”`;
     return alertOnce(`budget:${error.chatId ?? "all"}`, `⚠️ ${error.message}. The chronicle and cards ${where} are paused until next month or until you raise the limit.`);
@@ -80,14 +133,18 @@ export function createChatProcessor(options: SchedulerOptions, signals?: StopSig
     const chatUsd = chatBudgetUsd(chat, config.CHAT_MONTHLY_BUDGET_USD);
     const title = chat.title ?? String(chat.id);
 
+    // Set when a pass was started, so its refusals are reviewed whatever the outcome.
+    let passAfterRunId: number | null = null;
     try {
       const retryAt = await nextExtractionRetryAt(sql, chat.id);
       const pending = await pendingStats(sql, chat.id);
       if (
         !stopping() &&
+        !chat.chronicle_paused_at &&
         (!retryAt || retryAt.getTime() <= Date.now()) &&
         isPassDue(pending, await lastSuccessfulRunAt(sql, chat.id), config.EXTRACTION_INTERVAL_HOURS)
       ) {
+        passAfterRunId = await latestRunId(sql, chat.id);
         const result = await runExtractionPass({
           sql,
           anthropic: options.anthropic,
@@ -96,6 +153,7 @@ export function createChatProcessor(options: SchedulerOptions, signals?: StopSig
           config,
           drain: signals?.drain,
           signal: signals?.abort,
+          endUserId: options.endUserIdOf?.(chat.id),
         });
         log(
           `[extract] ${title}: ${result.messages} messages in ${result.calls} call(s): ${result.topics} topics, facts +${result.factsAdded} ↑${result.factsReinforced} ✎${result.factsUpdated}, projects +${result.projectsCreated} ~${result.projectsUpdated}`,
@@ -103,8 +161,12 @@ export function createChatProcessor(options: SchedulerOptions, signals?: StopSig
         if (result.skipped.length) {
           const ranges = result.skipped.map((range) => `${range.firstMsgId}–${range.lastMsgId} (${range.reason})`).join("; ");
           log(`[extract] ${title}: skipped messages ${ranges}`);
-          const count = result.skipped.reduce((sum, range) => sum + range.messages, 0);
-          await alertOnce(`skipped:${chat.id}`, `⚠️ The chronicler could not process ${count} message(s) in “${title}” and skipped them so the rest of the chat is not held up: ${ranges}.`);
+          const failed = result.skipped.filter((range) => !range.refusal);
+          if (failed.length) {
+            const count = failed.reduce((sum, range) => sum + range.messages, 0);
+            const reasons = failed.map((range) => `${range.firstMsgId}–${range.lastMsgId} (${range.reason})`).join("; ");
+            await alertOnce(`skipped:${chat.id}`, `⚠️ The chronicler could not process ${count} message(s) in “${title}” and skipped them so the rest of the chat is not held up: ${reasons}.`);
+          }
         }
       }
     } catch (error) {
@@ -117,14 +179,22 @@ export function createChatProcessor(options: SchedulerOptions, signals?: StopSig
       }
     }
 
+    let paused = chat.chronicle_paused_at !== null;
+    if (passAfterRunId !== null) {
+      const afterRunId = passAfterRunId;
+      paused = (await reviewRefusals(chat, title, afterRunId).catch((error) => (log(`[extract] ${title}: could not review refusals: ${String(error)}`), false))) || paused;
+    }
+
     try {
-      if (!stopping() && (await isConsolidationDue(sql, chat.id))) {
+      // A paused chat sends nothing to Claude, its cards included.
+      if (!stopping() && !paused && (await isConsolidationDue(sql, chat.id))) {
         const cleaned = await runConsolidation(
           sql,
           options.anthropic,
           config.EXTRACTION_MODEL,
           { totalUsd: config.MONTHLY_LLM_BUDGET_USD, chatId: chat.id, chatUsd },
           signals?.abort,
+          options.endUserIdOf?.(chat.id),
         );
         log(`[consolidate] ${title}: merged ${cleaned.factsMerged} facts, dropped ${cleaned.factsDropped}, merged ${cleaned.projectsMerged} projects, updated ${cleaned.projectsUpdated}`);
       }

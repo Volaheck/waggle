@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import type { Queryable, Sql } from "./db.js";
@@ -184,6 +185,16 @@ export interface StructuredRequest<T> {
   onUsage: (usage: UsageLike) => Promise<void>;
   /** Cancels the call (the bot is stopping); the usage it reached is still recorded. */
   signal?: AbortSignal;
+  /** Who the request is made for, as an opaque id (see chatEndUserId): Anthropic uses it to tell one end user's abuse from another's. */
+  endUserId?: string;
+}
+
+/**
+ * The chat as Anthropic's end user, sent as metadata.user_id: an HMAC of the chat id, so requests from one chat can be
+ * told apart without revealing which chat it is (a plain hash of a chat id could be reversed by trying them all).
+ */
+export function chatEndUserId(secret: string, chatId: number): string {
+  return createHmac("sha256", secret).update(`waggle-chat:${chatId}`).digest("hex").slice(0, 32);
 }
 
 /**
@@ -200,6 +211,7 @@ export async function callStructured<T>(anthropic: Anthropic, request: Structure
       // No prompt caching: passes run hours apart, far beyond the cache TTL, so a cache write would only cost extra.
       system: request.system,
       messages: [{ role: "user", content: request.prompt }],
+      ...(request.endUserId ? { metadata: { user_id: request.endUserId } } : {}),
     },
     { signal: request.signal },
   );

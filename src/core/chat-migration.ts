@@ -51,15 +51,20 @@ async function carryStanding(tx: Queryable, oldChatId: number, newChatId: number
   const carried: ChatStatus | null = old.status === "left" ? (holdsData ? "approved" : null) : old.status;
   if (carried) {
     await tx`
-      INSERT INTO chats (id, title, status, added_by, decided_by, decided_at, monthly_budget_usd)
-      VALUES (${newChatId}, ${old.title}, ${carried}, ${old.added_by}, ${old.decided_by}, ${old.decided_at}, ${old.monthly_budget_usd})
+      INSERT INTO chats (id, title, status, added_by, decided_by, decided_at, monthly_budget_usd, chronicle_paused_at, chronicle_pause_reason, chronicle_resumed_at)
+      VALUES (${newChatId}, ${old.title}, ${carried}, ${old.added_by}, ${old.decided_by}, ${old.decided_at}, ${old.monthly_budget_usd},
+              ${old.chronicle_paused_at}, ${old.chronicle_pause_reason}, ${old.chronicle_resumed_at})
       ON CONFLICT (id) DO UPDATE SET
         status = CASE WHEN chats.status IN ('pending', 'left') THEN excluded.status ELSE chats.status END,
         decided_by = CASE WHEN chats.status IN ('pending', 'left') THEN excluded.decided_by ELSE chats.decided_by END,
         decided_at = CASE WHEN chats.status IN ('pending', 'left') THEN excluded.decided_at ELSE chats.decided_at END,
         title = coalesce(chats.title, excluded.title),
         added_by = coalesce(chats.added_by, excluded.added_by),
-        monthly_budget_usd = coalesce(chats.monthly_budget_usd, excluded.monthly_budget_usd)`;
+        monthly_budget_usd = coalesce(chats.monthly_budget_usd, excluded.monthly_budget_usd),
+        -- A paused chronicler stays paused on the new id until an owner resumes it.
+        chronicle_paused_at = coalesce(chats.chronicle_paused_at, excluded.chronicle_paused_at),
+        chronicle_pause_reason = coalesce(chats.chronicle_pause_reason, excluded.chronicle_pause_reason),
+        chronicle_resumed_at = greatest(chats.chronicle_resumed_at, excluded.chronicle_resumed_at)`;
   }
   await tx`UPDATE chats SET status = 'left' WHERE id = ${oldChatId}`;
   return carried;

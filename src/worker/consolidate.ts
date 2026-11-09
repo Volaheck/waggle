@@ -177,6 +177,8 @@ export async function runConsolidation(
   budget: { totalUsd: number; chatId: number; chatUsd: number },
   /** Cancels the call, when the bot is stopping and cannot wait for it. */
   signal?: AbortSignal,
+  /** The chat as Anthropic's end user (chatEndUserId). */
+  endUserId?: string,
 ): Promise<ConsolidationStats> {
   const chatId = budget.chatId;
   await assertBudget(sql, budget.totalUsd, { id: chatId, limitUsd: budget.chatUsd });
@@ -194,6 +196,7 @@ export async function runConsolidation(
     schema: ConsolidationSchema,
     onUsage: (usage) => recordUsage(sql, "consolidate", model, usage, chatId),
     signal,
+    endUserId,
   });
   if (!outcome.ok) throw new Error(`Card clean-up stopped: ${outcome.message}`);
   return applyConsolidation(sql, input, outcome.data);

@@ -8,7 +8,7 @@ import { telegramWebhook } from "./bot/webhook.js";
 import { relinkForeignTopics } from "./core/chronicle.js";
 import { loadConfig } from "./core/config.js";
 import { createSql, migrate } from "./core/db.js";
-import { createAnthropic, isPricedModel } from "./core/llm.js";
+import { chatEndUserId, createAnthropic, isPricedModel } from "./core/llm.js";
 import { INTERRUPTED_PASS_ERROR } from "./worker/extract.js";
 import { startExtractionScheduler, startMessageRetention } from "./worker/scheduler.js";
 
@@ -94,7 +94,8 @@ const stopScheduler = config.ANTHROPIC_API_KEY
       sql,
       anthropic: createAnthropic(config.ANTHROPIC_API_KEY),
       config,
-      notifyAdmins: (text) => notifyAdmins(bot, sql, config.ADMIN_TG_IDS, text),
+      notifyAdmins: (text, offer) => notifyAdmins(bot, sql, config.ADMIN_TG_IDS, text, offer),
+      endUserIdOf: (chatId) => chatEndUserId(config.BOT_TOKEN, chatId),
     })
   : (console.warn("[extract] ANTHROPIC_API_KEY is not set — the chronicler is off; the bot still serves the archive and manual data"),
     async (_graceMs?: number) => {});

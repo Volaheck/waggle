@@ -73,6 +73,6 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together
 
 ## Privacy
 
-Waggle never records politics, health, finances, private life, addresses or secrets — the prompts forbid it and a stop-list filters it. Every fact links to its source message, people can hide or remove facts (a removed fact never comes back, even reworded), and `/forgetme` deletes everything about a person.
+Waggle never records politics, health, finances, private life, addresses or secrets — the prompts forbid it and a stop-list filters it. Only text goes to Claude, never photos or files, and phone numbers, emails, card and account numbers and pasted secrets are masked before it does. If Claude keeps refusing a chat's messages, the chronicler pauses there until a bot owner resumes it. Every fact links to its source message, people can hide or remove facts (a removed fact never comes back, even reworded), and `/forgetme` deletes everything about a person.
 
 Message texts are kept for 7 days (`MESSAGE_RETENTION_DAYS`): after that, as soon as the chronicler has processed a message, its text is deleted. What stays of the message is its author and time, so links to source messages and activity counts keep working. A message the chronicler has not processed yet — say, while a spending cap pauses it — keeps its text until it has been processed.

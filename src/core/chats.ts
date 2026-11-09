@@ -17,6 +17,11 @@ export interface Chat {
   decided_at: Date | null;
   monthly_budget_usd: string | null;
   created_at: Date;
+  /** Set while the chronicler is paused here (repeated refusals by the model); messages are still saved. */
+  chronicle_paused_at: Date | null;
+  chronicle_pause_reason: string | null;
+  /** When an owner last resumed it: refusals before that no longer count. */
+  chronicle_resumed_at: Date | null;
 }
 
 /** Rows imported before multi-chat support carry this chat id until an owner attaches them. */
@@ -45,6 +50,22 @@ export async function setChatStatus(sql: Sql, chatId: number, status: ChatStatus
     WHERE id = ${chatId}
     RETURNING *`;
   return chat;
+}
+
+/** Pauses the chronicler in a chat; false when it was paused already. */
+export async function pauseChronicle(sql: Sql, chatId: number, reason: string): Promise<boolean> {
+  const paused = await sql`
+    UPDATE chats SET chronicle_paused_at = now(), chronicle_pause_reason = ${reason}
+    WHERE id = ${chatId} AND chronicle_paused_at IS NULL`;
+  return paused.count > 0;
+}
+
+/** Resumes the chronicler in a chat; false when it was not paused. */
+export async function resumeChronicle(sql: Sql, chatId: number): Promise<boolean> {
+  const resumed = await sql`
+    UPDATE chats SET chronicle_paused_at = NULL, chronicle_pause_reason = NULL, chronicle_resumed_at = now()
+    WHERE id = ${chatId} AND chronicle_paused_at IS NOT NULL`;
+  return resumed.count > 0;
 }
 
 export async function isApproved(sql: Sql, chatId: number): Promise<boolean> {

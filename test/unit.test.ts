@@ -6,6 +6,7 @@ import { buildExtractionPrompt, EXTRACTION_SYSTEM_PROMPT, isPassDue } from "../s
 import { CONSOLIDATION_SYSTEM_PROMPT } from "../src/worker/consolidate.js";
 import { factCore, isNearDuplicate, isSameFact } from "../src/core/facts.js";
 import { detectLanguage } from "../src/core/language.js";
+import { maskPersonalData } from "../src/core/privacy.js";
 import { PROJECT_STATUSES } from "../src/core/projects.js";
 import { canonicalStackValue, splitStackValue, stackFamily } from "../src/core/stack.js";
 import { topLimitFor } from "../src/core/chronicle.js";
@@ -251,5 +252,52 @@ describe("chat language detection", () => {
     expect(detectLanguage(["ok", "👍"])).toBeNull();
     expect(detectLanguage(["Shipped it today, works great with the new sync", "Выкатил сегодня, отлично работает с новой синхронизацией"])).toBeNull();
     expect(detectLanguage(["ok"], ["фронтенд-разработчик", "скайдайвинг и путешествия", "Летопись чата: релиз нового бота"])).toBe("Russian");
+  });
+});
+
+describe("masking personal data before a prompt", () => {
+  it("masks phones, emails, cards, accounts, long numbers and secrets", () => {
+    const cases: [string, string][] = [
+      ["Звони +7 (912) 345-67-89 или 8 912 345 67 89", "Звони [phone] или [phone]"],
+      ["call +1-202-555-0143 or +31 6 12345678", "call [phone] or [phone]"],
+      ["тел:+79123456789, wa.me/79123456789, https://wa.me/79123456789.", "тел:[phone], [phone], [phone]."],
+      ["пиши на ivan.petrov@gmail.com", "пиши на [email]"],
+      ["карта 4111 1111 1111 1111, другая 4111-1111-1111-1112", "карта [card], другая [number]"],
+      ["IBAN GB82 WEST 1234 5698 7654 32", "IBAN [account]"],
+      ["паспорт 4508 123456, ИНН 7707083893, счёт 40817810099910004312", "паспорт [number], ИНН [number], счёт [number]"],
+      ["ключ sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx-yz", "ключ [secret]"],
+      ["токен 1234567890:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw1 вот", "токен [secret] вот"],
+      ["тел.89123456789, т.8(912)345-67-89", "тел.[phone], т.[phone]"],
+      ["TON UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XggGG, ETH 0x52908400098527886E0F7030069857D2E4169EE7", "TON [account], ETH [account]"],
+      ["BTC 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa и TJRyWwFs9wTFGZg3JbrVriFbNfCug5tDeC", "BTC [account] и [account]"],
+      ["https://api.telegram.org/bot1234567890:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw1/getMe", "https://api.telegram.org/bot[secret]/getMe"],
+      ["https://user:hunter2@db.example.com/admin", "https://user:[email]/admin"],
+      ["password: hunter2abc, API_KEY=abc123def456ghi. пароль: qwerty123!", "password: [secret], API_KEY=[secret]. пароль: [secret]!"],
+      ["AIzaSyD-1234567890abcdefghijklmnopqrstu", "[secret]"],
+      ["-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjEAAAAA -----END OPENSSH PRIVATE KEY----- ок", "[secret] ок"],
+    ];
+    for (const [text, masked] of cases) expect(maskPersonalData(text)).toBe(masked);
+  });
+
+  it("leaves dates, times, versions, prices, years, short numbers, usernames and links alone", () => {
+    for (const text of [
+      "Встреча 09.11.2026 в 10:30, версия 1.2.3, цена 1 500 ₽, $2,000,000, 3,14",
+      "Годы 2019-2024 и 2023 2024 2025, 1500 подписчиков, id 262479306",
+      "Пиши @flyheck, репо https://github.com/Volaheck/waggle и https://t.me/c/1581413930/168194",
+      "Наша группа https://t.me/+5bX9kLmN2pQrStUv и чат по номеру не публикуем",
+      "Релиз 2026-11-20 18:00, лог 2026-11-09 10:36:05, считаем 1 2 3 4 5 6 7 8 9 10, бюджет 15 000 000 000",
+      "Главный ключ: JavaScript и TypeScript, token: Ethereum, хэштег 3dprintingenthusiastsforever",
+      "https://medium.com/@author/post, v1.2.3, 3.14159265358979, 10.0.19045.1234",
+    ]) {
+      expect(maskPersonalData(text)).toBe(text);
+    }
+  });
+
+  it("stays fast on the longest Telegram message, whatever is in it", () => {
+    for (const text of ["ж".repeat(4096), "1 ".repeat(2048), "a@".repeat(2048), "a.".repeat(2048) + "@b", "QUJD".repeat(1024)]) {
+      const started = performance.now();
+      maskPersonalData(text);
+      expect(performance.now() - started).toBeLessThan(50);
+    }
   });
 });

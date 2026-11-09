@@ -5,7 +5,7 @@ import { createBot, registerCommands } from "../src/bot/bot.js";
 import { projectCard } from "../src/bot/format.js";
 import { syncMemberNames } from "../src/bot/names.js";
 import { migrateChat } from "../src/core/chat-migration.js";
-import { getChat, registerChat, setChatStatus } from "../src/core/chats.js";
+import { getChat, pauseChronicle, registerChat, setChatStatus } from "../src/core/chats.js";
 import type { Config } from "../src/core/config.js";
 import { createSql, migrate, type Sql } from "../src/core/db.js";
 import { proposeFact, visibleFacts } from "../src/core/facts.js";
@@ -586,6 +586,28 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       const [post] = await sql<{ user_id: number | null; is_forward: boolean }[]>`SELECT user_id, is_forward FROM messages WHERE chat_id = ${A} AND msg_id = ${msgId}`;
       expect(post).toEqual({ user_id: null, is_forward: true });
       expect(await sql`SELECT 1 FROM users WHERE tg_id = 777000`).toHaveLength(0);
+    });
+
+    it("only a bot owner resumes a chronicler that paused itself, and /chats shows the pause", async () => {
+      const owner = tg(OWNER, "Owner");
+      await pauseChronicle(sql, A, "Claude refused messages from this chat 2 times in a week");
+      await bot.handleUpdate(dm(owner, "/chats") as never);
+      expect(sent().some((text) => text.includes("⏸ chronicler paused") && text.includes("2 times in a week"))).toBe(true);
+      expect(calls.some((call) => JSON.stringify(call.payload.reply_markup ?? {}).includes(`chatresume:${key(A)}`))).toBe(true);
+      await bot.handleUpdate(dm(owner, "/botstatus") as never);
+      expect(sent().at(-1)).toContain("⏸ The chronicler is paused here");
+
+      await bot.handleUpdate(tap(alice, `chatresume:${key(A)}`) as never);
+      expect(answers().at(-1)).toBe("That's up to the bot owner");
+      expect((await getChat(sql, A))?.chronicle_paused_at).not.toBeNull();
+
+      await bot.handleUpdate(tap(owner, `chatresume:${key(A)}`) as never);
+      expect(answers().at(-1)).toBe("Resumed");
+      const chat = (await getChat(sql, A))!;
+      expect(chat.chronicle_paused_at).toBeNull();
+      expect(chat.chronicle_resumed_at).not.toBeNull();
+      await bot.handleUpdate(tap(owner, `chatresume:${key(A)}`) as never);
+      expect(answers().at(-1)).toBe("It's running already");
     });
 
     it("a rejection survives the bot leaving, and only configured owners decide", async () => {

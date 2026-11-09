@@ -1,11 +1,12 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { attachLegacyData, getChat, LEGACY_CHAT_ID, registerChat, setChatStatus, type Chat } from "../src/core/chats.js";
+import { attachLegacyData, getChat, LEGACY_CHAT_ID, registerChat, resumeChronicle, setChatStatus, type Chat } from "../src/core/chats.js";
+import { migrateChat } from "../src/core/chat-migration.js";
 import { catchupFor, relinkForeignTopics } from "../src/core/chronicle.js";
 import { createSql, migrate, type Sql } from "../src/core/db.js";
 import { dropFact, mergeFacts, normalizeStacks, proposeFact, rejectFact, rewriteFact, setFactHidden, visibleFacts, type FactKind } from "../src/core/facts.js";
 import { detectLanguage } from "../src/core/language.js";
-import { assertBudget, BudgetExceededError, canonicalModelId, estimateCostUsd, isPricedModel, monthSpendUsd, structuredOutputFormat } from "../src/core/llm.js";
+import { assertBudget, BudgetExceededError, canonicalModelId, chatEndUserId, estimateCostUsd, isPricedModel, monthSpendUsd, structuredOutputFormat } from "../src/core/llm.js";
 import { clearExpiredTexts, saveMessage, type StoredMessage } from "../src/core/messages.js";
 import { mergeProjects, PROJECT_STATUSES, upsertProject } from "../src/core/projects.js";
 import { getPerson, peopleOfChat, resolveUser, setOptOut } from "../src/core/users.js";
@@ -144,11 +145,11 @@ interface FakeAnswer {
 }
 
 function fakeAnthropic(answer: (request: { system: string; prompt: string }) => FakeAnswer) {
-  const requests: { system: string; prompt: string }[] = [];
+  const requests: { system: string; prompt: string; userId?: string }[] = [];
   const client = {
     messages: {
-      stream(params: { system: string; messages: { content: string }[] }) {
-        const request = { system: params.system, prompt: params.messages[0]!.content };
+      stream(params: { system: string; messages: { content: string }[]; metadata?: { user_id?: string } }) {
+        const request = { system: params.system, prompt: params.messages[0]!.content, userId: params.metadata?.user_id };
         requests.push(request);
         const reply = answer(request);
         const message = {
@@ -423,6 +424,26 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     await sql`DELETE FROM projects WHERE id = ${imported}`;
   });
 
+  it("masks personal data in what the chronicler is sent and names the chat to Anthropic only by an opaque id", async () => {
+    const chat = await newChat("Masked prompt");
+    const author = await person(chat.id, "Writer");
+    await message(chat.id, 1, author.id, "Мой номер +7 (912) 345-67-89, почта ivan.petrov@gmail.com, репо https://github.com/acme/atlas");
+    await message(chat.id, 2, author.id, "А рабочий +7 900\n123 45 67");
+    const { client, requests } = fakeAnthropic(() => ({ text: JSON.stringify(EMPTY_EXTRACTION) }));
+    const endUserId = chatEndUserId("test-secret", chat.id);
+    await runExtractionPass({ ...deps(chat.id, client), endUserId });
+    expect(requests[0]!.prompt).toContain("Мой номер [phone], почта [email], репо https://github.com/acme/atlas");
+    expect(requests[0]!.prompt).toContain("А рабочий [phone]");
+    expect(requests[0]!.prompt).not.toMatch(/912|ivan\.petrov|900/);
+    expect(requests[0]!.userId).toBe(endUserId);
+    expect(endUserId).toMatch(/^[0-9a-f]{32}$/);
+    expect(endUserId).not.toContain(String(Math.abs(chat.id)));
+    expect(chatEndUserId("test-secret", chat.id - 1)).not.toBe(endUserId);
+    // The text stays as written for the chat's own members.
+    const [stored] = await sql<{ text: string }[]>`SELECT text FROM messages WHERE chat_id = ${chat.id} AND msg_id = 1`;
+    expect(stored!.text).toContain("+7 (912) 345-67-89");
+  });
+
   it("splits a batch the model keeps refusing, skips only the slice it refuses and pays for every call", async () => {
     const chat = await newChat("Refusals");
     const author = await person(chat.id, "Writer");
@@ -432,9 +453,11 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     const { client, requests } = fakeAnthropic(({ prompt }) => (prompt.includes("FORBIDDEN-MARKER") ? { stopReason: "refusal", text: '{"topics": [' } : { text: JSON.stringify(EMPTY_EXTRACTION) }));
     const result = await runExtractionPass(deps(chat.id, client));
 
+    // Refused, the 40 messages are cut into slices of 10, so the refused message is sent twice rather than three times.
     expect(result.calls).toBe(5);
-    expect(result.failedCalls).toBe(3);
-    expect(result.skipped).toEqual([{ firstMsgId: 1021, lastMsgId: 1030, messages: 10, reason: "the model refused (cyber)" }]);
+    expect(result.failedCalls).toBe(2);
+    expect(result.refusals).toBe(2);
+    expect(result.skipped).toEqual([{ firstMsgId: 1021, lastMsgId: 1030, messages: 10, reason: "the model refused (cyber)", refusal: true }]);
     expect(await pendingCount(chat.id)).toBe(0);
     expect(await usageRows(chat.id)).toBe(5);
     expect(await monthSpendUsd(sql, chat.id)).toBeCloseTo(5 * CALL_COST, 5);
@@ -566,6 +589,97 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     await sql`UPDATE chats SET monthly_budget_usd = '50.00' WHERE id = ${capped.id}`;
     expect(chatBudgetUsd((await getChat(sql, capped.id))!, 20)).toBe(50);
     expect(chatBudgetUsd(free, 20)).toBe(20);
+  });
+
+  it("warns about the first refused slice and pauses the chat at the second, until an owner resumes it", async () => {
+    const chat = await newChat("Refused content");
+    const author = await person(chat.id, "Writer");
+    const write = async (from: number, marker: number | null) => {
+      for (let msgId = from; msgId < from + 20; msgId += 1) {
+        await message(chat.id, msgId, author.id, msgId === marker ? "FORBIDDEN-MARKER: something the model refuses" : `Message ${msgId} about the release`);
+      }
+    };
+    const { client, requests } = fakeAnthropic(({ system, prompt }) =>
+      system === CONSOLIDATION_SYSTEM_PROMPT ? { text: EMPTY_CLEANUP } : prompt.includes("FORBIDDEN-MARKER") ? { stopReason: "refusal", text: "" } : { text: JSON.stringify(EMPTY_EXTRACTION) },
+    );
+    const alerts: { text: string; offer?: { resumeChatId: number } }[] = [];
+    const processChat = createChatProcessor({
+      sql,
+      anthropic: client,
+      config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6 },
+      notifyAdmins: async (text, offer) => void alerts.push({ text, offer }),
+      endUserIdOf: (chatId) => chatEndUserId("test-secret", chatId),
+      log: () => {},
+    });
+    const fresh = async () => (await getChat(sql, chat.id))!;
+    const extractionCalls = () => requests.filter((request) => request.system !== CONSOLIDATION_SYSTEM_PROMPT).length;
+    const passLater = () => sql`UPDATE extraction_runs SET started_at = started_at - interval '7 hours', finished_at = finished_at - interval '7 hours' WHERE chat_id = ${chat.id}`;
+
+    await write(1, 5);
+    await processChat(await fresh());
+    expect(requests.every((request) => request.userId === chatEndUserId("test-secret", chat.id))).toBe(true);
+    expect((await fresh()).chronicle_paused_at).toBeNull();
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.text).toContain("Claude refused to process 10 message(s)");
+    expect(alerts[0]!.text).toContain("If it keeps refusing");
+    expect(alerts[0]!.offer).toBeUndefined();
+
+    await passLater();
+    await write(101, 105);
+    await processChat(await fresh());
+    const paused = await fresh();
+    expect(paused.chronicle_paused_at).not.toBeNull();
+    expect(alerts.at(-1)!.text).toContain("I paused the chronicler");
+    expect(alerts.at(-1)!.offer).toEqual({ resumeChatId: chat.id });
+
+    // While paused, new messages wait and nothing goes to Claude.
+    await passLater();
+    await write(201, null);
+    const before = extractionCalls();
+    await processChat(paused);
+    expect(extractionCalls()).toBe(before);
+    expect(await pendingCount(chat.id)).toBe(20);
+
+    // Resumed, the waiting messages are processed, and the refusals before the resume no longer count.
+    expect(await resumeChronicle(sql, chat.id)).toBe(true);
+    await processChat(await fresh());
+    expect(await pendingCount(chat.id)).toBe(0);
+    await passLater();
+    await write(301, 305);
+    await processChat(await fresh());
+    expect((await fresh()).chronicle_paused_at).toBeNull();
+    expect(alerts.at(-1)!.text).toContain("If it keeps refusing");
+  });
+
+  it("pauses a chat whose pass fails on refusals, and carries the pause over a supergroup upgrade", async () => {
+    const chat = await newChat("Refuses everything");
+    const author = await person(chat.id, "Writer");
+    for (let msgId = 1; msgId <= 200; msgId += 1) await message(chat.id, msgId, author.id, `Message ${msgId}`);
+    // Something in the catalog or on a card makes the model refuse every call, so nothing narrows down to a message.
+    const { client, requests } = fakeAnthropic(() => ({ stopReason: "refusal", text: "" }));
+    const alerts: { text: string; offer?: { resumeChatId: number } }[] = [];
+    const processChat = createChatProcessor({
+      sql,
+      anthropic: client,
+      config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6 },
+      notifyAdmins: async (text, offer) => void alerts.push({ text, offer }),
+      log: () => {},
+    });
+    await processChat(chat);
+    const [run] = await sql<{ status: string }[]>`SELECT status FROM extraction_runs WHERE chat_id = ${chat.id} ORDER BY id DESC LIMIT 1`;
+    const paused = (await getChat(sql, chat.id))!;
+    expect(paused.chronicle_paused_at).not.toBeNull();
+    expect(alerts.find((alert) => alert.offer)?.text).toContain("I paused the chronicler");
+    // Paused, the chat makes no more calls, not even the weekly clean-up.
+    const made = requests.length;
+    await sql`UPDATE extraction_runs SET started_at = started_at - interval '2 days', finished_at = finished_at - interval '2 days' WHERE chat_id = ${chat.id}`;
+    await processChat(paused);
+    expect(requests).toHaveLength(made);
+    expect(["done", "failed"]).toContain(run!.status);
+
+    const upgraded = chat.id - 900_000;
+    await migrateChat(sql, chat.id, upgraded);
+    expect((await getChat(sql, upgraded))!.chronicle_paused_at).not.toBeNull();
   });
 
   it("backs off a failing clean-up instead of paying for it on every tick", async () => {
