@@ -342,6 +342,27 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       expect(await sql`SELECT user_id, value FROM facts WHERE chat_id = ${chat} AND kind = 'timezone'`).toEqual([{ user_id: kit.id, value: "Берлин" }]);
     });
 
+    it("moves a member's city only on their own word, not on what others say about them", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      const bob = await member(chat, "Bob");
+      const at = (hoursAgo: number) => new Date(Date.now() - hoursAgo * HOUR);
+      const home = await say(chat, kit, "Я живу в Берлине", { at: at(3) });
+      await pass(chat, fakeModel({ main: { ...EMPTY, facts_add: [fact(kit, "timezone", "Берлин", [home])] } }).client);
+      const city = () => sql<{ id: number; value: string }[]>`SELECT id, value FROM facts WHERE chat_id = ${chat} AND kind = 'timezone'`;
+      const id = (await city())[0]!.id;
+      const moveTo = (value: string, sources: number[]) => fakeModel({ main: { ...EMPTY, facts_update: [{ fact_id: id, value, source_msg_ids: sources }] } }).client;
+
+      const rumour = await say(chat, bob, "Кит переехал в Лиссабон", { at: at(2) });
+      await say(chat, kit, "ага, кофе там хороший", { at: at(1.9) });
+      await pass(chat, moveTo("Лиссабон", [rumour]));
+      expect(await city()).toEqual([{ id, value: "Берлин" }]);
+
+      const moved = await say(chat, kit, "Всё, теперь живу в Лиссабоне", { at: at(1) });
+      await pass(chat, moveTo("Лиссабон", [moved]));
+      expect(await city()).toEqual([{ id, value: "Лиссабон" }]);
+    });
+
     it("shows the current notes to the next pass, adds to one that repeats and supersedes one that changed", async () => {
       const chat = await newChat();
       const kit = await member(chat, "Kit");

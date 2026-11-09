@@ -285,6 +285,9 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
   const users = new Map(data.users.map((user) => [user.id, user]));
   const inBatch = (ids: number[]) => ids.filter((id) => batchById.has(id));
   const validSources = memberSources(batchById);
+  // Where someone lives is kept only when they said it themselves, a new place and a changed one alike.
+  const selfStated = (kind: string, userId: number, sources: number[]) =>
+    kind !== "timezone" || sources.some((id) => batchById.get(id)!.user_id === userId);
 
   const batchProjects = await applyProjects(sql, data, result, users, validSources, stats);
   await applyRenames(sql, data, result, validSources, batchProjects, stats);
@@ -326,9 +329,7 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
       }
       const userId = parseRef(item.person);
       const sources = validSources(item.source_msg_ids);
-      // Where someone lives is kept only when they said it themselves.
-      const selfStated = item.kind !== "timezone" || sources.some((id) => batchById.get(id)!.user_id === userId);
-      if (userId === null || !users.has(userId) || sources.length === 0 || !selfStated || item.confidence < MIN_STORED_CONFIDENCE) {
+      if (userId === null || !users.has(userId) || sources.length === 0 || !selfStated(item.kind, userId, sources) || item.confidence < MIN_STORED_CONFIDENCE) {
         stats.factsSkipped += 1;
         continue;
       }
@@ -338,14 +339,16 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
       else stats.factsSkipped += 1;
     }
 
-    const knownFactIds = new Set(data.facts.map((fact) => fact.id));
+    const knownFacts = new Map(data.facts.map((fact) => [fact.id, fact]));
     for (const item of result.facts_update) {
-      if (!knownFactIds.has(item.fact_id)) continue;
+      const fact = knownFacts.get(item.fact_id);
+      if (!fact) continue;
       const sources = validSources(item.source_msg_ids);
       if (sources.length === 0 && inBatch(item.source_msg_ids).length > 0) continue;
       if (item.value === null) {
         if (await deprecateFact(tx, item.fact_id, sources)) stats.factsOutdated += 1;
-      } else if (await rewriteFact(tx, item.fact_id, item.value, sources, "llm")) stats.factsUpdated += 1;
+      } else if (!selfStated(fact.kind, fact.user_id, sources)) stats.factsSkipped += 1;
+      else if (await rewriteFact(tx, item.fact_id, item.value, sources, "llm")) stats.factsUpdated += 1;
     }
 
     stats.signals += await applySignals(tx, data.chatId, runId, result, batchById, users, projectIdOf);
