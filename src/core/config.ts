@@ -40,6 +40,10 @@ const EnvSchema = z.object({
   REPLY_PREMIUM_PER_MEMBER_PER_HOUR: z.coerce.number().int().min(0).default(10),
   /** Cap for the stronger model's answers across all chats, on top of REPLIES_MONTHLY_BUDGET_USD; 0 keeps every answer on REPLY_MODEL. */
   REPLY_PREMIUM_MONTHLY_BUDGET_USD: z.coerce.number().min(0).default(0),
+  /** How often a day the bot may speak up uninvited in a chat, when an argument the chat keeps having flares up again; 0 turns it off. */
+  INTERJECTIONS_PER_CHAT_PER_DAY: z.coerce.number().int().min(0).default(3),
+  /** Hours between two such interjections in one chat. */
+  INTERJECTION_MIN_GAP_HOURS: z.coerce.number().min(0).default(3),
   WEB_DIST_DIR: z.string().default("web/dist"),
   /** Local development only: open the Mini App in a plain browser via a secret link printed at startup. */
   DEV_BROWSER_LOGIN: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),

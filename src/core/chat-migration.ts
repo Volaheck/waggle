@@ -88,7 +88,8 @@ async function moveChatData(tx: Queryable, from: number, to: number): Promise<Ch
   await tx`DELETE FROM members WHERE chat_id = ${from}`;
 
   const messages = await tx`
-    UPDATE messages m SET chat_id = ${to}, msg_id = ${shiftedId(tx, "m.msg_id")}, reply_to_msg_id = ${shiftedId(tx, "m.reply_to_msg_id")}
+    UPDATE messages m SET chat_id = ${to}, msg_id = ${shiftedId(tx, "m.msg_id")}, reply_to_msg_id = ${shiftedId(tx, "m.reply_to_msg_id")},
+           thread_id = ${shiftedId(tx, "m.thread_id")}
     WHERE m.chat_id = ${from}
       AND NOT EXISTS (SELECT 1 FROM messages x WHERE x.chat_id = ${to} AND x.msg_id = ${shiftedId(tx, "m.msg_id")})`;
   await tx`DELETE FROM messages WHERE chat_id = ${from}`;
@@ -145,6 +146,8 @@ async function moveChatData(tx: Queryable, from: number, to: number): Promise<Ch
     UPDATE extraction_runs SET chat_id = ${to}, first_msg_id = ${shiftedId(tx, "first_msg_id")}, last_msg_id = ${shiftedId(tx, "last_msg_id")}
     WHERE chat_id = ${from}`;
 
+  // The gaps and the daily cap of the bot's interjections go on counting under the new id.
+  await tx`UPDATE interjections SET chat_id = ${to}, msg_id = ${shiftedId(tx, "msg_id")} WHERE chat_id = ${from}`;
   await tx`UPDATE llm_usage SET chat_id = ${to} WHERE chat_id = ${from}`;
   await tx`UPDATE users SET current_chat_id = ${to} WHERE current_chat_id = ${from}`;
 

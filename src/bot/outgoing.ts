@@ -30,6 +30,7 @@ export function outgoingLog(sql: Sql, warn: (line: string) => void = console.war
           sentAt: sent.date ? new Date(sent.date * 1000) : new Date(),
           text,
           replyToMsgId: reply?.message_id !== undefined && reply.chat_id === undefined ? reply.message_id : null,
+          threadId: sent.is_topic_message ? (sent.message_thread_id ?? null) : null,
         });
       }
     } catch (error) {

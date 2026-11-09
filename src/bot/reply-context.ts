@@ -23,7 +23,8 @@ import { realReply } from "./kit.js";
 /**
  * The data part of an answer's prompt: who the bot is, the members and the names they go by, the catalog and the
  * chronicle, fuller cards of the people the question is about, the conversation it belongs to and the latest messages.
- * Everything is read from the database; texts go through maskPersonalData.
+ * Everything is read from the database; texts go through maskPersonalData. The interjector's prompt (interjector.ts)
+ * shares its lines, dates and <about_you>.
  */
 
 export interface Question {
@@ -87,11 +88,12 @@ const DETAIL_SIGNALS_PER_KIND = 4;
 const AMBIGUOUS_NAMES = 10;
 
 /** Text from members can't open or close a section of the prompt. */
-function safe(text: string): string {
+export function safe(text: string): string {
   return text.replace(/</g, "‹").replace(/>/g, "›");
 }
 
-function line(text: string, max: number): string {
+/** One masked, prompt-safe line of at most `max` characters. */
+export function line(text: string, max: number): string {
   return safe(truncate(maskPersonalData(text.replace(/\s+/g, " ").trim()), max));
 }
 
@@ -131,16 +133,16 @@ export function asksAboutRating(text: string): boolean {
   return RATING_WORDS.test(text);
 }
 
-interface Clock {
+export interface Clock {
   timezone: string;
   /** YYYY-MM-DD in the display timezone. */
   today: string;
 }
 
-const dayOf = (date: Date, timeZone: string) => date.toLocaleDateString("en-CA", { timeZone });
+export const dayOf = (date: Date, timeZone: string) => date.toLocaleDateString("en-CA", { timeZone });
 
 /** «8 Nov», or «8 Nov 2025» in another year. */
-function dateLabel(date: Date, clock: Clock): string {
+export function dateLabel(date: Date, clock: Clock): string {
   const sameYear = dayOf(date, clock.timezone).slice(0, 4) === clock.today.slice(0, 4);
   return date.toLocaleDateString("en-GB", { day: "numeric", month: "short", ...(sameYear ? {} : { year: "numeric" }), timeZone: clock.timezone });
 }
@@ -151,7 +153,7 @@ function timeLabel(date: Date, clock: Clock): string {
   return dayOf(date, clock.timezone) === clock.today ? time : `${dateLabel(date, clock)} ${time}`;
 }
 
-interface ContextMessage {
+export interface ContextMessage {
   msg_id: number;
   sent_at: Date;
   text: string;
@@ -163,7 +165,7 @@ interface ContextMessage {
   display_name: string | null;
 }
 
-function messageLine(row: ContextMessage, clock: Clock, max: number): string {
+export function messageLine(row: ContextMessage, clock: Clock, max: number): string {
   const author = row.from_bot ? "Waggle" : safe(row.display_name ?? "someone");
   const reply = row.reply_to_bot ? " ↩Waggle" : row.reply_to_msg_id ? ` ↩${row.reply_to_msg_id}` : "";
   const media = row.media_type ? ` [${row.media_type}]` : "";
@@ -211,7 +213,7 @@ const ALIAS_SOURCE: Record<NamedAlias["source"], { person: string; project: stri
   chronicler: { person: "chronicler", project: "chronicler" },
 };
 
-function aliasLabel(alias: NamedAlias): string {
+export function aliasLabel(alias: NamedAlias): string {
   return `${safe(maskPersonalData(alias.alias))} (${ALIAS_SOURCE[alias.source][alias.user_id === null ? "project" : "person"]})`;
 }
 
@@ -277,7 +279,7 @@ const NOTE_COLUMNS = "id, user_id, kind, about, value, status, due_at, user_ids,
 
 const quoted = (note: ContextNote, max = 120) => `“${line(note.value, max)}”`;
 
-function aboutYouBlock(input: {
+export function aboutYouBlock(input: {
   me: UserFromGetMe;
   model: string;
   owners: { id: number; display_name: string; username: string | null }[];

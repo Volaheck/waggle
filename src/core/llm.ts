@@ -181,6 +181,8 @@ export interface StructuredRequest<T> {
   system: string;
   prompt: string;
   schema: z.ZodType<T>;
+  /** "low", the chronicler's, when not given. */
+  effort?: "low" | "medium" | "high";
   /** Called with the usage of every billed response, before anything is checked: failed calls cost money too. */
   onUsage: (usage: UsageLike) => Promise<void>;
   /** Cancels the call (the bot is stopping); the usage it reached is still recorded. */
@@ -212,7 +214,7 @@ export async function callStructured<T>(anthropic: Anthropic, request: Structure
     {
       model: request.model,
       max_tokens: request.maxTokens,
-      output_config: { effort: "low", format: structuredOutputFormat(request.schema) },
+      output_config: { effort: request.effort ?? "low", format: structuredOutputFormat(request.schema) },
       // No prompt caching: passes run hours apart, far beyond the cache TTL, so a cache write would only cost extra.
       system: request.system,
       messages: [{ role: "user", content: request.prompt }],

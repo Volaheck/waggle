@@ -72,6 +72,12 @@ export async function resumeChronicle(sql: Sql, chatId: number): Promise<boolean
   return resumed.count > 0;
 }
 
+/** An owner lets the bot speak up uninvited in a chat, or stops it; undefined for an unknown chat. */
+export async function setInterjections(sql: Sql, chatId: number, on: boolean): Promise<Chat | undefined> {
+  const [chat] = await sql<Chat[]>`UPDATE chats SET interjections = ${on} WHERE id = ${chatId} RETURNING *`;
+  return chat;
+}
+
 export async function isApproved(sql: Sql, chatId: number): Promise<boolean> {
   const [row] = await sql<{ ok: boolean }[]>`SELECT status = 'approved' AS ok FROM chats WHERE id = ${chatId}`;
   return Boolean(row?.ok);

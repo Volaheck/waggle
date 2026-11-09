@@ -199,13 +199,19 @@ export async function setOptOut(sql: Sql, userId: number, optedOut: boolean, cha
 
 /**
  * /forgetme and "stop collecting" in one chat (or, without a chat id, everywhere). With `messages` the text of
- * the person's messages is blanked too, and so is the text of the bot's answers to them.
+ * the person's messages is blanked too, and so is the text of the bot's answers to them (an interjection's copy in
+ * its log included).
  */
 export async function forgetUser(sql: Sql, userId: number, options: { chatId?: number; messages: boolean }): Promise<void> {
   const scope = options.chatId ?? null;
   await sql.begin(async (tx) => {
     await applyOptOut(tx, userId, true, scope);
     if (!options.messages) return;
+    await tx`
+      UPDATE interjections said SET text = NULL
+      FROM messages answer JOIN messages asked ON asked.chat_id = answer.chat_id AND asked.msg_id = answer.reply_to_msg_id
+      WHERE said.chat_id = answer.chat_id AND said.msg_id = answer.msg_id AND answer.from_bot
+        AND asked.user_id = ${userId} AND (${scope}::bigint IS NULL OR answer.chat_id = ${scope}::bigint)`;
     await tx`
       UPDATE messages answer SET text = '', extracted_at = now()
       FROM messages asked

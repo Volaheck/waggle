@@ -2,7 +2,10 @@
 -- people and the chat, debates in the chronicle and the bot speaking up on its own.
 
 -- Telegram never sends the bot its own messages, so the bot stores what it posts in a group itself (user_id is NULL).
-ALTER TABLE messages ADD COLUMN from_bot boolean NOT NULL DEFAULT false;
+-- thread_id is the forum topic a message was posted in (Telegram's message_thread_id), NULL outside topics.
+ALTER TABLE messages
+  ADD COLUMN from_bot boolean NOT NULL DEFAULT false,
+  ADD COLUMN thread_id bigint;
 
 -- What a member or a project is called in the chat: set by a bot owner, by the person themselves, or noticed by the chronicler.
 CREATE TABLE aliases (
@@ -53,7 +56,8 @@ ALTER TABLE chronicle
 -- The bot may speak up uninvited when a recurring argument flares up again; an owner turns that off per chat.
 ALTER TABLE chats ADD COLUMN interjections boolean NOT NULL DEFAULT true;
 
--- Every check of whether to speak up, spoken or not: the gaps and the daily cap are counted from here.
+-- Every model check of whether to speak up, spoken or not: the gaps and the daily cap are counted from here. msg_id is
+-- the message the bot posted and text what it said (cleared like message texts); both stay NULL when it kept quiet.
 CREATE TABLE interjections (
   id         serial PRIMARY KEY,
   chat_id    bigint NOT NULL,

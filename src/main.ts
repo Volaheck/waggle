@@ -57,7 +57,7 @@ for (const [name, model] of [
 }
 
 const anthropic = config.ANTHROPIC_API_KEY ? createAnthropic(config.ANTHROPIC_API_KEY) : undefined;
-const { bot, membership, assistant, onJoined } = createBot({ sql, config, anthropic });
+const { bot, membership, assistant, interjector, onJoined } = createBot({ sql, config, anthropic });
 await bot.init();
 // With sql, owners removed from ADMIN_TG_IDS also lose their owner command menu.
 await registerCommands(bot, config.ADMIN_TG_IDS, sql).catch((error) => console.warn("[bot] could not register commands:", error));
@@ -118,6 +118,8 @@ const shutdown = async (signal: string) => {
   console.log(`[main] ${signal}, shutting down`);
   stopNameSync();
   stopRetention();
+  // The bot does not start speaking up uninvited any more; a check under way finishes with the answers below.
+  interjector?.stop();
   // The bot keeps serving while the chronicler call under way finishes; no new call starts. A call that takes longer
   // is cancelled with its usage so far recorded, and the pass continues after the restart (batches are applied whole).
   if (!(await settledWithin(PASS_WAIT_MS + CANCEL_WAIT_MS, [stopScheduler(PASS_WAIT_MS)]))) {
@@ -128,8 +130,10 @@ const shutdown = async (signal: string) => {
   }
   server.close();
   if (webhook && !(await settledWithin(WEBHOOK_UPDATES_WAIT_MS, [webhook.settle()]))) console.warn("[main] some updates are still being handled; stopping anyway");
-  // Answers to mentions already under way are sent before the database closes.
-  if (assistant && !(await settledWithin(REPLIES_WAIT_MS, [assistant.idle()]))) console.warn("[main] some answers to mentions did not finish; stopping anyway");
+  // Answers to mentions already under way, and an interjection being checked, are sent before the database closes.
+  if (assistant && !(await settledWithin(REPLIES_WAIT_MS, [assistant.idle(), interjector?.idle()]))) {
+    console.warn("[main] some answers to mentions did not finish; stopping anyway");
+  }
   await sql.end({ timeout: 5 });
   process.exit(0);
 };

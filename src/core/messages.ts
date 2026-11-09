@@ -12,6 +12,8 @@ export interface IncomingMessage {
   isForward: boolean;
   forwardSource: string | null;
   mediaType: string | null;
+  /** The forum topic the message was posted in. */
+  threadId?: number | null;
 }
 
 export interface StoredMessage {
@@ -32,9 +34,10 @@ export interface StoredMessage {
 /** Returns false when the message was stored already (Telegram delivered the update again). */
 export async function saveMessage(sql: Sql, message: IncomingMessage): Promise<boolean> {
   const inserted = await sql`
-    INSERT INTO messages (chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, reply_to_bot, is_forward, forward_source, media_type)
+    INSERT INTO messages (chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, reply_to_bot, is_forward, forward_source, media_type, thread_id)
     VALUES (${message.chatId}, ${message.msgId}, ${message.userId}, ${message.sentAt}, ${message.text},
-            ${message.replyToMsgId}, ${message.replyToBot ?? false}, ${message.isForward}, ${message.forwardSource}, ${message.mediaType})
+            ${message.replyToMsgId}, ${message.replyToBot ?? false}, ${message.isForward}, ${message.forwardSource}, ${message.mediaType},
+            ${message.threadId ?? null})
     ON CONFLICT (chat_id, msg_id) DO NOTHING`;
   if (message.userId !== null) {
     await sql`
@@ -54,6 +57,7 @@ export interface OutgoingMessage {
   sentAt: Date;
   text: string;
   replyToMsgId: number | null;
+  threadId?: number | null;
 }
 
 /**
@@ -63,8 +67,8 @@ export interface OutgoingMessage {
  */
 export async function saveBotMessage(sql: Queryable, message: OutgoingMessage): Promise<boolean> {
   const inserted = await sql`
-    INSERT INTO messages (chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, from_bot)
-    SELECT ${message.chatId}, ${message.msgId}, NULL, ${message.sentAt}, ${message.text}, ${message.replyToMsgId}, true
+    INSERT INTO messages (chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, from_bot, thread_id)
+    SELECT ${message.chatId}, ${message.msgId}, NULL, ${message.sentAt}, ${message.text}, ${message.replyToMsgId}, true, ${message.threadId ?? null}
     WHERE EXISTS (SELECT 1 FROM chats WHERE id = ${message.chatId} AND status = 'approved')
     ON CONFLICT (chat_id, msg_id) DO NOTHING`;
   return inserted.count > 0;
@@ -84,13 +88,15 @@ export async function updateEditedMessage(sql: Sql, chatId: number, msgId: numbe
  * Message texts are kept no longer than they are needed: a message older than `retentionDays` that the chronicler
  * has processed loses its text and the name of the source it was forwarded from. The row stays (author, time, ids),
  * so links to the message and activity counts keep working. A message still waiting for the chronicler (a paused
- * chronicler, a used-up budget) keeps its text until it is processed. Returns how many messages were cleared.
+ * chronicler, a used-up budget) keeps its text until it is processed. The log of the bot's interjections loses the
+ * copies of its lines at the same age. Returns how many messages were cleared.
  */
 export async function clearExpiredTexts(sql: Queryable, retentionDays: number): Promise<number> {
   const cleared = await sql`
     UPDATE messages SET text = '', forward_source = NULL
     WHERE extracted_at IS NOT NULL AND sent_at < now() - ${`${retentionDays} days`}::interval
       AND (text <> '' OR forward_source IS NOT NULL)`;
+  await sql`UPDATE interjections SET text = NULL WHERE text IS NOT NULL AND created_at < now() - ${`${retentionDays} days`}::interval`;
   return cleared.count;
 }
 

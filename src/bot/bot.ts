@@ -2,7 +2,21 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { Bot, GrammyError, InlineKeyboard, type Transformer } from "grammy";
 import type { Message, User as TelegramUser } from "grammy/types";
 import { migrateChat } from "../core/chat-migration.js";
-import { allChats, approvedChats, attachLegacyData, chatsOfUser, getChat, isApproved, legacyStats, registerChat, resumeChronicle, setChatStatus, setCurrentChat } from "../core/chats.js";
+import {
+  allChats,
+  approvedChats,
+  attachLegacyData,
+  chatsOfUser,
+  getChat,
+  isApproved,
+  legacyStats,
+  registerChat,
+  resumeChronicle,
+  setChatStatus,
+  setCurrentChat,
+  setInterjections,
+  type Chat,
+} from "../core/chats.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
 import { monthSpendUsd } from "../core/llm.js";
@@ -17,6 +31,7 @@ import { registerCatalog } from "./catalog.js";
 import { catchupHtml, clampTelegram, countOf, formatDate, userHeader } from "./format.js";
 import { registerAliases } from "./aliases.js";
 import { createAssistant, isAddressedToBot, PREMIUM_REPLY_PURPOSE, repliesSpendUsd, type Assistant, type AssistantDeps } from "./assistant.js";
+import { createInterjector, type Interjector } from "./interjector.js";
 import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
 import { isInChat, MembershipCache } from "./membership.js";
 import { registerNotes } from "./notes.js";
@@ -30,6 +45,8 @@ export interface BotDeps {
   anthropic?: Anthropic;
   /** Tests shorten the answers' rate limits. */
   answerLimits?: AssistantDeps["limits"];
+  /** Tests shorten the time between two looks at a chat for an interjection. */
+  interjectionDebounceMs?: number;
   /** Tests stand in for Telegram here: installed first, so the log of the bot's own messages runs on top of it. */
   transport?: Transformer;
 }
@@ -62,7 +79,7 @@ const PRIVATE_COMMANDS = [
 const HELP_TEXT = [
   "🐝 <b>Waggle — the chat's chronicler</b>",
   "",
-  "I read the chat and keep a chronicle, member cards and a project catalog. In the group I stay quiet until someone calls me: mention me or reply to my message and ask about the people here, their projects or what the chat discussed.",
+  "I read the chat and keep a chronicle, member cards and a project catalog. In the group I mostly keep quiet: mention me or reply to my message and ask about the people here, their projects or what the chat discussed. Now and then, when the chat is back on an old argument, I may chip in uninvited.",
   "",
   "<b>People</b>",
   "/me — your card: fix, add, hide",
@@ -143,10 +160,13 @@ const CARD_OFFER_BUTTONS = 6;
 /** Questions to the owners about newcomers, per chat per day: a crowd joining at once does not flood their DMs. */
 const CARD_OFFERS_PER_CHAT_PER_DAY = 10;
 
+const CHAT_LABELS: Record<string, string> = { pending: "⏳ pending", approved: "✅ active", rejected: "🚫 rejected", left: "👋 left" };
+
 export function createBot(deps: BotDeps): {
   bot: Bot<BotContext>;
   membership: MembershipCache;
   assistant?: Assistant;
+  interjector?: Interjector;
   /** Call when an account appears in a chat for the first time outside the bot (the Mini App): the owners may be asked about it. */
   onJoined: (chatId: number, user: User) => void;
   /** Resolves once the questions to the owners about accounts seen so far have been sent. */
@@ -156,6 +176,11 @@ export function createBot(deps: BotDeps): {
   // Answers are off without a key or with a zero cap; a mention then gets the help text instead.
   const assistant =
     deps.anthropic && config.REPLIES_MONTHLY_BUDGET_USD > 0 ? createAssistant({ sql, anthropic: deps.anthropic, config, limits: deps.answerLimits }) : undefined;
+  // Speaking up uninvited spends from the answers' caps, so it is on only where answers are.
+  const interjector =
+    deps.anthropic && assistant && config.INTERJECTIONS_PER_CHAT_PER_DAY > 0
+      ? createInterjector({ sql, anthropic: deps.anthropic, config, answering: assistant.answering, debounceMs: deps.interjectionDebounceMs })
+      : undefined;
   const bot = new Bot<BotContext>(config.BOT_TOKEN);
   if (deps.transport) bot.api.config.use(deps.transport);
   bot.api.config.use(outgoingLog(sql));
@@ -276,7 +301,7 @@ export function createBot(deps: BotDeps): {
   }
 
   const greeting = () =>
-    `🐝 Hi! I'm Waggle, the chat's chronicler. Every ${config.EXTRACTION_INTERVAL_HOURS} h I go through new messages and keep a chronicle, member cards and a project catalog. In the group I stay quiet until someone calls me: mention me or reply to my message to ask about the people here, their projects or what the chat discussed. Commands — /help`;
+    `🐝 Hi! I'm Waggle, the chat's chronicler. Every ${config.EXTRACTION_INTERVAL_HOURS} h I go through new messages and keep a chronicle, member cards and a project catalog. In the group I mostly keep quiet: mention me or reply to my message to ask about the people here, their projects or what the chat discussed. Commands — /help`;
 
   async function greetApproved(chatId: number) {
     await bot.api
@@ -444,29 +469,42 @@ export function createBot(deps: BotDeps): {
     );
   });
 
+  /** A chat as /chats lists it, with what an owner can do there; an approved chat also says whether the bot may speak up uninvited. */
+  async function chatEntry(chat: Chat): Promise<{ html: string; keyboard?: InlineKeyboard }> {
+    const paused = chat.status === "approved" && chat.chronicle_paused_at !== null;
+    const label = paused ? "⏸ chronicler paused" : CHAT_LABELS[chat.status];
+    const why = paused && chat.chronicle_pause_reason ? `\n${escapeHtml(chat.chronicle_pause_reason)}` : "";
+    const head = `<b>${escapeHtml(chat.title ?? String(chat.id))}</b> · ${label}\n<code>${chat.id}</code>${why}`;
+    if (chat.status === "pending") return { html: head, keyboard: chatButtons(chat.id) };
+    if (chat.status === "rejected") return { html: head, keyboard: new InlineKeyboard().text("✅ Approve after all", `chatok:${encodeChat(chat.id)}`) };
+    if (chat.status !== "approved") return { html: head };
+    const nowhere = interjector ? "" : " (the bot speaks up nowhere: answers are off or INTERJECTIONS_PER_CHAT_PER_DAY is 0)";
+    const interjections = chat.interjections ? `🗣 Speaks up uninvited: on${nowhere}` : `🤐 Speaks up uninvited: off${nowhere}`;
+    const keyboard = (paused ? resumeButton(chat.id) : await legacyOffer(chat.id))?.row() ?? new InlineKeyboard();
+    keyboard.text(chat.interjections ? "🤐 Stop speaking up" : "🗣 Let it speak up", `interject:${encodeChat(chat.id)}:${chat.interjections ? "off" : "on"}`);
+    return { html: `${head}\n${interjections}`, keyboard };
+  }
+
   bot.command("chats", async (ctx) => {
     if (!ctx.from || !kit.isPrivate(ctx)) return;
     const owner = await kit.identity(ctx.from);
     if (!kit.isOwner(owner)) return;
     const chats = await allChats(sql);
     if (chats.length === 0) return void (await kit.show(ctx, "I haven't been added anywhere yet. Add the bot to a group and I'll send you an approval request."));
-    const labels: Record<string, string> = { pending: "⏳ pending", approved: "✅ active", rejected: "🚫 rejected", left: "👋 left" };
     for (const chat of chats) {
-      const paused = chat.status === "approved" && chat.chronicle_paused_at !== null;
-      const keyboard =
-        chat.status === "pending"
-          ? chatButtons(chat.id)
-          : paused
-            ? resumeButton(chat.id)
-            : chat.status === "approved"
-              ? await legacyOffer(chat.id)
-              : chat.status === "rejected"
-                ? new InlineKeyboard().text("✅ Approve after all", `chatok:${encodeChat(chat.id)}`)
-                : undefined;
-      const label = paused ? "⏸ chronicler paused" : labels[chat.status];
-      const why = paused && chat.chronicle_pause_reason ? `\n${escapeHtml(chat.chronicle_pause_reason)}` : "";
-      await kit.show(ctx, `<b>${escapeHtml(chat.title ?? String(chat.id))}</b> · ${label}\n<code>${chat.id}</code>${why}`, keyboard);
+      const { html, keyboard } = await chatEntry(chat);
+      await kit.show(ctx, html, keyboard);
     }
+  });
+
+  bot.callbackQuery(/^interject:c(\d+):(on|off)$/, async (ctx) => {
+    const owner = await kit.identity(ctx.from);
+    if (!kit.isOwner(owner)) return ctx.answerCallbackQuery({ text: "That's up to the bot owner" });
+    const chat = await setInterjections(sql, -Number(ctx.match[1]), ctx.match[2] === "on");
+    if (!chat) return ctx.answerCallbackQuery({ text: "I don't know that chat" });
+    await ctx.answerCallbackQuery({ text: chat.interjections ? "It may speak up there" : "It stays quiet there unless called" });
+    const { html, keyboard } = await chatEntry(chat);
+    return kit.show(ctx, html, keyboard, { edit: true });
   });
 
   // ---------- Archiving: every group message is stored before commands run. It never calls the LLM ----------
@@ -517,11 +555,17 @@ export function createBot(deps: BotDeps): {
             isForward: Boolean(message.forward_origin || message.is_automatic_forward),
             forwardSource: forwardSourceOf(message),
             mediaType: mediaTypeOf(message),
+            threadId: message.is_topic_message ? (message.message_thread_id ?? null) : null,
           });
-          // A member who mentions the bot or replies to it gets an answer, in the background (see assistant.ts).
-          // A redelivered update must not buy a second answer.
-          if (assistant && isNew && person && !message.forward_origin && isAddressedToBot(message, ctx.me)) {
-            assistant.answer(ctx.api, { chatId, chatTitle: ctx.chat.title ?? null, message, from: person, me: ctx.me });
+          // A member who mentions the bot or replies to it gets an answer, in the background (see assistant.ts); any
+          // other message of a member may be the moment to speak up uninvited (see interjector.ts). A redelivered
+          // update must not buy a second answer or another look.
+          if (isNew && person && !message.forward_origin) {
+            if (assistant && isAddressedToBot(message, ctx.me)) {
+              assistant.answer(ctx.api, { chatId, chatTitle: ctx.chat.title ?? null, message, from: person, me: ctx.me });
+            } else {
+              interjector?.consider(ctx.api, chatId, ctx.me);
+            }
           }
         }
       }
@@ -677,7 +721,13 @@ export function createBot(deps: BotDeps): {
     if (!ctx.from) return;
     const user = await kit.identity(ctx.from);
     if (!kit.isOwner(user)) return;
-    const lines = ["<b>Status</b>", `Chronicler: every ${config.EXTRACTION_INTERVAL_HOURS} h`];
+    const lines = [
+      "<b>Status</b>",
+      `Chronicler: every ${config.EXTRACTION_INTERVAL_HOURS} h`,
+      interjector
+        ? `Speaking up uninvited: at most ${countOf(config.INTERJECTIONS_PER_CHAT_PER_DAY, "time")} a chat a day, ${config.INTERJECTION_MIN_GAP_HOURS} h apart`
+        : "Speaking up uninvited: off (answers are off or INTERJECTIONS_PER_CHAT_PER_DAY is 0)",
+    ];
     for (const chat of await approvedChats(sql)) {
       const [last] = await sql<{ at: Date | null; status: string; error: string | null; messages_count: number }[]>`
         SELECT finished_at AS at, status, error, messages_count FROM extraction_runs WHERE chat_id = ${chat.id} ORDER BY id DESC LIMIT 1`;
@@ -698,6 +748,10 @@ export function createBot(deps: BotDeps): {
         FROM extraction_runs r, jsonb_array_elements(coalesce(r.stats->'skipped', '[]'::jsonb)) AS range
         WHERE r.chat_id = ${chat.id} AND r.started_at > now() - interval '30 days'`;
       const [passRetry, cleanupRetry] = await Promise.all([nextExtractionRetryAt(sql, chat.id), nextConsolidationRetryAt(sql, chat.id)]);
+      const zone = config.DISPLAY_TIMEZONE;
+      const [interjections] = await sql<{ checks: number; spoken: number }[]>`
+        SELECT count(*)::int AS checks, count(*) FILTER (WHERE spoke)::int AS spoken FROM interjections
+        WHERE chat_id = ${chat.id} AND created_at >= (date_trunc('day', now() AT TIME ZONE ${zone}) AT TIME ZONE ${zone})`;
       const lastLine = last
         ? `${last.at ? formatDate(last.at, config.DISPLAY_TIMEZONE) : "running now"} · ${last.status} · ${countOf(last.messages_count, "message")}${last.error ? `\n⚠️ ${escapeHtml(last.error)}` : ""}`
         : "none yet";
@@ -714,6 +768,9 @@ export function createBot(deps: BotDeps): {
           later(cleanupRetry) ? `⚠️ The weekly card clean-up failed; next attempt ${later(cleanupRetry)}` : "",
           skipped?.messages ? `⚠️ Skipped in the last 30 days: ${countOf(skipped.messages, "message")} the chronicler could not process` : "",
           `Members: ${counts?.members}, facts: ${counts?.facts}, projects: ${counts?.projects}, topics: ${counts?.topics}, private notes: ${counts?.notes} (/notes)`,
+          interjector || interjections?.checks
+            ? `Interjections today: ${countOf(interjections?.checks ?? 0, "check")}, ${interjections?.spoken ?? 0} spoken${chat.interjections ? "" : "; off here (/chats)"}`
+            : "",
           counts?.unlinked?.length
             ? `Unlinked cards: ${counts.unlinked.map(escapeHtml).join(", ")} — /link @username Name in the chat, or /link Name as a reply to the person`
             : "All cards are linked",
@@ -770,7 +827,7 @@ export function createBot(deps: BotDeps): {
     if (error.ctx.callbackQuery) void error.ctx.answerCallbackQuery({ text: "Something went wrong 😕" }).catch(() => {});
   });
 
-  return { bot, membership, assistant, onJoined, cardOffersIdle: async () => void (await Promise.allSettled([...pendingOffers])) };
+  return { bot, membership, assistant, interjector, onJoined, cardOffersIdle: async () => void (await Promise.allSettled([...pendingOffers])) };
 }
 
 const OWNER_COMMANDS = [

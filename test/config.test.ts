@@ -20,6 +20,8 @@ describe("loadConfig", () => {
     expect(config.WEBHOOK_SECRET).toBeUndefined();
     expect(config.BOT_APP_SHORT_NAME).toBeUndefined();
     expect(config.MESSAGE_RETENTION_DAYS).toBe(7);
+    expect(config.INTERJECTIONS_PER_CHAT_PER_DAY).toBe(3);
+    expect(config.INTERJECTION_MIN_GAP_HOURS).toBe(3);
   });
 
   it("treats keys left blank in .env as not set, so defaults apply", () => {
