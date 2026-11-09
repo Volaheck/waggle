@@ -21,6 +21,7 @@ import { CONSOLIDATION_SYSTEM_PROMPT } from "../src/worker/consolidate.js";
 import { EXTRACTION_SYSTEM_PROMPT, ExtractionSchema, FACT_ADD_KINDS, runExtractionPass, TOPIC_KINDS, type ExtractionResult } from "../src/worker/extract.js";
 import { NOTES_PURPOSE, NOTES_SYSTEM_PROMPT, NotesSchema, type NotesResult } from "../src/worker/notes-extract.js";
 import { createChatProcessor } from "../src/worker/scheduler.js";
+import { areThemesDue, buildThemes, THEMES_PURPOSE, THEMES_SYSTEM_PROMPT, type ThemesResult } from "../src/worker/themes-index.js";
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
 const TOKEN = "123456:TEST-TOKEN";
@@ -620,46 +621,131 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
   });
 
   describe("recurring themes", () => {
-    it("cluster arguments the same people keep having, whatever alphabet the tools are named in", async () => {
+    /** Answers the daily theme index with `answer`, keeping each prompt. */
+    const themesModel = (answer: ThemesResult) => {
+      const prompts: string[] = [];
+      const client = {
+        messages: {
+          stream(params: { system: string; messages: { content: string }[] }) {
+            expect(params.system).toBe(THEMES_SYSTEM_PROMPT);
+            prompts.push(params.messages[0]!.content);
+            const message = { stop_reason: "end_turn", stop_details: null, content: [{ type: "text", text: JSON.stringify(answer) }], usage: { input_tokens: 20_000, output_tokens: 1_000 } };
+            return { currentMessage: message, finalMessage: async () => message };
+          },
+        },
+      } as unknown as Anthropic;
+      return { client, prompts };
+    };
+    const build = (chat: number, client: Anthropic) =>
+      buildThemes(sql, client, { model: "claude-sonnet-5-5", timeZone: "UTC", budget: { totalUsd: 500, chatId: chat, chatUsd: 50 } });
+
+    it("are what the model grouped from the chronicle: known topics on two days or more, each in one theme, met in either alphabet", async () => {
       const chat = await newChat();
       const kit = await member(chat, "Kit");
       const bob = await member(chat, "Bob");
       const dora = await member(chat, "Dora");
       const eve = await member(chat, "Eve");
       const [run] = await sql<{ id: number }[]>`INSERT INTO extraction_runs (chat_id) VALUES (${chat}) RETURNING id`;
-      const topic = async (title: string, daysAgo: number, userIds: number[], kind = "debate", heat = 10) => {
+      const topic = async (title: string, daysAgo: number, userIds: number[], kind = "debate") => {
         const at = new Date(Date.now() - daysAgo * DAY);
         const [row] = await sql<{ id: number }[]>`
           INSERT INTO chronicle (chat_id, run_id, period_from, period_to, title, summary, kind, user_ids, heat)
-          VALUES (${chat}, ${run!.id}, ${at}, ${at}, ${title}, 'Each side kept its view.', ${kind}, ${userIds}, ${heat}) RETURNING id`;
+          VALUES (${chat}, ${run!.id}, ${at}, ${at}, ${title}, 'Each side kept its view.', ${kind}, ${userIds}, 10) RETURNING id`;
         return row!.id;
       };
       const first = await topic("Claude против Codex для фронтенда", 40, [kit.id, bob.id]);
-      await topic("Клод vs Кодекс: кто пишет фронтенд лучше", 20, [bob.id, kit.id]);
-      await topic("Опус против GPT во фронтенде", 2, [kit.id, bob.id, dora.id]);
-      // Shares the tools but only one person; too old; too cold; on one day only.
-      await topic("Claude Code или Cursor для фронтенда", 10, [dora.id, eve.id]);
-      await topic("Claude против Codex, начало", 200, [kit.id, bob.id]);
-      await topic("Codex против Claude во фронтенде", 5, [kit.id, bob.id], "discussion", 10);
-      await topic("Rust или Go для сервера", 3, [dora.id, bob.id], "discussion", 60);
-      await topic("Раст против Go на сервере", 3, [bob.id, dora.id], "discussion", 45);
+      const second = await topic("Клод vs Кодекс: кто пишет фронтенд лучше", 20, [bob.id, kit.id], "discussion");
+      const third = await topic("Опус против GPT во фронтенде", 2, [kit.id, bob.id, dora.id]);
+      const sameDay = [await topic("Rust или Go для сервера", 3, [dora.id, bob.id], "discussion"), await topic("Раст против Go на сервере", 3, [bob.id, dora.id], "discussion")];
+      const mortgage = [await topic("Ипотека или аренда", 9, [kit.id, eve.id], "discussion"), await topic("Снова про аренду", 8, [eve.id, kit.id], "discussion")];
+      // Not shown to the model: someone's project, a talk of one, one too old.
+      const project = await topic("Kit показывает свой лендинг", 5, [kit.id, bob.id], "project");
+      const alone = await topic("Eve о своём лендинге", 6, [eve.id]);
+      const old = await topic("Claude против Codex, начало", 200, [kit.id, bob.id]);
+
+      expect(await areThemesDue(sql, chat)).toBe(true);
+      const model = themesModel({
+        themes: [
+          { title: "Claude против Codex во фронтенде", topic_ids: [first, second, third, third, project, old, 999_999], keywords: ["Claude", "Codex", "GPT", " фронтенд ", "вёрстка", "лендинг", "фронтенд"] },
+          { title: "Rust или Go на сервере", topic_ids: sameDay, keywords: ["Rust", "Go", "сервер"] },
+          { title: "Снова фронтенд", topic_ids: [second, third], keywords: ["фронтенд"] },
+          { title: "Ипотека или аренда", topic_ids: mortgage, keywords: ["ипотека", "аренда"] },
+          { title: "Табы и пробелы", topic_ids: [first, alone], keywords: ["табы"] },
+        ],
+      });
+      expect(await build(chat, model.client)).toEqual({ themes: 1, topics: 7 });
+      const [prompt] = model.prompts;
+      expect(prompt).toContain(`[t${first}] ${isoDay(new Date(Date.now() - 40 * DAY))} · Kit, Bob · Claude против Codex для фронтенда — Each side kept its view.`);
+      for (const title of ["свой лендинг", "о своём лендинге", "начало"]) expect(prompt).not.toContain(title);
+      expect(await sql`SELECT purpose FROM llm_usage WHERE chat_id = ${chat}`).toEqual([{ purpose: THEMES_PURPOSE }]);
+      expect(await areThemesDue(sql, chat)).toBe(false);
 
       const themes = await recurringThemes(sql, chat);
       const debates = themes.filter((theme) => theme.kind === "debate");
       expect(debates).toHaveLength(1);
-      expect(debates[0]!.key).toBe(`t${first}`);
-      expect(debates[0]!.topics.map((entry) => entry.title)).toEqual(["Claude против Codex для фронтенда", "Клод vs Кодекс: кто пишет фронтенд лучше", "Опус против GPT во фронтенде"]);
-      expect(debates[0]!.keywords).toEqual(expect.arrayContaining(["anthropic", "openai", "фронтенд"]));
-      expect(debates[0]!.title).toBe("Опус против GPT во фронтенде");
+      expect(debates[0]).toMatchObject({ key: `t${first}`, title: "Claude против Codex во фронтенде" });
+      expect(debates[0]!.topics.map((entry) => entry.id)).toEqual([first, second, third]);
+      expect(debates[0]!.keywords).toEqual(expect.arrayContaining(["anthropic", "openai", "фронтенд", "лендинг"]));
       expect(debates[0]!.userIds.slice(0, 2).sort()).toEqual([kit.id, bob.id].sort());
 
       const [segment] = await textTerms(sql, ["опять клод против жпт, и фронтенд на нём"]);
       expect(themesMatching(themes, segment!, { minShared: 3 }).map((match) => match.theme.key)).toEqual([`t${first}`]);
       expect(themesMatching(themes, segment!, { minShared: 3, userIds: [dora.id] })).toHaveLength(1);
+      expect(themesMatching(themes, segment!, { minShared: 3, userIds: [eve.id] })).toEqual([]);
       expect(themesMatching(themes, segment!, { minShared: 4 })).toEqual([]);
 
       const focus = block(await contextFor(asking(chat, kit, "ну что, опять спорим?")), "in_focus")!;
-      expect(focus).toMatch(/🔒 keeps arguing: with Bob(?: and Dora)? about “Опус против GPT во фронтенде”: 3 times, \d{1,2} \w{3,4}, \d{1,2} \w{3,4}, \d{1,2} \w{3,4}/);
+      expect(focus).toMatch(/🔒 keeps coming back to: with Bob(?: and Dora)? about “Claude против Codex во фронтенде”: 3 times, \d{1,2} \w{3,4}, \d{1,2} \w{3,4}, \d{1,2} \w{3,4}/);
+
+      // The next build is a day later, and only once the chronicle has a topic it did not see.
+      await sql`UPDATE app_state SET updated_at = now() - interval '25 hours' WHERE key = ${`themes:${chat}`}`;
+      await sql`UPDATE chronicle SET created_at = now() - interval '26 hours' WHERE chat_id = ${chat}`;
+      expect(await areThemesDue(sql, chat)).toBe(false);
+      await topic("Codex снова против Claude", 0, [kit.id, bob.id]);
+      expect(await areThemesDue(sql, chat)).toBe(true);
+      expect(await build(chat, themesModel({ themes: [] }).client)).toEqual({ themes: 0, topics: 8 });
+      expect((await recurringThemes(sql, chat)).filter((theme) => theme.kind === "debate")).toEqual([]);
+    });
+
+    it("are rebuilt on the chronicler's schedule, once a day", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      const bob = await member(chat, "Bob");
+      const [run] = await sql<{ id: number }[]>`INSERT INTO extraction_runs (chat_id) VALUES (${chat}) RETURNING id`;
+      const ids: number[] = [];
+      for (const daysAgo of [9, 2]) {
+        const at = new Date(Date.now() - daysAgo * DAY);
+        const [row] = await sql<{ id: number }[]>`
+          INSERT INTO chronicle (chat_id, run_id, period_from, period_to, title, summary, kind, user_ids)
+          VALUES (${chat}, ${run!.id}, ${at}, ${at}, 'Табы или пробелы', 'Each side kept its view.', 'debate', ${[kit.id, bob.id]}) RETURNING id`;
+        ids.push(row!.id);
+      }
+      const model = themesModel({ themes: [{ title: "Табы или пробелы", topic_ids: ids, keywords: ["табы", "пробелы", "отступы"] }] });
+      const lines: string[] = [];
+      const processChat = createChatProcessor({
+        sql,
+        anthropic: model.client,
+        config: { EXTRACTION_MODEL: "claude-sonnet-5-5", MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6 },
+        notifyAdmins: async () => {},
+        log: (line) => void lines.push(line),
+      });
+      await processChat((await getChat(sql, chat))!);
+      await processChat((await getChat(sql, chat))!);
+      expect(model.prompts).toHaveLength(1);
+      expect(lines).toContain("[themes] Hive: 1 recurring theme(s) from 2 topic(s)");
+      expect((await recurringThemes(sql, chat)).map((theme) => theme.title)).toEqual(["Табы или пробелы"]);
+    });
+
+    it("bring a running joke back by its name, never by everyday words or one word of it", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      await stored(chat, { kind: "bit", about: "чайник-оракул", value: "наш бот в чате опять спорит с чайником-оракулом", userIds: [kit.id] });
+      const themes = await recurringThemes(sql, chat);
+      expect(themes.map((theme) => [theme.kind, [...theme.keywords].sort()])).toEqual([["bit", ["оракул", "чайник"]]]);
+      const matches = async (text: string) => themesMatching(themes, (await textTerms(sql, [text]))[0]!, { minShared: 3 }).length;
+      expect(await matches("чайник опять свистит, оракул не врёт")).toBe(1);
+      expect(await matches("наш бот в чате опять спорит")).toBe(0);
+      expect(await matches("поставь чайник")).toBe(0);
     });
   });
 

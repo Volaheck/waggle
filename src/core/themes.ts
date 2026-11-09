@@ -2,8 +2,9 @@ import type { Sql } from "./db.js";
 import { stackFamily } from "./stack.js";
 
 /**
- * Recurring themes: the arguments the same people keep coming back to, and the chat's running jokes. Plain SQL and a
- * little clustering, no model: the answer context and the bot's own interjections read them.
+ * Recurring themes: what the chat keeps coming back to, as the model grouped it from the chronicle once a day
+ * (worker/themes-index.ts), and the chat's running jokes. The answer context and the bot's own interjections read them;
+ * a live conversation is matched to one by the terms they share.
  */
 
 /**
@@ -72,15 +73,15 @@ export interface ThemeTopic {
   kind: string;
   period_to: Date;
   user_ids: number[];
-  terms: string[];
 }
 
 export interface Theme {
   /** Stays the same as the theme grows: its oldest topic (t12), or the first version of a running joke (b7). */
   key: string;
+  /** "debate" for anything the chat keeps coming back to, an argument or a long-running subject. */
   kind: "debate" | "bit";
   title: string;
-  /** Terms found in at least two of its topics; a running joke's are those of its note. */
+  /** The terms of the words that bring it up; a running joke's are those of its name. */
   keywords: string[];
   /** Everyone who took part, the most frequent first. */
   userIds: number[];
@@ -90,34 +91,6 @@ export interface Theme {
   note?: { id: number; about: string | null; value: string; said_at: Date | null };
 }
 
-const THEME_DAYS = 180;
-const HOT_DISCUSSION_HEAT = 40;
-const MIN_SHARED_TERMS = 2;
-const MIN_SHARED_PEOPLE = 2;
-const MIN_THEME_DAYS = 2;
-/** Far more than a chat argues about in half a year; it bounds the pairwise comparison. */
-const MAX_TOPICS = 600;
-
-function shared<T>(a: readonly T[], b: readonly T[]): number {
-  const other = new Set(b);
-  return a.filter((item) => other.has(item)).length;
-}
-
-/** Connected groups: `linked` items end up in one group, directly or through others. */
-function groupsOf<T>(items: T[], linked: (a: T, b: T) => boolean): T[][] {
-  const parent = items.map((_, index) => index);
-  const root = (index: number): number => {
-    while (parent[index] !== index) index = parent[index] = parent[parent[index]!]!;
-    return index;
-  };
-  for (let a = 0; a < items.length; a += 1) {
-    for (let b = a + 1; b < items.length; b += 1) if (linked(items[a]!, items[b]!)) parent[root(a)] = root(b);
-  }
-  const groups = new Map<number, T[]>();
-  items.forEach((item, index) => groups.set(root(index), [...(groups.get(root(index)) ?? []), item]));
-  return [...groups.values()];
-}
-
 function byFrequency<T>(lists: T[][]): T[] {
   const counts = new Map<T, number>();
   for (const item of lists.flat()) counts.set(item, (counts.get(item) ?? 0) + 1);
@@ -125,39 +98,40 @@ function byFrequency<T>(lists: T[][]): T[] {
 }
 
 /**
- * The chat's recurring themes. Topics of the last THEME_DAYS days that are debates, or discussions of two or more people
- * with a heat of HOT_DISCUSSION_HEAT or more, belong together when their titles share MIN_SHARED_TERMS terms and they
- * share MIN_SHARED_PEOPLE participants; a group that spans MIN_THEME_DAYS days or more is a theme, newest first.
- * Every current running joke (a bit note) is a theme too.
+ * The chat's recurring themes, the latest first: the ones the model grouped from the chronicle that still have two
+ * topics or more, then every current running joke (a bit note), known by its name.
  */
 export async function recurringThemes(sql: Sql, chatId: number): Promise<Theme[]> {
-  const [rows, bits] = await Promise.all([
-    sql<(Omit<ThemeTopic, "terms"> & { lexemes: string[] })[]>`
-      SELECT id, title, summary, kind, period_to, user_ids, tsvector_to_array(to_tsvector('russian', title)) AS lexemes
-      FROM chronicle
-      WHERE chat_id = ${chatId} AND period_to > now() - ${`${THEME_DAYS} days`}::interval
-        AND (kind = 'debate' OR (kind = 'discussion' AND cardinality(user_ids) >= ${MIN_SHARED_PEOPLE} AND heat >= ${HOT_DISCUSSION_HEAT}))
-      ORDER BY period_to DESC, id DESC
-      LIMIT ${MAX_TOPICS}`,
+  const [stored, bits] = await Promise.all([
+    sql<{ title: string; topic_ids: number[]; lexemes: string[] }[]>`
+      SELECT title, topic_ids, tsvector_to_array(to_tsvector('russian', array_to_string(keywords, ' '))) AS lexemes
+      FROM themes WHERE chat_id = ${chatId} ORDER BY id`,
     sql<{ id: number; about: string | null; value: string; user_ids: number[]; said_at: Date | null; superseded_by: number | null; lexemes: string[] }[]>`
-      SELECT id, about, value, user_ids, said_at, superseded_by, tsvector_to_array(tsv) AS lexemes
+      SELECT id, about, value, user_ids, said_at, superseded_by, tsvector_to_array(to_tsvector('russian', coalesce(about, value))) AS lexemes
       FROM notes WHERE chat_id = ${chatId} AND kind = 'bit'`,
   ]);
 
-  const topics: ThemeTopic[] = rows.map(({ lexemes, ...topic }) => ({ ...topic, terms: termsOf(lexemes) }));
-  const debates = groupsOf(topics, (a, b) => shared(a.terms, b.terms) >= MIN_SHARED_TERMS && shared(a.user_ids, b.user_ids) >= MIN_SHARED_PEOPLE)
-    .map((group) => group.sort((a, b) => a.period_to.getTime() - b.period_to.getTime() || a.id - b.id))
-    .filter((group) => new Set(group.map((topic) => topic.period_to.toISOString().slice(0, 10))).size >= MIN_THEME_DAYS)
-    .map((group): Theme => {
-      const counts = byFrequency(group.map((topic) => topic.terms));
-      return {
-        key: `t${Math.min(...group.map((topic) => topic.id))}`,
-        kind: "debate",
-        title: group.at(-1)!.title,
-        keywords: counts.filter((term) => group.filter((topic) => topic.terms.includes(term)).length >= 2),
-        userIds: byFrequency(group.map((topic) => topic.user_ids)),
-        topics: group,
-      };
+  const topicIds = stored.flatMap((theme) => theme.topic_ids);
+  const topics = topicIds.length
+    ? await sql<ThemeTopic[]>`SELECT id, title, summary, kind, period_to, user_ids FROM chronicle WHERE chat_id = ${chatId} AND id = ANY(${topicIds}::int[])`
+    : [];
+  const topicById = new Map(topics.map((topic) => [topic.id, topic]));
+  const debates = stored
+    .flatMap((theme): Theme[] => {
+      const own = theme.topic_ids
+        .flatMap((id) => (topicById.has(id) ? [topicById.get(id)!] : []))
+        .sort((a, b) => a.period_to.getTime() - b.period_to.getTime() || a.id - b.id);
+      if (own.length < 2) return [];
+      return [
+        {
+          key: `t${Math.min(...own.map((topic) => topic.id))}`,
+          kind: "debate",
+          title: theme.title,
+          keywords: termsOf(theme.lexemes),
+          userIds: byFrequency(own.map((topic) => topic.user_ids)),
+          topics: own,
+        },
+      ];
     })
     .sort((a, b) => b.topics.at(-1)!.period_to.getTime() - a.topics.at(-1)!.period_to.getTime());
 
@@ -195,14 +169,16 @@ export async function recurringThemes(sql: Sql, chatId: number): Promise<Theme[]
 }
 
 /**
- * The themes that share at least `minShared` keywords with the terms, the most shared first; with `userIds`, only those
- * at least one of whose people is among them.
+ * The themes that share at least `minShared` keywords with the terms, the most shared first. A theme with fewer
+ * keywords needs all of them, and never fewer than two: a running joke is brought up by its two-word name, never by
+ * one word. With `userIds`, only the themes at least one of whose people is among them.
  */
 export function themesMatching(themes: Theme[], terms: Iterable<string>, options: { minShared?: number; userIds?: number[] } = {}): { theme: Theme; shared: string[] }[] {
   const wanted = new Set(terms);
+  const needed = (theme: Theme) => Math.max(2, Math.min(options.minShared ?? 3, theme.keywords.length));
   return themes
     .filter((theme) => !options.userIds || theme.userIds.some((id) => options.userIds!.includes(id)))
     .map((theme) => ({ theme, shared: theme.keywords.filter((keyword) => wanted.has(keyword)) }))
-    .filter((match) => match.shared.length >= (options.minShared ?? 3))
+    .filter((match) => match.shared.length >= needed(match.theme))
     .sort((a, b) => b.shared.length - a.shared.length);
 }

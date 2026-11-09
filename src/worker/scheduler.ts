@@ -8,6 +8,7 @@ import { consentObjectionsSince, consentObjectionText } from "../core/notes.js";
 import { messageLink } from "../core/text.js";
 import { isConsolidationDue, nextConsolidationRetryAt, runConsolidation } from "./consolidate.js";
 import { isPassDue, lastSuccessfulRunAt, latestRunId, pendingStats, refusalsAfter, refusalsSince, runExtractionPass, type SkippedRange } from "./extract.js";
+import { areThemesDue, buildThemes } from "./themes-index.js";
 
 export interface SchedulerOptions {
   sql: Sql;
@@ -221,6 +222,22 @@ export function createChatProcessor(options: SchedulerOptions, signals?: StopSig
         const retryAt = await nextConsolidationRetryAt(sql, chat.id).catch(() => null);
         await alertOnce(`cleanup:${chat.id}`, `⚠️ The weekly card clean-up failed in “${title}”: ${error instanceof Error ? error.message : String(error)}. ${retryText(retryAt)}`);
       }
+    }
+
+    try {
+      if (!stopping() && !paused && (await areThemesDue(sql, chat.id))) {
+        const built = await buildThemes(sql, options.anthropic, {
+          model: config.EXTRACTION_MODEL,
+          timeZone: config.DISPLAY_TIMEZONE ?? "UTC",
+          budget: { totalUsd: config.MONTHLY_LLM_BUDGET_USD, chatId: chat.id, chatUsd },
+          signal: signals?.abort,
+          endUserId: options.endUserIdOf?.(chat.id),
+        });
+        log(`[themes] ${title}: ${built.themes} recurring theme(s) from ${built.topics} topic(s)`);
+      }
+    } catch (error) {
+      if (error instanceof BudgetExceededError) await reportBudget(error, title);
+      else log(`[themes] ${title}: not rebuilt, the next try is in a day: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
 }

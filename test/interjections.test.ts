@@ -216,11 +216,17 @@ describe.skipIf(!DATABASE_URL)("speaking up uninvited", () => {
     return msgId;
   }
 
-  /** Debates the chronicle recorded among `people`, one for each title, that many days ago. */
-  async function argument(chatId: number, people: User[], titles: [string, number][]): Promise<number[]> {
+  interface Recurring {
+    /** Each topic's title and how many days ago it was. */
+    topics: [string, number][];
+    keywords: string[];
+  }
+
+  /** Debates the chronicle recorded among `people`, grouped into one theme named after the latest, as the daily index does. */
+  async function argument(chatId: number, people: User[], theme: Recurring): Promise<number[]> {
     const [run] = await sql<{ id: number }[]>`INSERT INTO extraction_runs (chat_id, status) VALUES (${chatId}, 'done') RETURNING id`;
     const ids: number[] = [];
-    for (const [title, daysAgo] of titles) {
+    for (const [title, daysAgo] of theme.topics) {
       const at = new Date(Date.now() - daysAgo * DAY);
       const [topic] = await sql<{ id: number }[]>`
         INSERT INTO chronicle (chat_id, run_id, period_from, period_to, title, summary, kind, user_ids, heat)
@@ -228,18 +234,25 @@ describe.skipIf(!DATABASE_URL)("speaking up uninvited", () => {
         RETURNING id`;
       ids.push(topic!.id);
     }
+    await sql`INSERT INTO themes (chat_id, title, keywords, topic_ids) VALUES (${chatId}, ${theme.topics.at(-1)![0]}, ${theme.keywords}, ${ids})`;
     return ids;
   }
 
-  const FRONTEND: [string, number][] = [
-    ["Claude против Codex для фронтенда", 40],
-    ["Клод vs Кодекс: кто пишет фронтенд лучше", 20],
-    ["Опус против GPT во фронтенде", 2],
-  ];
-  const TABS: [string, number][] = [
-    ["Табы против пробелов в коде", 30],
-    ["Снова табы или пробелы: код ревью", 12],
-  ];
+  const FRONTEND: Recurring = {
+    topics: [
+      ["Claude против Codex для фронтенда", 40],
+      ["Клод vs Кодекс: кто пишет фронтенд лучше", 20],
+      ["Опус против GPT во фронтенде", 2],
+    ],
+    keywords: ["Claude", "Codex", "GPT", "Опус", "фронтенд", "вёрстка"],
+  };
+  const TABS: Recurring = {
+    topics: [
+      ["Табы против пробелов в коде", 30],
+      ["Снова табы или пробелы: код ревью", 12],
+    ],
+    keywords: ["табы", "пробелы", "отступы", "линтер"],
+  };
   const frontendTalk = (): [string, string][] => [
     ["Kit", "опять клод против жпт, и фронтенд на нём"],
     ["Bob", "жпт верстает фронтенд быстрее, проверено"],
@@ -288,8 +301,8 @@ describe.skipIf(!DATABASE_URL)("speaking up uninvited", () => {
   it("speaks once on a recurring argument, in its forum topic, with the argument's history, and then keeps quiet", async () => {
     const chat = await newChat();
     const topics = await argument(chat, [users.Kit!, users.Bob!], FRONTEND);
-    await stance(chat, { userId: users.Kit!.id, value: "Claude пишет фронтенд чище", topicId: topics[0]!, about: FRONTEND[0]![0] });
-    await stance(chat, { userId: users.Bob!.id, value: "Codex дешевле и быстрее", about: FRONTEND[1]![0], saidAt: new Date(Date.now() - 19 * DAY) });
+    await stance(chat, { userId: users.Kit!.id, value: "Claude пишет фронтенд чище", topicId: topics[0]!, about: FRONTEND.topics[0]![0] });
+    await stance(chat, { userId: users.Bob!.id, value: "Codex дешевле и быстрее", about: FRONTEND.topics[1]![0], saidAt: new Date(Date.now() - 19 * DAY) });
     const ids = await talk(chat, frontendTalk(), { threadId: 77 });
     const claude = fakeClaude();
     const line = "Кит, Claude у тебя и в прошлый раз писал фронтенд чище. Кэш, видимо, тоже.";
@@ -301,7 +314,7 @@ describe.skipIf(!DATABASE_URL)("speaking up uninvited", () => {
     const [check] = claude.checks;
     expect(check).toMatchObject({ model: "claude-opus-5-5", system: INTERJECTION_SYSTEM_PROMPT, effort: "medium" });
     expect(check!.userId).toMatch(/^[0-9a-f]{32}$/);
-    expect(check!.prompt).toContain(`<theme kind="argument" times="3" title="Опус против GPT во фронтенде">`);
+    expect(check!.prompt).toContain(`<theme kind="recurring topic" times="3" title="Опус против GPT во фронтенде">`);
     expect(check!.prompt).toMatch(/- \d{1,2} \w{3,4}(?: \d{4})?: Claude против Codex для фронтенда — Каждый остался при своём\. \(Kit, Bob\)/);
     expect(check!.prompt).toMatch(/Sides:\n- Kit, \d{1,2} \w{3,4}(?: \d{4})?: “Claude пишет фронтенд чище”\n- Bob, \d{1,2} \w{3,4}(?: \d{4})?: “Codex дешевле и быстрее”/);
     expect(check!.prompt).toMatch(new RegExp(`\\[${ids[0]} [^\\]]+\\] Kit: опять клод против жпт`));
@@ -550,7 +563,10 @@ describe.skipIf(!DATABASE_URL)("speaking up uninvited", () => {
     const claude = fakeClaude();
     const created = made(claude);
     const chat = await newChat();
-    await argument(chat, [users.Kit!, users.Bob!], [["Ипотека против аренды: что выгоднее в долгую", 30], ["Аренда или ипотека: опять выгоднее в долгую", 10]]);
+    await argument(chat, [users.Kit!, users.Bob!], {
+      topics: [["Ипотека против аренды: что выгоднее в долгую", 30], ["Аренда или ипотека: опять выгоднее в долгую", 10]],
+      keywords: ["аренда", "долгую", "выгоднее", "считали"],
+    });
     await talk(chat, [
       ["Kit", "аренда выгоднее в долгую, считали же"], ["Bob", "в долгую выгоднее своё"], ["Kit", "ну-ну"], ["Bob", "аренда — деньги на ветер"],
       ["Kit", "посчитай"], ["Bob", "считал"], ["Kit", "плохо считал"], ["Bob", "выгоднее, говорю"],

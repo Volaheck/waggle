@@ -142,6 +142,7 @@ async function moveChatData(tx: Queryable, from: number, to: number): Promise<Ch
     WHERE s.project_id = p.id AND p.chat_id = ${to} AND m.chat_id = ${to} AND m.user_id = s.user_id AND m.opted_out`;
 
   const topics = await tx`UPDATE chronicle SET chat_id = ${to}, msg_ids = ${shiftedIds(tx, "msg_ids")} WHERE chat_id = ${from}`;
+  await tx`UPDATE themes SET chat_id = ${to} WHERE chat_id = ${from}`;
   await tx`
     UPDATE extraction_runs SET chat_id = ${to}, first_msg_id = ${shiftedId(tx, "first_msg_id")}, last_msg_id = ${shiftedId(tx, "last_msg_id")}
     WHERE chat_id = ${from}`;

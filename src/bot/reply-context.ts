@@ -361,7 +361,7 @@ function privateLines(input: { person: Person; notes: ContextNote[]; jokes: Cont
     ...item("bait", of("bait").map((note) => dated(note))),
     ...item("said about you", of("about_bot").map((note) => dated(note))),
     ...item("running jokes", jokes.map((joke) => line(joke.about ?? joke.value, 60))),
-    ...item("keeps arguing", recurring),
+    ...item("keeps coming back to", recurring),
   ];
 }
 
