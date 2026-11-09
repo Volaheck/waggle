@@ -2,7 +2,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import type { Message, UserFromGetMe } from "grammy/types";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createBot } from "../src/bot/bot.js";
-import { asksAboutRating, buildReplyContext, refersToConversation, type Question } from "../src/bot/reply-context.js";
+import { asksAboutRating, buildReplyContext, promptText, refersToConversation, type Question } from "../src/bot/reply-context.js";
 import { addAlias, ambiguousNames, mentionsName, nameForms, namedIn, wordsOf } from "../src/core/aliases.js";
 import { migrateChat } from "../src/core/chat-migration.js";
 import { attachLegacyData, LEGACY_CHAT_ID, registerChat, setChatStatus } from "../src/core/chats.js";
@@ -15,7 +15,8 @@ import { saveBotMessage, saveMessage } from "../src/core/messages.js";
 import { addUserProject, mergeProjects, renameProject, updateProject } from "../src/core/projects.js";
 import { hasForbiddenTopic, transliterateName } from "../src/core/text.js";
 import { forgetUser, getPerson, resolveUser, setOptOut, type User } from "../src/core/users.js";
-import { EXTRACTABLE_KINDS, EXTRACTION_SYSTEM_PROMPT, runExtractionPass, type ExtractionResult } from "../src/worker/extract.js";
+import { EXTRACTABLE_KINDS, EXTRACTION_SYSTEM_PROMPT, INTERRUPTED_PASS_ERROR, runExtractionPass, type ExtractionResult } from "../src/worker/extract.js";
+import { nextExtractionRetryAt } from "../src/worker/scheduler.js";
 import { NOTES_SYSTEM_PROMPT } from "../src/worker/notes-extract.js";
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -170,7 +171,7 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
   };
 
   const contextFor = (question: Question, model = "claude-opus-5-5") =>
-    buildReplyContext(sql, question, { timezone: "UTC", model, ownerTgIds: [OWNER], recentAnswers: [], insultMotif: "the scrolls are sealed" });
+    buildReplyContext(sql, question, { timezone: "UTC", model, ownerTgIds: [OWNER], recentAnswers: [], insultMotif: "the scrolls are sealed" }).then(promptText);
 
   const block = (context: string, name: string) => new RegExp(`<${name}[^>]*>\\n([\\s\\S]*?)\\n</${name}>`).exec(context)?.[1];
 
@@ -304,8 +305,8 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
       expect(focus).toContain("Rust vs Go — Kit argued for Rust.");
       expect(focus).not.toContain("Ancient history");
       expect(focus).not.toContain("Dora");
-      // The members list does not repeat a card the focus already shows.
-      expect(block(context, "members")).toContain("- Kit (@kit_k) | card in in_focus");
+      // The members list keeps every card whoever asks, so the chat's memory reads the same in every answer.
+      expect(block(context, "members")).toMatch(/^- Kit \(@kit_k\) \| stack: /m);
       expect(block(context, "members")).toContain("- Dora (@dora_d) | interest: climbing");
       for (const line of focus.split("\n- ")) expect(line.length).toBeLessThanOrEqual(1800 + 2);
     });
@@ -369,6 +370,77 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
       const plain = await contextFor(asking(chat, kit, "что нового?"));
       expect(block(plain, "recent_messages")!.split("\n")).toHaveLength(30);
     });
+
+    it("quotes what the chronicler has not processed yet before the latest messages, in chunks the next answer repeats byte for byte", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      const bob = await member(chat, "Bob");
+      const start = Date.now() - 5 * 60 * MINUTE;
+      const ids: number[] = [];
+      for (let index = 0; index < 100; index += 1) ids.push(await say(chat, index % 2 ? kit : bob, `point ${index}`, { at: new Date(start + index * MINUTE) }));
+      await sql`UPDATE messages SET extracted_at = now() WHERE chat_id = ${chat} AND msg_id <= ${ids[9]!}`;
+      // A refused message that was edited since waits again, and stays out all the same.
+      await sql`INSERT INTO app_state (key, value) VALUES (${`extraction_skipped:${chat}`}, ${sql.json({ msg_ids: [ids[20]!] })})`;
+      const options = { timezone: "UTC", model: "claude-opus-5-5", ownerTgIds: [OWNER], recentAnswers: [], insultMotif: "the scrolls are sealed" };
+
+      const parts = await buildReplyContext(sql, asking(chat, kit, "что было утром?"), options);
+      expect(parts.map((part) => part.cached)).toEqual([true, false, true, false, false]);
+      const context = promptText(parts);
+      const earlier = block(context, "earlier_messages")!.split("\n").map((row) => row.replace(/^\[[^\]]*\] \w+: /, ""));
+      expect(earlier).toEqual(Array.from({ length: 60 }, (_, index) => `point ${index + 10}`).filter((text) => text !== "point 20"));
+      expect(block(context, "recent_messages")!.split("\n")[0]).toMatch(/: point 70$/);
+      expect(context.indexOf("</earlier_messages>")).toBeLessThan(context.indexOf("<recent_messages>"));
+
+      for (let index = 100; index < 105; index += 1) await say(chat, bob, `point ${index}`);
+      const next = await buildReplyContext(sql, asking(chat, bob, "а что Kit думает?"), options);
+      // Another asker, five more messages: the memory and the complete chunks are the same bytes, only the tail moved on.
+      expect(next[0]!.text).toBe(parts[0]!.text);
+      expect(next.slice(1, 3).map((part) => part.text)).toEqual(parts.slice(1, 3).map((part) => part.text));
+      expect(next[3]!.text).toMatch(/: point 74\n$/);
+
+      await sql`UPDATE messages SET extracted_at = now() WHERE chat_id = ${chat}`;
+      const afterPass = await buildReplyContext(sql, asking(chat, kit, "что было утром?"), options);
+      expect(afterPass.map((part) => part.cached)).toEqual([true, false]);
+      expect(promptText(afterPass)).not.toContain("earlier_messages");
+    });
+
+    it("keeps out of the window an opted-out member's words and an old message edited since the last pass, and marks forwards", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      const quiet = await member(chat, "Quiet");
+      await setOptOut(sql, quiet.id, true, chat);
+      const start = Date.now() - 8 * 60 * MINUTE;
+      const old = await say(chat, kit, "the old roadmap", { at: new Date(start) });
+      await sql`UPDATE messages SET extracted_at = now() WHERE chat_id = ${chat} AND msg_id = ${old}`;
+      await sql`INSERT INTO extraction_runs (chat_id, finished_at, status, first_msg_id, last_msg_id) VALUES (${chat}, now(), 'done', ${old}, ${old})`;
+      await sql`UPDATE messages SET text = 'the old roadmap, rewritten', extracted_at = NULL WHERE chat_id = ${chat} AND msg_id = ${old}`;
+      await say(chat, quiet, "nobody needs to remember this", { at: new Date(start + MINUTE) });
+      await saveMessage(sql, {
+        chatId: chat, msgId: ++nextMsgId, userId: kit.id, sentAt: new Date(start + 2 * MINUTE), text: "Breaking: a framework nobody asked for", replyToMsgId: null,
+        isForward: true, forwardSource: "Some Channel", mediaType: null,
+      });
+      await say(chat, kit, "my own take: skip it", { at: new Date(start + 3 * MINUTE) });
+      for (let index = 0; index < 30; index += 1) await say(chat, kit, `later ${index}`, { at: new Date(start + (10 + index) * MINUTE) });
+
+      const earlier = block(await contextFor(asking(chat, kit, "что было утром?")), "earlier_messages")!.split("\n");
+      expect(earlier).toHaveLength(2);
+      expect(earlier[0]).toMatch(/\] Kit \[forwarded\]: Breaking: a framework nobody asked for$/);
+      expect(earlier[1]).toMatch(/\] Kit: my own take: skip it$/);
+    });
+
+    it("leaves out the oldest waiting messages a hundred at a time when too many wait, and says so", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      const start = Date.now() - 10 * 60 * MINUTE;
+      for (let index = 0; index < 360; index += 1) await say(chat, kit, `line ${index}`, { at: new Date(start + index * MINUTE) });
+      const context = await contextFor(asking(chat, kit, "что нового?"));
+      const earlier = block(context, "earlier_messages")!.split("\n");
+      // 330 wait before the latest 30: the oldest hundred step aside, so the window shifts once in a hundred messages.
+      expect(earlier[0]).toBe("(older messages since the chronicler's last pass are left out)");
+      expect(earlier[1]).toMatch(/: line 100$/);
+      expect(earlier.at(-1)).toMatch(/: line 329$/);
+      expect(earlier).toHaveLength(231);
+    });
   });
 
   describe("the bot in a group", () => {
@@ -387,7 +459,7 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
       return { ok: true, result: true };
     };
     const config = {
-      BOT_TOKEN: TOKEN, ADMIN_TG_IDS: [OWNER], DATABASE_URL: DATABASE_URL!, BOT_MODE: "polling", PORT: 0, EXTRACTION_MODEL: "x", EXTRACTION_INTERVAL_HOURS: 6,
+      BOT_TOKEN: TOKEN, ADMIN_TG_IDS: [OWNER], DATABASE_URL: DATABASE_URL!, BOT_MODE: "polling", PORT: 0, EXTRACTION_MODEL: "x", EXTRACTION_INTERVAL_HOURS: 6, EXTRACTION_PASS_MESSAGES: 200, EXTRACTION_MIN_GAP_MINUTES: 60,
       MESSAGE_RETENTION_DAYS: 7, DISPLAY_TIMEZONE: "UTC", MONTHLY_LLM_BUDGET_USD: 60, CHAT_MONTHLY_BUDGET_USD: 20, WEB_DIST_DIR: "web/dist", DEV_BROWSER_LOGIN: false,
       DEV_LOGIN_AS: "", REPLY_MODEL: "claude-haiku-5-5", REPLIES_MONTHLY_BUDGET_USD: 10, REPLY_PREMIUM_MODEL: "claude-opus-5-5", REPLY_PREMIUM_PER_MEMBER_PER_HOUR: 10,
       REPLY_PREMIUM_MONTHLY_BUDGET_USD: 0,
@@ -396,8 +468,8 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
     let answer = "Bob writes Rust 🐝";
     const claude = {
       messages: {
-        create: async (params: { messages: { content: string }[] }) => {
-          prompts.push(params.messages[0]!.content);
+        create: async (params: { messages: { content: { text: string }[] }[] }) => {
+          prompts.push(params.messages[0]!.content.map((block) => block.text).join(""));
           return { stop_reason: "end_turn", content: [{ type: "text", text: answer }], usage: { input_tokens: 1000, output_tokens: 50 } };
         },
       },
@@ -516,7 +588,7 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
       const others = await sql<{ id: number }[]>`UPDATE chats SET status = 'left' WHERE id <> ${chat} AND status = 'approved' RETURNING id`;
       try {
         await bot.handleUpdate(inDm(owner, "/botstatus") as never);
-        expect(lastSent()).toContain(`Bot hive\nMessages: ${counts!.pending}, waiting for the chronicler: ${counts!.pending}.`);
+        expect(lastSent()).toContain(`Bot hive\nMessages: ${counts!.pending}, waiting for the chronicler: ${counts!.pending}, next pass `);
       } finally {
         await sql`UPDATE chats SET status = 'approved' WHERE id = ANY(${others.map((row) => row.id)})`;
       }
@@ -640,6 +712,45 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
     const EMPTY: ExtractionResult = { topics: [], facts_add: [], facts_update: [], projects: [], project_renames: [], project_signals: [] };
     const pass = (chatId: number, client: Anthropic) =>
       runExtractionPass({ sql, anthropic: client, chatId, chatBudgetUsd: 50, config: { EXTRACTION_MODEL: "claude-sonnet-5-5", MONTHLY_LLM_BUDGET_USD: 500 } });
+
+    it("takes what waited when the pass began, and leaves what arrives meanwhile for the next one", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      await say(chat, kit, "shipped the importer today, finally", { at: new Date(Date.now() - 7 * 60 * MINUTE) });
+      let lateId = 0;
+      const prompts: string[] = [];
+      const client = {
+        messages: {
+          stream(params: { system: string; messages: { content: string }[] }) {
+            const notesCall = params.system === NOTES_SYSTEM_PROMPT;
+            if (!notesCall) prompts.push(params.messages[0]!.content);
+            const message = { stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify(notesCall ? { notes: [], aliases: [] } : EMPTY) }], usage: { input_tokens: 10_000, output_tokens: 1_000 } };
+            return {
+              currentMessage: message,
+              finalMessage: async () => {
+                if (!notesCall && !lateId) lateId = await say(chat, kit, "and the exporter is next on my list");
+                return message;
+              },
+            };
+          },
+        },
+      } as unknown as Anthropic;
+      const result = await pass(chat, client);
+      expect(prompts).toHaveLength(1);
+      expect(result.messages).toBe(1);
+      expect(await sql`SELECT msg_id FROM messages WHERE chat_id = ${chat} AND extracted_at IS NULL`).toEqual([{ msg_id: lateId }]);
+    });
+
+    it("does not count a pass a stop cut short as a failure that delays the next one", async () => {
+      const chat = await newChat();
+      await sql`INSERT INTO extraction_runs (chat_id, started_at, finished_at, status) VALUES (${chat}, now() - interval '3 hours', now() - interval '3 hours', 'done')`;
+      await sql`INSERT INTO extraction_runs (chat_id, started_at, finished_at, status, error) VALUES (${chat}, now() - interval '10 minutes', now(), 'failed', ${INTERRUPTED_PASS_ERROR})`;
+      expect(await nextExtractionRetryAt(sql, chat)).toBeNull();
+      const [failed] = await sql<{ started_at: Date }[]>`
+        INSERT INTO extraction_runs (chat_id, started_at, finished_at, status, error) VALUES (${chat}, now() - interval '20 minutes', now(), 'failed', 'the model went away') RETURNING started_at`;
+      await sql`INSERT INTO extraction_runs (chat_id, started_at, finished_at, status, error) VALUES (${chat}, now() - interval '5 minutes', now(), 'failed', ${INTERRUPTED_PASS_ERROR})`;
+      expect(await nextExtractionRetryAt(sql, chat)).toEqual(new Date(failed!.started_at.getTime() + 60 * MINUTE));
+    });
 
     it("sees the bot's lines labelled, and takes nothing about people from them", async () => {
       const chat = await newChat();

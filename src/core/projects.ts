@@ -71,7 +71,11 @@ const RATING = {
 /** An abandoned project's score is multiplied by this; the bot may say so, unlike the other weights. */
 export const ABANDONED_MULTIPLIER = RATING.abandonedMultiplier;
 
-/** What one signal adds to the score today: its impact by the kind's weight, fading with age (the window is applied apart). */
+/**
+ * What one signal adds to the score today: its impact by the kind's weight, fading with its age in whole days (the
+ * window is applied apart). Scores change at midnight, not every few hours, so the chat's memory in an answer's prompt
+ * stays the same from one answer to the next and the prompt cache can keep it.
+ */
 function signalPoints(sql: Sql, signal: string) {
   const weights = RATING.kindWeight;
   const row = sql.unsafe(signal);
@@ -79,7 +83,7 @@ function signalPoints(sql: Sql, signal: string) {
       WHEN 'usage' THEN ${weights.usage}::numeric WHEN 'contribution' THEN ${weights.contribution}::numeric
       WHEN 'praise' THEN ${weights.praise}::numeric WHEN 'milestone' THEN ${weights.milestone}::numeric
       WHEN 'critique' THEN ${weights.critique}::numeric ELSE ${weights.interest}::numeric END
-    * exp(-extract(epoch FROM now() - ${row}.happened_at) / (86400.0 * ${RATING.decayDays}::numeric))`;
+    * exp(-greatest(0, (now() AT TIME ZONE 'UTC')::date - (${row}.happened_at AT TIME ZONE 'UTC')::date) / ${RATING.decayDays}::numeric)`;
 }
 
 export async function listProjects(sql: Sql, chatId: number, options: { sort?: ProjectSort; viewerUserId?: number; limit?: number } = {}): Promise<ProjectListItem[]> {
@@ -108,7 +112,7 @@ export async function listProjects(sql: Sql, chatId: number, options: { sort?: P
            coalesce(s.signals_count, 0) AS signals_count,
            round((coalesce(v.votes, 0) * ${RATING.vote}::numeric + coalesce(s.signal_points, 0)::numeric)
                  * CASE WHEN p.status = 'abandoned' THEN ${RATING.abandonedMultiplier}::numeric ELSE 1 END)::int AS score,
-           coalesce((SELECT json_agg(json_build_object('id', u.id, 'display_name', u.display_name, 'username', u.username, 'role', pm.role) ORDER BY pm.role IS NULL, u.display_name)
+           coalesce((SELECT json_agg(json_build_object('id', u.id, 'display_name', u.display_name, 'username', u.username, 'role', pm.role) ORDER BY pm.role IS NULL, u.display_name, u.id)
                      FROM project_members pm JOIN users u ON u.id = pm.user_id WHERE pm.project_id = p.id), '[]') AS authors,
            coalesce((SELECT json_agg(json_build_object('kind', r.kind, 'note', r.note, 'msg_id', r.source_msg_ids[1], 'happened_at', r.happened_at))
                      FROM (SELECT * FROM project_signals WHERE project_id = p.id AND NOT hidden ORDER BY happened_at DESC LIMIT 5) r), '[]') AS recent_signals,
@@ -117,7 +121,7 @@ export async function listProjects(sql: Sql, chatId: number, options: { sort?: P
     LEFT JOIN s ON s.project_id = p.id
     LEFT JOIN v ON v.project_id = p.id
     WHERE p.chat_id = ${chatId} AND NOT p.hidden
-    ORDER BY ${orderBy}
+    ORDER BY ${orderBy}, p.id
     LIMIT ${limit}`;
 }
 

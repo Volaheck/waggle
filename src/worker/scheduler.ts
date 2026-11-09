@@ -7,13 +7,27 @@ import { clearExpiredTexts } from "../core/messages.js";
 import { consentObjectionsSince, consentObjectionText } from "../core/notes.js";
 import { messageLink } from "../core/text.js";
 import { isConsolidationDue, nextConsolidationRetryAt, runConsolidation } from "./consolidate.js";
-import { isPassDue, lastSuccessfulRunAt, latestRunId, pendingStats, refusalsAfter, refusalsSince, runExtractionPass, type SkippedRange } from "./extract.js";
+import {
+  INTERRUPTED_PASS_ERROR,
+  isPassDue,
+  lastSuccessfulRunAt,
+  latestRunId,
+  pendingStats,
+  refusalsAfter,
+  refusalsSince,
+  runExtractionPass,
+  type PassSchedule,
+  type SkippedRange,
+} from "./extract.js";
 import { areThemesDue, buildThemes } from "./themes-index.js";
 
 export interface SchedulerOptions {
   sql: Sql;
   anthropic: Anthropic;
-  config: Pick<Config, "EXTRACTION_MODEL" | "MONTHLY_LLM_BUDGET_USD" | "CHAT_MONTHLY_BUDGET_USD" | "EXTRACTION_INTERVAL_HOURS"> &
+  config: Pick<
+    Config,
+    "EXTRACTION_MODEL" | "MONTHLY_LLM_BUDGET_USD" | "CHAT_MONTHLY_BUDGET_USD" | "EXTRACTION_INTERVAL_HOURS" | "EXTRACTION_PASS_MESSAGES" | "EXTRACTION_MIN_GAP_MINUTES"
+  > &
     Partial<Pick<Config, "ADMIN_TG_IDS" | "DISPLAY_TIMEZONE">>;
   checkEveryMs?: number;
   /** A message to the bot owners; `resumeChatId` adds a button that resumes the chronicler paused in that chat. */
@@ -46,6 +60,10 @@ function describeRanges(chatId: number, ranges: SkippedRange[]): string {
     .join(", ");
 }
 
+export function passSchedule(config: Pick<Config, "EXTRACTION_INTERVAL_HOURS" | "EXTRACTION_PASS_MESSAGES" | "EXTRACTION_MIN_GAP_MINUTES">): PassSchedule {
+  return { intervalHours: config.EXTRACTION_INTERVAL_HOURS, messages: config.EXTRACTION_PASS_MESSAGES, minGapMinutes: config.EXTRACTION_MIN_GAP_MINUTES };
+}
+
 export function chatBudgetUsd(chat: Chat, fallback: number): number {
   return chat.monthly_budget_usd === null ? fallback : Number(chat.monthly_budget_usd);
 }
@@ -55,10 +73,15 @@ export function extractionRetryDelayMs(consecutiveFailures: number): number {
   return Math.min(MAX_RETRY_MS, HOUR_MS * 2 ** Math.max(0, consecutiveFailures - 1));
 }
 
-/** When the chronicler may try a chat again after failed passes; null when the last pass did not fail. */
+/**
+ * When the chronicler may try a chat again after failed passes; null when the last pass did not fail. A pass a stop cut
+ * short (a deploy) is no failure: it neither counts nor resets the count.
+ */
 export async function nextExtractionRetryAt(sql: Sql, chatId: number): Promise<Date | null> {
   const runs = await sql<{ started_at: Date; status: string }[]>`
-    SELECT started_at, status FROM extraction_runs WHERE chat_id = ${chatId} AND status <> 'running' ORDER BY id DESC LIMIT 12`;
+    SELECT started_at, status FROM extraction_runs
+    WHERE chat_id = ${chatId} AND status <> 'running' AND error IS DISTINCT FROM ${INTERRUPTED_PASS_ERROR}
+    ORDER BY id DESC LIMIT 12`;
   const failures = runs.findIndex((run) => run.status !== "failed");
   const count = failures === -1 ? runs.length : failures;
   return count === 0 ? null : new Date(runs[0]!.started_at.getTime() + extractionRetryDelayMs(count));
@@ -154,7 +177,7 @@ export function createChatProcessor(options: SchedulerOptions, signals?: StopSig
         !stopping() &&
         !chat.chronicle_paused_at &&
         (!retryAt || retryAt.getTime() <= Date.now()) &&
-        isPassDue(pending, await lastSuccessfulRunAt(sql, chat.id), config.EXTRACTION_INTERVAL_HOURS)
+        isPassDue(pending, await lastSuccessfulRunAt(sql, chat.id), passSchedule(config))
       ) {
         passAfterRunId = await latestRunId(sql, chat.id);
         const result = await runExtractionPass({

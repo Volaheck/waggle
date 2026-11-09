@@ -3,8 +3,8 @@ import { signInitData, validateInitData } from "../src/api/init-data.js";
 import { catchupHtml, clampTelegram } from "../src/bot/format.js";
 import { extractUrls, hasForbiddenTopic, messageLink, nameKey, normalizeUrl, normalizeValue, slugify, truncate } from "../src/core/text.js";
 import { rankCards } from "../src/core/merge.js";
-import { assistantNote, replyEffort, replySystemPrompt } from "../src/bot/assistant.js";
-import { buildExtractionPrompt, EXTRACTION_SYSTEM_PROMPT, isPassDue } from "../src/worker/extract.js";
+import { assistantNote, replyEffort, replySystemPrompt, squeezedOut } from "../src/bot/assistant.js";
+import { buildExtractionPrompt, EXTRACTION_SYSTEM_PROMPT, isPassDue, passDueAt } from "../src/worker/extract.js";
 import { CONSOLIDATION_SYSTEM_PROMPT } from "../src/worker/consolidate.js";
 import { NOTES_SYSTEM_PROMPT, namesForRefs } from "../src/worker/notes-extract.js";
 import { factCore, isNearDuplicate, isSameFact } from "../src/core/facts.js";
@@ -122,24 +122,43 @@ describe("text helpers", () => {
 describe("isPassDue", () => {
   const hour = 3_600_000;
   const now = new Date("2026-11-10T12:00:00Z");
+  const schedule = { intervalHours: 6, messages: 200, minGapMinutes: 60 };
+  const ago = (ms: number) => new Date(now.getTime() - ms);
+  const waiting = (count: number, oldest: Date | null, shown = count) => ({ count, oldest, shown });
 
-  it("waits for the interval since the last pass regardless of message count", () => {
-    const pending = { count: 500, oldest: new Date(now.getTime() - 10 * hour) };
-    expect(isPassDue(pending, new Date(now.getTime() - 2 * hour), 6, now)).toBe(false);
-    expect(isPassDue(pending, new Date(now.getTime() - 6 * hour), 6, now)).toBe(true);
+  it("waits for the interval while few messages pile up", () => {
+    const pending = waiting(150, ago(10 * hour));
+    expect(isPassDue(pending, ago(2 * hour), schedule, now)).toBe(false);
+    expect(isPassDue(pending, ago(6 * hour), schedule, now)).toBe(true);
   });
 
-  it("runs even for a single pending message once the interval passed", () => {
-    expect(isPassDue({ count: 1, oldest: new Date(now.getTime() - hour) }, new Date(now.getTime() - 7 * hour), 6, now)).toBe(true);
+  it("lets the first message after a quiet spell wait for company, at most the interval", () => {
+    expect(isPassDue(waiting(1, ago(hour)), ago(7 * hour), schedule, now)).toBe(false);
+    expect(isPassDue(waiting(1, ago(6 * hour)), ago(20 * hour), schedule, now)).toBe(true);
+    expect(passDueAt(waiting(1, ago(hour)), ago(7 * hour), schedule)).toEqual(new Date(now.getTime() + 5 * hour));
   });
 
   it("does nothing without pending messages", () => {
-    expect(isPassDue({ count: 0, oldest: null }, null, 6, now)).toBe(false);
+    expect(isPassDue(waiting(0, null), null, schedule, now)).toBe(false);
+    expect(passDueAt(waiting(0, null), ago(hour), schedule)).toBeNull();
   });
 
   it("first pass waits for the interval since the oldest pending message", () => {
-    expect(isPassDue({ count: 3, oldest: new Date(now.getTime() - 2 * hour) }, null, 6, now)).toBe(false);
-    expect(isPassDue({ count: 3, oldest: new Date(now.getTime() - 7 * hour) }, null, 6, now)).toBe(true);
+    expect(isPassDue(waiting(3, ago(2 * hour)), null, schedule, now)).toBe(false);
+    expect(isPassDue(waiting(3, ago(7 * hour)), null, schedule, now)).toBe(true);
+  });
+
+  it("starts early in a busy chat, but not right after the previous pass", () => {
+    const busy = waiting(180, ago(50 * 60_000), 200);
+    expect(isPassDue(busy, ago(45 * 60_000), schedule, now)).toBe(false);
+    expect(isPassDue(busy, ago(60 * 60_000), schedule, now)).toBe(true);
+    expect(isPassDue(waiting(199, ago(2 * hour)), ago(2 * hour), schedule, now)).toBe(false);
+    // The very first pass of a busy chat: the gap counts from the oldest waiting message.
+    expect(isPassDue(waiting(250, ago(61 * 60_000)), null, schedule, now)).toBe(true);
+  });
+
+  it("keeps to the interval when the message threshold is off", () => {
+    expect(isPassDue(waiting(5000, ago(5 * hour)), ago(5 * hour), { ...schedule, messages: 0 }, now)).toBe(false);
   });
 });
 
@@ -367,5 +386,16 @@ describe("notes written by the model", () => {
     expect(NOTES_SYSTEM_PROMPT).toContain("never by refs like u7");
     expect(NOTES_SYSTEM_PROMPT).toContain("old history included, is about_bot with about \"consent\", never a stance");
     expect(NOTES_SYSTEM_PROMPT).toContain("never their job, employer or a change of profession");
+    expect(NOTES_SYSTEM_PROMPT).toContain("whether the bot held or gave in (giving in never landed); never a bit");
+  });
+});
+
+describe("answers squeezed out by pressure", () => {
+  it("are held back when one word comes over and over or the text runs long", () => {
+    expect(squeezedOut("Мяу мяу. МЯУ! мяу, мяу")).toBe(true);
+    expect(squeezedOut("мяу мяу мяу мяу")).toBe(false);
+    expect(squeezedOut("Пчёлы не мяукают, а реанимацию по чату не делают.")).toBe(false);
+    expect(squeezedOut("Жил-был кот. ".repeat(120))).toBe(true);
+    expect(squeezedOut("а".repeat(1500))).toBe(false);
   });
 });

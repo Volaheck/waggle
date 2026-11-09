@@ -19,19 +19,20 @@ import {
 } from "../core/chats.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
-import { monthSpendUsd } from "../core/llm.js";
+import { monthSpendUsd, PREMIUM_REPLY_PURPOSE } from "../core/llm.js";
 import { mergeSeedUser, rankCards, unlinkedCards, type UnlinkedCard } from "../core/merge.js";
 import { saveMessage, updateEditedMessage } from "../core/messages.js";
 import { catchupFor } from "../core/chronicle.js";
 import { escapeHtml, nameKey, truncate } from "../core/text.js";
 import { accountByUsername, fullName, getUser, markLeft, SERVICE_TG_IDS, type User } from "../core/users.js";
 import { nextConsolidationRetryAt } from "../worker/consolidate.js";
-import { chatBudgetUsd, nextExtractionRetryAt } from "../worker/scheduler.js";
+import { lastSuccessfulRunAt, passDueAt, pendingStats } from "../worker/extract.js";
+import { chatBudgetUsd, nextExtractionRetryAt, passSchedule } from "../worker/scheduler.js";
 import { registerCatalog } from "./catalog.js";
 import { catchupHtml, clampTelegram, countOf, formatDate, userHeader } from "./format.js";
 import { registerAliases } from "./aliases.js";
 import { BUSINESS_UPDATES, businessRemindersOn, registerBusiness } from "./business.js";
-import { createAssistant, isAddressedToBot, PREMIUM_REPLY_PURPOSE, repliesSpendUsd, type Assistant, type AssistantDeps } from "./assistant.js";
+import { createAssistant, isAddressedToBot, repliesSpendUsd, type Assistant, type AssistantDeps } from "./assistant.js";
 import { createInterjector, type Interjector } from "./interjector.js";
 import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
 import { isInChat, MembershipCache } from "./membership.js";
@@ -302,7 +303,7 @@ export function createBot(deps: BotDeps): {
   }
 
   const greeting = () =>
-    `🐝 Hi! I'm Waggle, the chat's chronicler. Every ${config.EXTRACTION_INTERVAL_HOURS} h I go through new messages and keep a chronicle, member cards and a project catalog. In the group I mostly keep quiet: mention me or reply to my message to ask about the people here, their projects or what the chat discussed. Commands — /help`;
+    `🐝 Hi! I'm Waggle, the chat's chronicler. Every ${config.EXTRACTION_INTERVAL_HOURS} h, and sooner when the chat is busy, I go through new messages and keep a chronicle, member cards and a project catalog. In the group I mostly keep quiet: mention me or reply to my message to ask about the people here, their projects or what the chat discussed. Commands — /help`;
 
   async function greetApproved(chatId: number) {
     await bot.api
@@ -727,7 +728,9 @@ export function createBot(deps: BotDeps): {
     if (!kit.isOwner(user)) return;
     const lines = [
       "<b>Status</b>",
-      `Chronicler: every ${config.EXTRACTION_INTERVAL_HOURS} h`,
+      config.EXTRACTION_PASS_MESSAGES > 0
+        ? `Chronicler: every ${config.EXTRACTION_INTERVAL_HOURS} h, or once ${countOf(config.EXTRACTION_PASS_MESSAGES, "message")} wait, at least ${config.EXTRACTION_MIN_GAP_MINUTES} min apart`
+        : `Chronicler: every ${config.EXTRACTION_INTERVAL_HOURS} h`,
       interjector
         ? `Speaking up uninvited: at most ${countOf(config.INTERJECTIONS_PER_CHAT_PER_DAY, "time")} a chat a day, ${config.INTERJECTION_MIN_GAP_HOURS} h apart`
         : "Speaking up uninvited: off (answers are off or INTERJECTIONS_PER_CHAT_PER_DAY is 0)",
@@ -745,8 +748,14 @@ export function createBot(deps: BotDeps): {
                (SELECT count(*)::int FROM notes WHERE chat_id = ${chat.id} AND superseded_by IS NULL) AS notes,
                (SELECT array_agg(u.display_name ORDER BY u.display_name) FROM users u JOIN members m ON m.user_id = u.id
                 WHERE m.chat_id = ${chat.id} AND u.tg_id IS NULL) AS unlinked`;
-      const spent = await monthSpendUsd(sql, chat.id);
+      const [spent, premiumHere, waiting, lastPass] = await Promise.all([
+        monthSpendUsd(sql, chat.id),
+        repliesSpendUsd(sql, PREMIUM_REPLY_PURPOSE, chat.id),
+        pendingStats(sql, chat.id),
+        lastSuccessfulRunAt(sql, chat.id),
+      ]);
       const budget = chatBudgetUsd(chat, config.CHAT_MONTHLY_BUDGET_USD);
+      const due = passDueAt(waiting, lastPass, passSchedule(config));
       const [skipped] = await sql<{ messages: number }[]>`
         SELECT coalesce(sum((range->>'messages')::int), 0)::int AS messages
         FROM extraction_runs r, jsonb_array_elements(coalesce(r.stats->'skipped', '[]'::jsonb)) AS range
@@ -764,7 +773,7 @@ export function createBot(deps: BotDeps): {
         "",
         ...[
           `💬 <b>${escapeHtml(chat.title ?? String(chat.id))}</b>`,
-          `Messages: ${counts?.messages}, waiting for the chronicler: ${counts?.pending}. Last run — ${lastLine}`,
+          `Messages: ${counts?.messages}, waiting for the chronicler: ${counts?.pending}${due ? `, next pass ${later(due) ?? "within minutes"}` : ""}. Last run — ${lastLine}`,
           chat.chronicle_paused_at
             ? `⏸ The chronicler is paused here: ${escapeHtml(chat.chronicle_pause_reason ?? "an owner's decision")}. Resume it in /chats`
             : "",
@@ -778,11 +787,17 @@ export function createBot(deps: BotDeps): {
           counts?.unlinked?.length
             ? `Unlinked cards: ${counts.unlinked.map(escapeHtml).join(", ")} — /link @username Name in the chat, or /link Name as a reply to the person`
             : "All cards are linked",
-          `AI this month: $${spent.toFixed(3)} of $${budget.toFixed(2)}`,
+          `AI this month: $${spent.toFixed(3)} of $${budget.toFixed(2)}${premiumHere > 0 ? `, and $${premiumHere.toFixed(3)} on ${config.REPLY_PREMIUM_MODEL} answers (their own cap)` : ""}`,
         ].filter(Boolean),
       );
     }
-    lines.push("", `Total AI spend this month: $${(await monthSpendUsd(sql)).toFixed(3)} of $${config.MONTHLY_LLM_BUDGET_USD}`);
+    const premiumCap = config.REPLY_PREMIUM_MONTHLY_BUDGET_USD;
+    lines.push(
+      "",
+      `Total AI spend this month: $${(await monthSpendUsd(sql)).toFixed(3)} of $${config.MONTHLY_LLM_BUDGET_USD}${
+        premiumCap > 0 ? `, plus ${config.REPLY_PREMIUM_MODEL}'s answers on a cap of their own: at most $${config.MONTHLY_LLM_BUDGET_USD + premiumCap} a month in all` : ""
+      }`,
+    );
     const answers = [`Answers this month: ${config.REPLY_MODEL} $${(await repliesSpendUsd(sql)).toFixed(3)} of $${config.REPLIES_MONTHLY_BUDGET_USD}`];
     if (config.REPLY_PREMIUM_MONTHLY_BUDGET_USD > 0) {
       const premium = await repliesSpendUsd(sql, PREMIUM_REPLY_PURPOSE);

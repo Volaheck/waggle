@@ -98,11 +98,18 @@ export async function recordUsage(sql: Queryable, purpose: string, model: string
             ${usage.cache_read_input_tokens ?? 0}, ${usage.cache_creation_input_tokens ?? 0}, ${estimateCostUsd(model, usage)})`;
 }
 
+/**
+ * The stronger answering model's usage. It has a cap of its own (REPLY_PREMIUM_MONTHLY_BUDGET_USD) and counts towards
+ * no other, so it can never silence a chat or stop its chronicler.
+ */
+export const PREMIUM_REPLY_PURPOSE = "reply_premium";
+
+/** This month's spending on everything but the stronger model's answers, across all chats or in one. */
 export async function monthSpendUsd(sql: Sql, chatId?: number): Promise<number> {
   const scope = chatId ?? null;
   const [row] = await sql<{ total: string | null }[]>`
     SELECT sum(cost_usd)::text AS total FROM llm_usage
-    WHERE at >= date_trunc('month', now()) AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
+    WHERE at >= date_trunc('month', now()) AND purpose <> ${PREMIUM_REPLY_PURPOSE} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
   return Number(row?.total ?? 0);
 }
 
@@ -116,7 +123,7 @@ export class BudgetExceededError extends Error {
   }
 }
 
-/** Checks the bot-wide monthly cap and, for a chat, that chat's own cap. */
+/** Checks the bot-wide monthly cap and, for a chat, that chat's own cap (both without the stronger model's answers). */
 export async function assertBudget(sql: Sql, limitUsd: number, chat?: { id: number; limitUsd: number }): Promise<void> {
   const spent = await monthSpendUsd(sql);
   if (spent >= limitUsd) throw new BudgetExceededError(spent, limitUsd);

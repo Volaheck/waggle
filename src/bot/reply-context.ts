@@ -22,10 +22,20 @@ import { realReply } from "./kit.js";
 
 /**
  * The data part of an answer's prompt: who the bot is, the members and the names they go by, the catalog and the
- * chronicle, fuller cards of the people the question is about, the conversation it belongs to and the latest messages.
- * Everything is read from the database; texts go through maskPersonalData. The interjector's prompt (interjector.ts)
- * shares its lines, dates and <about_you>.
+ * chronicle, what the chronicler has not processed yet, fuller cards of the people the question is about, the
+ * conversation it belongs to and the latest messages. Everything is read from the database; texts go through
+ * maskPersonalData. The interjector's prompt (interjector.ts) shares its lines, dates and <about_you>.
  */
+
+/**
+ * A piece of the prompt. Answers in a chat come seconds apart, so the prompt cache keeps everything up to a `cached`
+ * piece: the chat's memory is the same for every question until something in it changes, and what no pass has taken
+ * yet only grows at its end, in chunks that stay byte-identical once complete.
+ */
+export interface PromptPart {
+  text: string;
+  cached: boolean;
+}
 
 export interface Question {
   chatId: number;
@@ -48,6 +58,8 @@ export interface ReplyContextOptions {
   /** The model writing this answer: the bot can say which one it is. */
   model: string;
   ownerTgIds: number[];
+  /** Whether to quote what the chronicler has not processed yet (off after the model refused a prompt with it). */
+  earlier?: boolean;
   recentAnswers?: RecentAnswer[];
   /** The motif for a comeback, should the question be an insult. */
   insultMotif: string;
@@ -67,6 +79,15 @@ const THREAD_CHARS = 400;
 const SEGMENT_PAUSE_MS = 25 * 60_000;
 const SEGMENT_MESSAGES = 120;
 const SEGMENT_CHARS = 250;
+/**
+ * Messages the chronicler has not processed yet, older than the latest messages, are quoted in full: the answer would
+ * know them from nowhere else. A busy chat gets a pass once a couple of hundred pile up (passDueAt), so the cap only
+ * bites when passes stall; then the oldest are left out, a hundred at a time, so the window rarely shifts.
+ */
+const EARLIER_MESSAGES = 300;
+const EARLIER_CHUNK = 25;
+const EARLIER_LEFT_OUT_STEP = 100;
+const EARLIER_CHARS = 300;
 const FOCUS_PEOPLE = 5;
 /** About 500 tokens a person, private notes included. */
 const FOCUS_CHARS = 1800;
@@ -161,6 +182,8 @@ export interface ContextMessage {
   reply_to_bot: boolean;
   reply_to_msg_id: number | null;
   from_bot: boolean;
+  /** A forwarded post is not its forwarder's own words. */
+  is_forward?: boolean;
   user_id: number | null;
   display_name: string | null;
 }
@@ -168,9 +191,47 @@ export interface ContextMessage {
 export function messageLine(row: ContextMessage, clock: Clock, max: number): string {
   const author = row.from_bot ? "Waggle" : safe(row.display_name ?? "someone");
   const reply = row.reply_to_bot ? " ↩Waggle" : row.reply_to_msg_id ? ` ↩${row.reply_to_msg_id}` : "";
+  const forwarded = row.is_forward ? " [forwarded]" : "";
   const media = row.media_type ? ` [${row.media_type}]` : "";
   const text = line(row.text, max);
-  return `[${row.msg_id} ${timeLabel(row.sent_at, clock)}] ${author}${reply}${media}${text ? `: ${text}` : ""}`;
+  return `[${row.msg_id} ${timeLabel(row.sent_at, clock)}] ${author}${reply}${forwarded}${media}${text ? `: ${text}` : ""}`;
+}
+
+interface WaitingMessage extends ContextMessage {
+  /** Its place among the messages since the chronicler's last pass that wait for it, counted from the oldest. */
+  position: number;
+}
+
+interface EarlierWindow {
+  rows: WaitingMessage[];
+  /** Whether older waiting messages are left out (always whole steps of EARLIER_LEFT_OUT_STEP). */
+  leftOut: boolean;
+  /** The position after the last row. */
+  end: number;
+}
+
+/** The waiting messages older than the latest ones (oldest first): all of them, or the newest few hundred. */
+function earlierWindow(olderWaiting: WaitingMessage[]): EarlierWindow {
+  const end = (olderWaiting.at(-1)?.position ?? -1) + 1;
+  const start = Math.max(0, Math.ceil((end - EARLIER_MESSAGES) / EARLIER_LEFT_OUT_STEP) * EARLIER_LEFT_OUT_STEP);
+  return { rows: olderWaiting.filter((row) => row.position >= start), leftOut: start > 0, end };
+}
+
+/**
+ * The window in chunks of EARLIER_CHUNK by position, so a chunk reads the same in every answer until the next pass.
+ * Only the last complete chunk is marked for the cache: the cache finds the earlier ones by looking back from it.
+ */
+function earlierParts(window: EarlierWindow, clock: Clock): PromptPart[] {
+  if (window.rows.length === 0) return [];
+  const lastComplete = Math.floor(window.end / EARLIER_CHUNK) - 1;
+  const header = `<earlier_messages note="what the chronicle and the cards do not cover yet: the messages since the chronicler's last pass before the latest 30, oldest first; its end may repeat in current_conversation">${
+    window.leftOut ? "\n(older messages since the chronicler's last pass are left out)" : ""
+  }`;
+  const chunks = [...groupBy(window.rows, (row) => Math.floor(row.position / EARLIER_CHUNK))];
+  return chunks.map(([index, rows], order) => ({
+    text: `${order === 0 ? `${header}\n` : ""}${rows.map((row) => messageLine(row, clock, EARLIER_CHARS)).join("\n")}\n`,
+    cached: index === lastComplete,
+  }));
 }
 
 /** The run of messages before the question, back to the last pause of SEGMENT_PAUSE_MS between two of them. */
@@ -184,7 +245,7 @@ function currentSegment(newestFirst: ContextMessage[]): ContextMessage[] {
   return segment.reverse();
 }
 
-const MESSAGE_COLUMNS = "m.msg_id, m.sent_at, m.text, m.media_type, m.reply_to_bot, m.reply_to_msg_id, m.from_bot, m.user_id, u.display_name";
+const MESSAGE_COLUMNS = "m.msg_id, m.sent_at, m.text, m.media_type, m.reply_to_bot, m.reply_to_msg_id, m.from_bot, m.is_forward, m.user_id, u.display_name";
 
 /** The messages the question replies to, up to the root of the conversation, root first; the bot's own included. */
 async function replyChain(sql: Sql, chatId: number, parentId: number): Promise<ContextMessage[]> {
@@ -487,8 +548,11 @@ function inFocusBlock(input: {
     : "";
 }
 
-/** Everything the app knows about the chat, as the reply prompt's data. */
-export async function buildReplyContext(sql: Sql, question: Question, options: ReplyContextOptions): Promise<string> {
+/**
+ * Everything the app knows about the chat, as the reply prompt's data: the chat's memory first, the same for every
+ * question, then what the chronicler has not processed yet, then all that depends on the question.
+ */
+export async function buildReplyContext(sql: Sql, question: Question, options: ReplyContextOptions): Promise<PromptPart[]> {
   const { chatId, message, me } = question;
   const clock: Clock = { timezone: options.timezone, today: dayOf(new Date(), options.timezone) };
   const asked = questionText(message, me);
@@ -496,7 +560,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   const replied = realReply(message);
   // Messages the chronicler skipped because the model refused them are kept out here too.
   const skipped = await skippedMessageIds(sql, chatId);
-  const [people, facts, projects, chronicle, latest, chain, aliases, former, owners, chatNotes] = await Promise.all([
+  const [people, facts, projects, chronicle, latest, waiting, chain, aliases, former, owners, chatNotes] = await Promise.all([
     peopleOfChat(sql, chatId),
     sql<{ user_id: number; kind: string; value: string }[]>`
       SELECT user_id, kind, value FROM facts
@@ -505,14 +569,27 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     listProjects(sql, chatId, { sort: "top" }),
     sql<{ title: string; summary: string; period_to: Date }[]>`
       SELECT title, summary, period_to FROM chronicle
-      WHERE chat_id = ${chatId} AND importance >= 2 AND period_to > now() - ${`${CHRONICLE_DAYS} days`}::interval
-      ORDER BY period_to DESC LIMIT ${CHRONICLE_ENTRIES}`,
+      WHERE chat_id = ${chatId} AND importance >= 2 AND period_to > ${clock.today}::date - ${CHRONICLE_DAYS}::int
+      ORDER BY period_to DESC, id DESC LIMIT ${CHRONICLE_ENTRIES}`,
     sql<ContextMessage[]>`
       SELECT ${sql.unsafe(MESSAGE_COLUMNS)}
       FROM messages m LEFT JOIN users u ON u.id = m.user_id
       WHERE m.chat_id = ${chatId} AND m.msg_id < ${message.message_id} AND m.msg_id <> ALL(${skipped}::bigint[])
         AND (btrim(m.text) <> '' OR m.media_type IS NOT NULL)
       ORDER BY m.msg_id DESC LIMIT ${aboutConversation ? SEGMENT_MESSAGES : CONTEXT_MESSAGES}`,
+    // Enough of the newest waiting messages to fill the window before the latest ones. Only those since the last pass:
+    // an old message edited since waits again, but stays out (it would shift every chunk). Nothing of anyone who asked
+    // not to be recorded: this is memory, not the conversation under way.
+    sql<WaitingMessage[]>`
+      SELECT * FROM (
+        SELECT ${sql.unsafe(MESSAGE_COLUMNS)}, (row_number() OVER (ORDER BY m.msg_id) - 1)::int AS position
+        FROM messages m LEFT JOIN users u ON u.id = m.user_id
+        WHERE m.chat_id = ${chatId} AND m.extracted_at IS NULL AND m.msg_id < ${message.message_id}
+          AND m.msg_id > (SELECT coalesce(max(last_msg_id), 0) FROM extraction_runs WHERE chat_id = ${chatId} AND status = 'done')
+          AND m.msg_id <> ALL(${skipped}::bigint[]) AND btrim(m.text) <> ''
+          AND NOT EXISTS (SELECT 1 FROM members mb WHERE mb.chat_id = m.chat_id AND mb.user_id = m.user_id AND mb.opted_out)
+      ) AS waiting
+      ORDER BY msg_id DESC LIMIT ${options.earlier === false ? 0 : EARLIER_MESSAGES + EARLIER_LEFT_OUT_STEP + CONTEXT_MESSAGES}`,
     replied ? replyChain(sql, chatId, replied.message_id) : Promise.resolve([]),
     chatAliases(sql, chatId),
     formerNames(sql, chatId),
@@ -543,6 +620,9 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   const thread = chain.filter(shown);
   const parentStored = replied ? chain.some((row) => row.msg_id === replied.message_id) : false;
   const conversation = aboutConversation ? currentSegment(latest) : [...latest].reverse();
+  // The window ends where the latest 30 begin in either mode, so a referee's question reuses the same cached chunks.
+  const latestFrom = (latest[CONTEXT_MESSAGES - 1] ?? latest.at(-1))?.msg_id ?? message.message_id;
+  const earlier = earlierParts(earlierWindow(waiting.filter((row) => row.msg_id < latestFrom).reverse()), clock);
 
   // The people this question is about: who asks, whose message it answers, and whoever it or its thread names.
   const named: Named[] = inContext.map((person) => ({
@@ -639,12 +719,13 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     kinds.set(fact.kind, [...(kinds.get(fact.kind) ?? []), fact.value]);
     factsOf.set(fact.user_id, kinds);
   }
-  // peopleOfChat lists the most recently active first.
-  const members = inContext.map((person) => {
+  // peopleOfChat lists the most recently active first, which picks who fits; the chat's memory lists them in a fixed
+  // order and with the same cards whoever asks, so it reads the same in every answer.
+  const roster = [...inContext].sort((a, b) => a.id - b.id);
+  const members = roster.map((person) => {
     const who = safe(`${person.display_name}${person.username ? ` (@${person.username})` : ""}`);
     if (person.opted_out) return `- ${who}: asked not to collect anything about them`;
     const tagline = person.tagline ? ` — ${safe(person.tagline)}` : "";
-    if (focusIds.includes(person.id)) return `- ${who}${tagline} | card in in_focus`;
     let room = MAX_FACTS_PER_MEMBER;
     const card = [...(factsOf.get(person.id) ?? new Map<string, string[]>())].flatMap(([kind, values]) => {
       const kept = values.slice(0, Math.max(0, room));
@@ -684,17 +765,17 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   const askerName = `${question.from.first_name}${question.from.last_name ? ` ${question.from.last_name}` : ""}${question.from.username ? ` (@${question.from.username})` : ""}`;
   const conversationLines = conversation.map((row) => messageLine(row, clock, aboutConversation ? SEGMENT_CHARS : MESSAGE_CHARS));
 
-  // The focus shows its people's own corrections and words about the bot; the chat-wide lists show everyone else's.
+  // The chat-wide lists are the same whoever asks; the focus repeats its people's own corrections and words about the bot.
   const names = new Map(people.filter((person) => !person.opted_out).map((person) => [person.id, person.display_name]));
-  const outOfFocus = (note: ContextNote) => note.user_id === null || !focusIds.includes(note.user_id);
   const jokes = chatNotes.filter((note) => note.kind === "bit");
-  const corrections = chatNotes.filter((note) => note.kind === "correction" && outOfFocus(note)).slice(0, CORRECTIONS);
+  const corrections = chatNotes.filter((note) => note.kind === "correction").slice(0, CORRECTIONS);
   const saidAboutYou = chatNotes
-    .filter((note) => note.kind === "about_bot" && outOfFocus(note))
+    .filter((note) => note.kind === "about_bot")
     .slice(0, SAID_ABOUT_YOU)
     .map((note) => `${quoted(note)} (${[...namesIn(note.user_id === null ? [] : [note.user_id], names), dateLabel(note.said_at, clock)].join(", ")})`);
+  const rosterNamed = [...named].sort((a, b) => a.id - b.id);
 
-  return [
+  const memory = [
     `<chat title="${safe(question.chatTitle ?? "").replace(/"/g, "'")}" today="${clock.today}" timezone="${clock.timezone}" />`,
     aboutYouBlock({
       me,
@@ -705,11 +786,14 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
       saidAboutYou,
     }),
     `<members>\n${members.join("\n") || "(none yet)"}\n</members>`,
-    whoIsWhoBlock({ people: inContext, aliasesOf, projects: projects.slice(0, MAX_PROJECTS), projectAliases, former: formerOf, ambiguous: ambiguousNames(named) }),
+    whoIsWhoBlock({ people: roster, aliasesOf, projects: projects.slice(0, MAX_PROJECTS), projectAliases, former: formerOf, ambiguous: ambiguousNames(rosterNamed) }),
     correctionsBlock(corrections, names, clock),
     `<projects rating="best first">\n${catalog.join("\n") || "(none yet)"}\n</projects>`,
     `<chronicle days="${CHRONICLE_DAYS}" order="newest first">\n${topicsList.join("\n") || "(nothing yet)"}\n</chronicle>`,
     runningJokesBlock(jokes.slice(0, RUNNING_JOKES), names, clock),
+  ];
+  const aboutQuestion = [
+    earlier.length ? "</earlier_messages>" : "",
     projectDetailsBlock({ ranked: projects, picked, breakdown, former: formerOf, clock }),
     inFocusBlock({
       focus: focusPeople,
@@ -737,7 +821,12 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     repliedToBot && unstoredParent ? `<your_message_they_reply_to>\n${line(unstoredParent, 1500)}\n</your_message_they_reply_to>` : "",
     `<if_insulted motif="${options.insultMotif}" />`,
     `<question from="${safe(askerName).replace(/"/g, "'")}">\n${line(asked, 1500)}\n</question>`,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  ];
+  const text = (blocks: string[]) => blocks.filter(Boolean).join("\n\n");
+  return [{ text: `${text(memory)}\n\n`, cached: true }, ...earlier, { text: text(aboutQuestion), cached: false }];
+}
+
+/** The parts as one text, the way the model reads them. */
+export function promptText(parts: PromptPart[]): string {
+  return parts.map((part) => part.text).join("");
 }

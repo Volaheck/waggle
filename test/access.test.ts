@@ -10,6 +10,7 @@ import { getChat, pauseChronicle, registerChat, resumeChronicle, setChatStatus }
 import type { Config } from "../src/core/config.js";
 import { createSql, migrate, type Sql } from "../src/core/db.js";
 import { proposeFact, visibleFacts } from "../src/core/facts.js";
+import { assertBudget, monthSpendUsd } from "../src/core/llm.js";
 import { clearExpiredTexts, saveMessage } from "../src/core/messages.js";
 import {
   addUserProject,
@@ -383,7 +384,7 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
     const botInfo = { id: 42, is_bot: true, first_name: "Waggle", username: "waggle_test_bot", can_join_groups: true, can_read_all_group_messages: true, supports_inline_queries: false };
     const config = (admins: number[]) =>
       ({
-        BOT_TOKEN: TOKEN, ADMIN_TG_IDS: admins, DATABASE_URL: DATABASE_URL!, BOT_MODE: "polling", PORT: 0, EXTRACTION_MODEL: "x", EXTRACTION_INTERVAL_HOURS: 6, MESSAGE_RETENTION_DAYS: 7,
+        BOT_TOKEN: TOKEN, ADMIN_TG_IDS: admins, DATABASE_URL: DATABASE_URL!, BOT_MODE: "polling", PORT: 0, EXTRACTION_MODEL: "x", EXTRACTION_INTERVAL_HOURS: 6, EXTRACTION_PASS_MESSAGES: 200, EXTRACTION_MIN_GAP_MINUTES: 60, MESSAGE_RETENTION_DAYS: 7,
         DISPLAY_TIMEZONE: "UTC", MONTHLY_LLM_BUDGET_USD: 60, CHAT_MONTHLY_BUDGET_USD: 20, WEB_DIST_DIR: "web/dist", DEV_BROWSER_LOGIN: false, DEV_LOGIN_AS: "",
       }) as unknown as Config;
     const fakeApi = async (_prev: unknown, method: string, payload: Record<string, any>) => {
@@ -620,12 +621,25 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
     });
 
     const fakeClaude = () => {
-      const requests: { model: string; content: string; userId?: string; effort?: string }[] = [];
+      const requests: { model: string; content: string; userId?: string; effort?: string; cached: boolean[] }[] = [];
       let answer = { stop_reason: "end_turn", text: "Alice knows Rust 🐝" };
       const client = {
         messages: {
-          create: async (params: { model: string; messages: { content: string }[]; metadata?: { user_id?: string }; output_config?: { effort?: string } }) => {
-            requests.push({ model: params.model, content: params.messages[0]!.content, userId: params.metadata?.user_id, effort: params.output_config?.effort });
+          create: async (params: {
+            model: string;
+            system: { text: string; cache_control?: unknown }[];
+            messages: { content: { text: string; cache_control?: unknown }[] }[];
+            metadata?: { user_id?: string };
+            output_config?: { effort?: string };
+          }) => {
+            const blocks = [...params.system, ...params.messages[0]!.content];
+            requests.push({
+              model: params.model,
+              content: params.messages[0]!.content.map((block) => block.text).join(""),
+              userId: params.metadata?.user_id,
+              effort: params.output_config?.effort,
+              cached: blocks.map((block) => block.cache_control !== undefined),
+            });
             return {
               stop_reason: answer.stop_reason,
               content: answer.text ? [{ type: "text", text: answer.text }] : [],
@@ -672,6 +686,9 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       expect(claude.requests).toHaveLength(1);
       const [first] = claude.requests;
       expect(first).toMatchObject({ model: "claude-haiku-5-5", effort: "high" });
+      // The system prompt and the chat's memory are cached; the question part never is.
+      expect(first!.cached.slice(0, 2)).toEqual([true, true]);
+      expect(first!.cached.at(-1)).toBe(false);
       expect(first!.userId).toMatch(/^[0-9a-f]{32}$/);
       expect(first!.content).toContain("Rust");
       expect(first!.content).toContain("call me [phone]");
@@ -803,6 +820,74 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
         expect(sent().slice(before)).toEqual(["Alice knows Rust 🐝"]);
       } finally {
         await sql`DELETE FROM llm_usage WHERE id = ${usage!.id}`;
+      }
+
+      // The stronger model's answers have a wallet of their own: however much they cost, the chat's and the bot's caps
+      // (and with them the chronicler) never feel it.
+      const { MONTHLY_LLM_BUDGET_USD: totalCap, CHAT_MONTHLY_BUDGET_USD: chatCap } = config([OWNER]);
+      const [premiumSpent] = await sql<{ id: number }[]>`
+        INSERT INTO llm_usage (purpose, model, input_tokens, output_tokens, cost_usd, chat_id)
+        VALUES ('reply_premium', 'claude-opus-5-5', 0, 0, ${totalCap + chatCap}, ${A}) RETURNING id`;
+      try {
+        expect(await monthSpendUsd(sql)).toBeLessThan(totalCap);
+        await expect(assertBudget(sql, totalCap, { id: A, limitUsd: chatCap })).resolves.toBeUndefined();
+        await answering.handleUpdate(ask(dave, "and now?") as never);
+        await assistant.idle();
+        expect(claude.requests.at(-1)!.model).toBe("claude-haiku-5-5");
+      } finally {
+        await sql`DELETE FROM llm_usage WHERE id = ${premiumSpent!.id}`;
+      }
+      // Everything else still counts towards the chat's cap: once it is used up, the chat hears why it is quiet.
+      const [chatSpent] = await sql<{ id: number }[]>`
+        INSERT INTO llm_usage (purpose, model, input_tokens, output_tokens, cost_usd, chat_id)
+        VALUES ('extract', 'claude-sonnet-5-5', 0, 0, ${chatCap}, ${A}) RETURNING id`;
+      try {
+        const asked = claude.requests.length;
+        await answering.handleUpdate(ask(dave, "and again?") as never);
+        await assistant.idle();
+        expect(claude.requests).toHaveLength(asked);
+      } finally {
+        await sql`DELETE FROM llm_usage WHERE id = ${chatSpent!.id}`;
+      }
+    });
+
+    it("asks again without the unprocessed messages when the model refuses a prompt with them, and leaves them out until the next pass", async () => {
+      const prompts: string[] = [];
+      const client = {
+        messages: {
+          create: async (params: { messages: { content: { text: string }[] }[] }) => {
+            const prompt = params.messages[0]!.content.map((block) => block.text).join("");
+            prompts.push(prompt);
+            const refused = prompt.includes("<earlier_messages");
+            return {
+              stop_reason: refused ? "refusal" : "end_turn",
+              content: refused ? [] : [{ type: "text", text: "The hive heard it all 🐝" }],
+              usage: { input_tokens: 1000, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+            };
+          },
+        },
+      } as unknown as Anthropic;
+      const { bot: answering, assistant } = answeringBot({ client, requests: [], answerWith: () => {} } as unknown as ReturnType<typeof fakeClaude>);
+      const erin = tg(9299, "Erin");
+      for (let index = 0; index < 40; index += 1) await answering.handleUpdate(inGroup(A, bob, `a long day, part ${index}`) as never);
+
+      await answering.handleUpdate(ask(erin, "what did we miss?") as never);
+      await assistant.idle();
+      expect(prompts.map((prompt) => prompt.includes("<earlier_messages"))).toEqual([true, false]);
+      expect(sent().at(-1)).toBe("The hive heard it all 🐝");
+
+      await answering.handleUpdate(ask(erin, "and before that?") as never);
+      await assistant.idle();
+      expect(prompts.map((prompt) => prompt.includes("<earlier_messages"))).toEqual([true, false, false]);
+
+      // A new pass brings them back.
+      const [run] = await sql<{ id: number }[]>`INSERT INTO extraction_runs (chat_id, finished_at, status) VALUES (${A}, now(), 'done') RETURNING id`;
+      try {
+        await answering.handleUpdate(ask(erin, "and now?") as never);
+        await assistant.idle();
+        expect(prompts[3]).toContain("<earlier_messages");
+      } finally {
+        await sql`DELETE FROM extraction_runs WHERE id = ${run!.id}`;
       }
     });
 

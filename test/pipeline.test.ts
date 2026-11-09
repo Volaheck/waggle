@@ -545,7 +545,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
       {
         sql,
         anthropic: quiet.client,
-        config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6 },
+        config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6, EXTRACTION_PASS_MESSAGES: 200, EXTRACTION_MIN_GAP_MINUTES: 60 },
         notifyAdmins: async (text) => void alerts.push(text),
         log: () => {},
       },
@@ -630,7 +630,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     const processChat = createChatProcessor({
       sql,
       anthropic: client,
-      config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6 },
+      config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6, EXTRACTION_PASS_MESSAGES: 200, EXTRACTION_MIN_GAP_MINUTES: 60 },
       notifyAdmins: async (text, offer) => void alerts.push({ text, offer }),
       endUserIdOf: (chatId) => chatEndUserId("test-secret", chatId),
       log: () => {},
@@ -685,7 +685,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     const processChat = createChatProcessor({
       sql,
       anthropic: client,
-      config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6 },
+      config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6, EXTRACTION_PASS_MESSAGES: 200, EXTRACTION_MIN_GAP_MINUTES: 60 },
       notifyAdmins: async (text, offer) => void alerts.push({ text, offer }),
       log: () => {},
     });
@@ -716,7 +716,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     const processChat = createChatProcessor({
       sql,
       anthropic: client,
-      config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6 },
+      config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6, EXTRACTION_PASS_MESSAGES: 200, EXTRACTION_MIN_GAP_MINUTES: 60 },
       notifyAdmins: async (text) => void alerts.push(text),
       log: () => {},
     });
@@ -756,7 +756,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     const processChat = createChatProcessor({
       sql,
       anthropic: client,
-      config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6 },
+      config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6, EXTRACTION_PASS_MESSAGES: 200, EXTRACTION_MIN_GAP_MINUTES: 60 },
       notifyAdmins: async (text) => void alerts.push(text),
       log: () => {},
     });
@@ -1168,7 +1168,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     const stop = startExtractionScheduler({
       sql,
       anthropic: hanging,
-      config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6 },
+      config: { EXTRACTION_MODEL: MODEL, MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6, EXTRACTION_PASS_MESSAGES: 200, EXTRACTION_MIN_GAP_MINUTES: 60 },
       notifyAdmins: async (text) => void alerts.push(text),
       log: () => {},
       checkEveryMs: 60_000,

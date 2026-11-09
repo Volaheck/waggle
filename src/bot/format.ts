@@ -137,7 +137,7 @@ export function catchupHtml(data: CatchupData, users: Map<number, User>, chatId:
   if (data.unprocessed.count > 0 && data.unprocessed.firstMsgId) {
     const readFrom = linkTo(chatId, data.unprocessed.firstMsgId, "read from here");
     lines.push(
-      `⏳ ${countOf(data.unprocessed.count, "more message", "more messages")} not chronicled yet (the chronicler goes through new ones every ${intervalHours} h)${readFrom ? ` — ${readFrom}` : ""}.`,
+      `⏳ ${countOf(data.unprocessed.count, "more message", "more messages")} not chronicled yet (the chronicler goes through new ones every ${intervalHours} h, sooner when the chat is busy)${readFrom ? ` — ${readFrom}` : ""}.`,
     );
   }
   if (data.mentions.length) {

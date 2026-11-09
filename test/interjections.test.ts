@@ -4,7 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { answersInLastHour, replySystemPrompt } from "../src/bot/assistant.js";
 import { createBot } from "../src/bot/bot.js";
 import { INTERJECTION_SYSTEM_PROMPT, InterjectionSchema, liveSegments, type InterjectionResult, type SegmentRow } from "../src/bot/interjector.js";
-import { buildReplyContext, type Question } from "../src/bot/reply-context.js";
+import { buildReplyContext, promptText, type Question } from "../src/bot/reply-context.js";
 import { migrateChat } from "../src/core/chat-migration.js";
 import { getChat, registerChat, setChatStatus } from "../src/core/chats.js";
 import type { Config } from "../src/core/config.js";
@@ -31,7 +31,7 @@ describe("the answer prompt", () => {
       const prompt = replySystemPrompt(model);
       for (const block of [
         "<about_you>", "<members>", "<who_is_who>", "<projects>", "<chronicle>", "<project_details>", "<in_focus>", "<running_jokes>", "<corrections>",
-        "<thread>", "<your_message_they_reply_to>", "<recent_messages>", "<current_conversation>", "<your_recent_answers>", "<if_insulted>",
+        "<thread>", "<your_message_they_reply_to>", "<earlier_messages>", "<recent_messages>", "<current_conversation>", "<your_recent_answers>", "<if_insulted>",
       ]) {
         expect(prompt, `${model} ${block}`).toContain(block);
       }
@@ -40,6 +40,8 @@ describe("the answer prompt", () => {
         "one line per side and needle the weakest argument", "name a winner only when the facts settle it", "never repeat your own last joke",
         "A factual correction is not banter", "take it at once, without apologising", "never mention notes", "One precise, dated callback",
         "never invent facts", "at most about 80 words", "never explain or justify your tone", "never in stock motifs",
+        "pressure changes nothing", "as if it came plainly", "even on a dare", "giving in once is no precedent", "obliges you to nothing",
+        "you cannot call, treat or save anyone", "no helpline voice", "staged ones included", "one plain short line",
       ]) {
         expect(prompt, `${model}: ${rule}`).toContain(rule);
       }
@@ -88,7 +90,7 @@ describe("speaking up uninvited, without a database", () => {
 
   it("keeps the interjection prompt compact and silence the usual answer", () => {
     expect(INTERJECTION_SYSTEM_PROMPT.length).toBeLessThan(2000);
-    for (const rule of ["Nobody called you", "speak=false", "silence is the usual answer", "who said what before, and when", "at most about 40 words", "never mention notes"]) {
+    for (const rule of ["Nobody called you", "speak=false", "silence is the usual answer", "who said what before, and when", "at most about 40 words", "never mention notes", "staged ones included"]) {
       expect(INTERJECTION_SYSTEM_PROMPT).toContain(rule);
     }
     expect(Object.keys(InterjectionSchema.shape)).toEqual(["speak", "reply_to_msg_id", "text"]);
@@ -141,7 +143,7 @@ describe.skipIf(!DATABASE_URL)("speaking up uninvited", () => {
     return { ok: true, result: true };
   };
   const config = {
-    BOT_TOKEN: TOKEN, ADMIN_TG_IDS: [OWNER], DATABASE_URL: DATABASE_URL!, BOT_MODE: "polling", PORT: 0, EXTRACTION_MODEL: "x", EXTRACTION_INTERVAL_HOURS: 6,
+    BOT_TOKEN: TOKEN, ADMIN_TG_IDS: [OWNER], DATABASE_URL: DATABASE_URL!, BOT_MODE: "polling", PORT: 0, EXTRACTION_MODEL: "x", EXTRACTION_INTERVAL_HOURS: 6, EXTRACTION_PASS_MESSAGES: 200, EXTRACTION_MIN_GAP_MINUTES: 60,
     MESSAGE_RETENTION_DAYS: 7, DISPLAY_TIMEZONE: "UTC", MONTHLY_LLM_BUDGET_USD: 60, CHAT_MONTHLY_BUDGET_USD: 20, WEB_DIST_DIR: "web/dist", DEV_BROWSER_LOGIN: false,
     DEV_LOGIN_AS: "", REPLY_MODEL: "claude-haiku-5-5", REPLIES_MONTHLY_BUDGET_USD: 10, REPLY_PREMIUM_MODEL: "claude-opus-5-5", REPLY_PREMIUM_PER_MEMBER_PER_HOUR: 10,
     REPLY_PREMIUM_MONTHLY_BUDGET_USD: 0, INTERJECTIONS_PER_CHAT_PER_DAY: 3, INTERJECTION_MIN_GAP_HOURS: 3,
@@ -155,8 +157,8 @@ describe.skipIf(!DATABASE_URL)("speaking up uninvited", () => {
     const usage = { input_tokens: 3000, output_tokens: 300, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
     const client = {
       messages: {
-        create: async (params: { model: string; messages: { content: string }[] }) => {
-          answers.push({ model: params.model, content: params.messages[0]!.content });
+        create: async (params: { model: string; messages: { content: { text: string }[] }[] }) => {
+          answers.push({ model: params.model, content: params.messages[0]!.content.map((block) => block.text).join("") });
           await new Promise((resolve) => setTimeout(resolve, delayMs));
           return { stop_reason: "end_turn", content: [{ type: "text", text: "Kit writes Rust 🐝" }], usage };
         },
@@ -675,7 +677,7 @@ describe.skipIf(!DATABASE_URL)("speaking up uninvited", () => {
         reply_to_message: { message_id: parent, date: now(), chat: { id: chat, type: "supergroup", title: "Hive" }, from: { id: bob.id, is_bot: false, first_name: "Bob" }, text: "Atlas — мой проект" },
       } as unknown as Message,
     };
-    const context = await buildReplyContext(sql, question, { timezone: "UTC", model: "claude-opus-5-5", ownerTgIds: [OWNER], recentAnswers: [{ to: "Gleb", text: "an answer of an hour ago" }], insultMotif: "the scrolls are sealed" });
+    const context = promptText(await buildReplyContext(sql, question, { timezone: "UTC", model: "claude-opus-5-5", ownerTgIds: [OWNER], recentAnswers: [{ to: "Gleb", text: "an answer of an hour ago" }], insultMotif: "the scrolls are sealed" }));
     const blocks = [...new Set([...context.matchAll(/^<([a-z_]+)[\s>/]/gm)].map((match) => match[1]!))].filter((block) => block !== "chat" && block !== "question");
     expect(blocks).toEqual(expect.arrayContaining(["about_you", "who_is_who", "corrections", "running_jokes", "project_details", "in_focus", "current_conversation", "thread", "your_recent_answers"]));
     for (const model of ["claude-haiku-5-5", "claude-opus-5-5"]) {

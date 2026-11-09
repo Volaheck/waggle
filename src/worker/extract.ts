@@ -179,16 +179,21 @@ Rules:
 Empty arrays are a normal result when there is nothing new. Write all content in the chat's language; names, slugs, refs, status codes and stack family names follow the rules above.`;
 
 export interface PendingStats {
+  /** Messages waiting for the chronicler, the bot's lines included; forwards and texts under 3 characters do not count. */
   count: number;
   oldest: Date | null;
+  /** The waiting messages an answer quotes in <earlier_messages> (reply-context.ts): every one with text. */
+  shown: number;
 }
 
 export async function pendingStats(sql: Sql, chatId: number): Promise<PendingStats> {
   const [row] = await sql<PendingStats[]>`
-    SELECT count(*)::int AS count, min(sent_at) AS oldest
+    SELECT count(*) FILTER (WHERE NOT is_forward AND length(text) >= 3)::int AS count,
+           min(sent_at) FILTER (WHERE NOT is_forward AND length(text) >= 3) AS oldest,
+           count(*) FILTER (WHERE btrim(text) <> '')::int AS shown
     FROM messages
-    WHERE chat_id = ${chatId} AND extracted_at IS NULL AND NOT is_forward AND length(text) >= 3`;
-  return row ?? { count: 0, oldest: null };
+    WHERE chat_id = ${chatId} AND extracted_at IS NULL`;
+  return row ?? { count: 0, oldest: null, shown: 0 };
 }
 
 export async function lastSuccessfulRunAt(sql: Sql, chatId: number): Promise<Date | null> {
@@ -196,18 +201,40 @@ export async function lastSuccessfulRunAt(sql: Sql, chatId: number): Promise<Dat
   return row?.at ?? null;
 }
 
-/** Every `intervalHours` the extractor takes whatever piled up since the previous pass — no message-count thresholds. */
-export function isPassDue(pending: PendingStats, lastRunAt: Date | null, intervalHours: number, now = new Date()): boolean {
-  if (pending.count === 0 || !pending.oldest) return false;
-  const reference = lastRunAt ?? pending.oldest;
-  return now.getTime() - reference.getTime() >= intervalHours * 3_600_000;
+export interface PassSchedule {
+  intervalHours: number;
+  /** A pass also starts once this many messages wait (0: only the interval)… */
+  messages: number;
+  /** …but not sooner than this after the previous one. */
+  minGapMinutes: number;
 }
 
-async function loadBatch(sql: Sql, chatId: number, limit: number): Promise<BatchData | null> {
+/**
+ * When the next pass is due. A message waits for the chronicler at most `intervalHours`, counted from the previous pass
+ * or from the oldest waiting message, whichever is later, so the first message after a quiet night waits for company
+ * instead of getting a pass of its own. A busy chat gets one sooner, once `messages` wait, but no sooner than
+ * `minGapMinutes` after the previous pass. Answers quote whatever waits in full (reply-context.ts), so nothing is out
+ * of their sight meanwhile; the second rule keeps that part of their prompt short and the cards and notes fresh.
+ */
+export function passDueAt(pending: PendingStats, lastRunAt: Date | null, schedule: PassSchedule): Date | null {
+  if (pending.count === 0 || !pending.oldest) return null;
+  const byInterval = Math.max(lastRunAt?.getTime() ?? 0, pending.oldest.getTime()) + schedule.intervalHours * 3_600_000;
+  if (schedule.messages === 0 || pending.shown < schedule.messages) return new Date(byInterval);
+  const byVolume = (lastRunAt ?? pending.oldest).getTime() + schedule.minGapMinutes * 60_000;
+  return new Date(Math.min(byInterval, byVolume));
+}
+
+export function isPassDue(pending: PendingStats, lastRunAt: Date | null, schedule: PassSchedule, now = new Date()): boolean {
+  const due = passDueAt(pending, lastRunAt, schedule);
+  return due !== null && due.getTime() <= now.getTime();
+}
+
+/** The oldest waiting messages, up to the pass's `ceiling`: what arrives while a pass runs waits for the next one. */
+async function loadBatch(sql: Sql, chatId: number, limit: number, ceiling: number): Promise<BatchData | null> {
   const batch = await sql<StoredMessage[]>`
     SELECT ${sql.unsafe(MESSAGE_COLUMNS)}
     FROM messages
-    WHERE chat_id = ${chatId} AND extracted_at IS NULL
+    WHERE chat_id = ${chatId} AND extracted_at IS NULL AND msg_id <= ${ceiling}
     ORDER BY msg_id
     LIMIT ${limit}`;
   return batch.length === 0 ? null : batchDataFor(sql, chatId, batch);
@@ -661,6 +688,8 @@ export async function runExtractionPass(deps: ExtractorDeps): Promise<PassResult
   await checkBudget();
   const [run] = await sql<{ id: number }[]>`INSERT INTO extraction_runs (chat_id) VALUES (${chatId}) RETURNING id`;
   const runId = run!.id;
+  const [{ ceiling } = { ceiling: null }] = await sql<{ ceiling: number | null }[]>`
+    SELECT max(msg_id) AS ceiling FROM messages WHERE chat_id = ${chatId} AND extracted_at IS NULL`;
   const total: PassResult = { ...emptyStats(), calls: 0, failedCalls: 0, refusals: 0, messages: 0, skipped: [], notes: 0, aliases: 0, notesCalls: 0, notesFailures: [] };
   const onUsage = (usage: UsageLike) => recordUsage(sql, "extract", config.EXTRACTION_MODEL, usage, chatId);
   let firstMsgId: number | null = null;
@@ -670,7 +699,7 @@ export async function runExtractionPass(deps: ExtractorDeps): Promise<PassResult
   try {
     while (total.calls - total.failedCalls < MAX_CALLS_PER_PASS) {
       if (deps.drain?.aborted) throw new Error(INTERRUPTED_PASS_ERROR);
-      const data = await loadBatch(sql, chatId, limit);
+      const data = ceiling === null ? null : await loadBatch(sql, chatId, limit, ceiling);
       if (!data) break;
       data.ownerTgIds = deps.config.ADMIN_TG_IDS ?? [];
       data.timezone = deps.config.DISPLAY_TIMEZONE;

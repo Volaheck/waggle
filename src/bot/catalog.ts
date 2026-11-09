@@ -677,7 +677,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
               `<i>${formatDate(entry.period_to, config.DISPLAY_TIMEZONE)}</i>\n${chronicleLine(entry, scope.chatId)}`,
           )
           .join("\n\n")
-      : `The chronicle is empty for this period. The chronicler goes through new messages every ${config.EXTRACTION_INTERVAL_HOURS} h.`;
+      : `The chronicle is empty for this period. The chronicler goes through new messages every ${config.EXTRACTION_INTERVAL_HOURS} h, sooner when the chat is busy.`;
     await kit.show(ctx, `📜 <b>Chat highlights</b>\n\n${body}`, keyboard, {
       edit,
     });

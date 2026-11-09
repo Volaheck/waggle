@@ -4,7 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { signInitData } from "../src/api/init-data.js";
 import { createApi } from "../src/api/server.js";
 import { createBot } from "../src/bot/bot.js";
-import { buildReplyContext, type Question } from "../src/bot/reply-context.js";
+import { buildReplyContext, promptText, type Question } from "../src/bot/reply-context.js";
 import { addAlias } from "../src/core/aliases.js";
 import { migrateChat } from "../src/core/chat-migration.js";
 import { attachLegacyData, getChat, LEGACY_CHAT_ID, registerChat, setChatStatus } from "../src/core/chats.js";
@@ -219,7 +219,7 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
     return { chatId, chatTitle: "Hive", from: tgFrom, me, message: { message_id: ++nextMsgId, date: now(), chat: { id: chatId, type: "supergroup", title: "Hive" }, from: tgFrom, text } as unknown as Message };
   };
   const contextFor = (question: Question) =>
-    buildReplyContext(sql, question, { timezone: "UTC", model: "claude-opus-5-5", ownerTgIds: [OWNER], recentAnswers: [], insultMotif: "the scrolls are sealed" });
+    buildReplyContext(sql, question, { timezone: "UTC", model: "claude-opus-5-5", ownerTgIds: [OWNER], recentAnswers: [], insultMotif: "the scrolls are sealed" }).then(promptText);
   const block = (context: string, name: string) => new RegExp(`<${name}[^>]*>\\n([\\s\\S]*?)\\n</${name}>`).exec(context)?.[1];
 
   describe("what the chronicler notes", () => {
@@ -518,7 +518,7 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       const processChat = createChatProcessor({
         sql,
         anthropic: client,
-        config: { EXTRACTION_MODEL: "claude-sonnet-5-5", MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6 },
+        config: { EXTRACTION_MODEL: "claude-sonnet-5-5", MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6, EXTRACTION_PASS_MESSAGES: 200, EXTRACTION_MIN_GAP_MINUTES: 60 },
         notifyAdmins: async (text) => void alerts.push(text),
         log: () => {},
       });
@@ -725,7 +725,7 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       const processChat = createChatProcessor({
         sql,
         anthropic: model.client,
-        config: { EXTRACTION_MODEL: "claude-sonnet-5-5", MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6 },
+        config: { EXTRACTION_MODEL: "claude-sonnet-5-5", MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, EXTRACTION_INTERVAL_HOURS: 6, EXTRACTION_PASS_MESSAGES: 200, EXTRACTION_MIN_GAP_MINUTES: 60 },
         notifyAdmins: async () => {},
         log: (line) => void lines.push(line),
       });
@@ -782,9 +782,9 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       expect(focus).toContain("🔒 running jokes: чайник-оракул");
       expect(context).not.toContain("записывали");
       expect(block(context, "running_jokes")).toMatch(/^- чайник-оракул: “чайник-оракул предсказывает погоду” \(Kit, Bob; \d{1,2} \w{3,4}\)$/);
-      expect(block(context, "corrections")).toMatch(/^- about Dora: “Atlas — проект Доры, а не Боба” \(\d{1,2} \w{3,4}\)$/);
-      expect(block(context, "about_you")).toMatch(/What members say about you: “бот умнее половины чата” \(Bob, \d{1,2} \w{3,4}\)\./);
-      expect(block(context, "about_you")).not.toContain("опечатки");
+      // The chat-wide lists are the same whoever asks, the asker's own notes included; the focus repeats those.
+      expect(block(context, "corrections")).toMatch(/^- about Dora: “Atlas — проект Доры, а не Боба” \(\d{1,2} \w{3,4}\)\n- about Kit: “Кит — не дизайнер, а бэкендер” \(\d{1,2} \w{3,4}\)$/);
+      expect(block(context, "about_you")).toMatch(/What members say about you: “бот умнее половины чата” \(Bob, \d{1,2} \w{3,4}\); “бот тайно считает наши опечатки” \(Kit, \d{1,2} \w{3,4}\)\./);
     });
   });
 
@@ -801,7 +801,7 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       return { ok: true, result: true };
     };
     const config = {
-      BOT_TOKEN: TOKEN, ADMIN_TG_IDS: [OWNER], DATABASE_URL: DATABASE_URL!, BOT_MODE: "polling", PORT: 0, EXTRACTION_MODEL: "x", EXTRACTION_INTERVAL_HOURS: 6,
+      BOT_TOKEN: TOKEN, ADMIN_TG_IDS: [OWNER], DATABASE_URL: DATABASE_URL!, BOT_MODE: "polling", PORT: 0, EXTRACTION_MODEL: "x", EXTRACTION_INTERVAL_HOURS: 6, EXTRACTION_PASS_MESSAGES: 200, EXTRACTION_MIN_GAP_MINUTES: 60,
       MESSAGE_RETENTION_DAYS: 7, DISPLAY_TIMEZONE: "UTC", MONTHLY_LLM_BUDGET_USD: 60, CHAT_MONTHLY_BUDGET_USD: 20, WEB_DIST_DIR: "web/dist", DEV_BROWSER_LOGIN: false,
       DEV_LOGIN_AS: "", REPLY_MODEL: "claude-haiku-5-5", REPLIES_MONTHLY_BUDGET_USD: 0, REPLY_PREMIUM_MODEL: "claude-opus-5-5", REPLY_PREMIUM_PER_MEMBER_PER_HOUR: 10,
       REPLY_PREMIUM_MONTHLY_BUDGET_USD: 0,
