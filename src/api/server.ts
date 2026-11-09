@@ -377,7 +377,7 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     try {
       return c.html(await readFile(path.join(distRoot, "index.html"), "utf8"));
     } catch {
-      return c.text("Mini App ещё не собрана: npm run build:web", 503);
+      return c.text("The Mini App isn't built yet: npm run build:web", 503);
     }
   });
 

@@ -22,13 +22,13 @@ const EnvSchema = z.object({
   WEBHOOK_SECRET: z.string().min(16).optional(),
   BOT_APP_SHORT_NAME: z.string().optional(),
   PORT: z.coerce.number().int().default(8787),
-  EXTRACTION_MODEL: z.string().default("claude-haiku-5-5"),
+  EXTRACTION_MODEL: z.string().default("claude-sonnet-5-5"),
   EXTRACTION_INTERVAL_HOURS: z.coerce.number().positive().default(6),
   DISPLAY_TIMEZONE: z.string().default("UTC"),
   /** Cap for the whole bot, across all chats. */
-  MONTHLY_LLM_BUDGET_USD: z.coerce.number().default(5),
+  MONTHLY_LLM_BUDGET_USD: z.coerce.number().default(60),
   /** Default cap per chat; an owner can set another one for a chat. */
-  CHAT_MONTHLY_BUDGET_USD: z.coerce.number().default(2),
+  CHAT_MONTHLY_BUDGET_USD: z.coerce.number().default(20),
   WEB_DIST_DIR: z.string().default("web/dist"),
   /** Local development only: open the Mini App in a plain browser via a secret link printed at startup. */
   DEV_BROWSER_LOGIN: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),

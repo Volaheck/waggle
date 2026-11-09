@@ -4,36 +4,44 @@ import { z } from "zod";
 import type { Sql } from "../core/db.js";
 import { dropFact, mergeFacts, normalizeStacks, type Fact } from "../core/facts.js";
 import { assertBudget, recordUsage } from "../core/llm.js";
-import { mergeProjects, PROJECT_STATUSES, upsertProject } from "../core/projects.js";
+import { detectLanguage } from "../core/language.js";
+import { mergeProjects, STATUS_CODE_LIST, statusCode, statusFromCode, upsertProject } from "../core/projects.js";
+import { PROMPT_STATUS_CODES } from "./extract.js";
+
+/** Kinds whose values are written in words, so they show the chat's language (stack and links read the same anywhere). */
+const WORDY_KINDS = new Set(["role", "expertise", "interest", "looking_for", "can_help"]);
 
 export const ConsolidationSchema = z.object({
   fact_merges: z.array(z.object({ fact_ids: z.array(z.number().int()), value: z.string() })),
   fact_drops: z.array(z.object({ fact_id: z.number().int() })),
   project_merges: z.array(z.object({ into: z.string(), from: z.array(z.string()) })),
-  project_updates: z.array(z.object({ slug: z.string(), tagline: z.string().nullable(), status: z.enum(PROJECT_STATUSES).nullable() })),
+  project_updates: z.array(z.object({ slug: z.string(), tagline: z.string().nullable(), status: z.enum(STATUS_CODE_LIST).nullable() })),
 });
 
 export type ConsolidationResult = z.infer<typeof ConsolidationSchema>;
 
-export const CONSOLIDATION_SYSTEM_PROMPT = `Ты — редактор карточек участников и каталога проектов закрытого Telegram-чата. Карточки пополняются автоматически, и в них копятся повторы. Твоя задача — навести порядок, ничего не выдумывая.
+export const CONSOLIDATION_SYSTEM_PROMPT = `You are the editor of the member cards and the project catalog of a private Telegram group chat. The cards are filled in automatically, and repeats pile up in them. Your job is to tidy them up without making anything up.
 
-Ты получаешь карточки (участник, факты с id и видом) и каталог проектов (slug, название, описание, статус, авторы, ссылки).
+You receive the cards (member, facts with id and kind) and the project catalog (slug, name, status, authors, tagline, links).
 
-Карточка — короткая анкета без повторов. Смысловые дубли недопустимы: два факта об одном и том же (одно семейство продуктов, одна тема разными словами, общее и частное — «игры Nintendo» и «Nintendo Switch») сливай в один.
-- role — ровно одна роль на человека. Несколько ролей сведи в одну ёмкую формулировку.
-- stack — одна технология на факт, коротким названием без пояснений. ИИ-модели и инструменты одной компании — ОДИН факт: OpenAI (GPT, ChatGPT, Codex, Astra) — «GPT / Codex», Anthropic (Claude, Opus, Claude Code) — «Claude», Google — «Gemini». Железо и тарифы — не стек.
-- expertise, interest — коротко, одним-двумя словами или короткой фразой.
-- link — только личные ссылки (GitHub-профиль, личный сайт, портфолио), не ссылки на проекты из каталога.
-- project — проекты в карточке не хранятся: они есть в каталоге. Удаляй такие факты.
+Language
+Write ALL content — merged fact values and project taglines — in the chat's language. When the input begins with <chat_language>, that is the chat's language: write in it. Otherwise it is the language most of the existing role, expertise and interest facts and project taglines are written in (names, stack facts and links do not count: they read the same in any language). When the facts you merge are in different languages, write the merged value in the chat's language. Never translate content into any language other than the chat's, English included. Never translate or transliterate names of people, products and technologies, but inflect them as the chat's language requires; stack facts use the fixed family names given below. These instructions are in English, and every example in them is only an illustration: no example is a reason to write in English when the cards are in another language.
 
-Что делать:
-- fact_merges — группы фактов ОДНОГО человека и одного вида, которые говорят одно и то же или сводятся к одному («Codex (тариф Max)» + «Codex (активно пользовался)» → «Codex»; две записи про один MacBook; несколько ролей). fact_ids — все id группы, value — итоговая формулировка. Можно передать одну id, чтобы просто укоротить формулировку по правилам выше.
-- fact_drops — факты, которые повторяют каталог (вид project, ссылки на проекты), не несут смысла или нарушают правила (железо в стеке, финансы, личное).
-- Факты, помеченные ✍️, написал сам человек: их не объединяй, не переформулируй и не удаляй.
-- project_merges — записи каталога об одном и том же продукте (into — slug, который остаётся, обычно с лучшим названием; from — slug'и дублей).
-- project_updates — описание (одна фраза, без денег и личного) или статус, если текущие явно неточны или описание говорит о другом продукте. Иначе не трогай.
+A card is a short profile without repeats. Semantic duplicates are not allowed: merge two facts about the same thing (one product family, one topic in different words, the general and the specific — "Nintendo games" and "Nintendo Switch") into one.
+- role — exactly one role per person. Fold several roles into one concise wording.
+- stack — one technology per fact, by a short name with no explanations. AI models and tools from one company are ONE fact: OpenAI (GPT, ChatGPT, Codex, Astra) is "GPT / Codex", Anthropic (Claude, Opus, Claude Code) is "Claude", Google is "Gemini". Hardware and subscription plans do not belong in stack.
+- expertise, interest — briefly, in one or two words or a short phrase.
+- link — personal links only (a GitHub profile, a personal site, a portfolio), not links to projects from the catalog.
+- project — projects are not kept on cards: they are in the catalog. Drop such facts.
 
-Если чистить нечего — верни пустые массивы.`;
+What to do:
+- fact_merges — groups of facts of ONE person and one kind that say the same thing or boil down to one ("Codex (Max plan)" + "Codex (used it actively)" → "Codex"; two entries about the same MacBook; several roles). fact_ids — all ids of the group, value — the final wording. You can pass a single id just to shorten its wording according to the rules above.
+- fact_drops — facts that repeat the catalog (kind project, links to projects), carry no meaning or break the rules (hardware in stack, finances, personal matters).
+- Facts marked ✍️ were written by the person themselves: do not merge, reword or drop them.
+- project_merges — catalog entries about the same product (into — the slug that stays, usually the one with the better name; from — the slugs of the duplicates).
+- project_updates — a tagline (one sentence, nothing about money or personal matters) or a status, if the current ones are clearly inaccurate or the tagline describes a different product. Otherwise leave them alone. status — one of ${PROMPT_STATUS_CODES}; statuses are fixed codes, not content: copy the quoted code exactly and never translate it.
+
+If there is nothing to clean up, return empty arrays.`;
 
 export interface ConsolidationInput {
   chatId: number;
@@ -65,9 +73,13 @@ export function buildConsolidationPrompt(input: ConsolidationInput): string {
     .filter(Boolean)
     .join("\n");
   const catalog = input.projects
-    .map((project) => `${project.slug} | ${project.name} | ${project.status} | авторы: ${project.authors.join(", ")} | ${project.tagline ?? ""} | ${JSON.stringify(project.links)}`)
+    .map((project) => `${project.slug} | ${project.name} | ${statusCode(project.status) ?? "-"} | authors: ${project.authors.join(", ")} | ${project.tagline ?? ""} | ${JSON.stringify(project.links)}`)
     .join("\n");
-  return `<cards>\n${cards}\n</cards>\n\n<catalog>\n${catalog}\n</catalog>`;
+  const language = detectLanguage([
+    ...input.facts.filter((fact) => WORDY_KINDS.has(fact.kind)).map((fact) => fact.value),
+    ...input.projects.map((project) => project.tagline ?? ""),
+  ]);
+  return `${language ? `<chat_language>${language}</chat_language>\n\n` : ""}<cards>\n${cards}\n</cards>\n\n<catalog>\n${catalog}\n</catalog>`;
 }
 
 export interface ConsolidationStats {
@@ -106,7 +118,7 @@ export async function applyConsolidation(sql: Sql, input: ConsolidationInput, re
   for (const update of result.project_updates) {
     const project = input.projects.find((candidate) => candidate.slug === update.slug);
     if (!project || (!update.tagline && !update.status)) continue;
-    await upsertProject(sql, { chatId: input.chatId, slug: project.slug, name: project.name, tagline: update.tagline, status: update.status, authorIds: [], sourceMsgIds: [], source: "llm" });
+    await upsertProject(sql, { chatId: input.chatId, slug: project.slug, name: project.name, tagline: update.tagline, status: statusFromCode(update.status), authorIds: [], sourceMsgIds: [], source: "llm" });
     stats.projectsUpdated += 1;
   }
   await sql`

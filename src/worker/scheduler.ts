@@ -61,11 +61,11 @@ export function startExtractionScheduler(options: SchedulerOptions): () => void 
       }
     } catch (error) {
       if (error instanceof BudgetExceededError) {
-        const where = error.chatId === undefined ? "во всех чатах" : `в «${title}»`;
-        await alertOnce(`budget:${error.chatId ?? "all"}`, `⚠️ ${error.message}. Летопись и карточки ${where} на паузе до следующего месяца или пока не поднимешь лимит.`);
+        const where = error.chatId === undefined ? "in all chats" : `in “${title}”`;
+        await alertOnce(`budget:${error.chatId ?? "all"}`, `⚠️ ${error.message}. The chronicle and cards ${where} are paused until next month or until you raise the limit.`);
       } else {
         log(`[extract] ${title} failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
-        await alertOnce(`error:${chat.id}`, `⚠️ Ошибка обработки сообщений в «${title}»: ${error instanceof Error ? error.message : String(error)}. Повторю через час.`);
+        await alertOnce(`error:${chat.id}`, `⚠️ Failed to process messages in “${title}”: ${error instanceof Error ? error.message : String(error)}. Will retry in an hour.`);
       }
     }
   };

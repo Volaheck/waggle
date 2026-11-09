@@ -3,7 +3,6 @@ import type { InlineKeyboardButton, User as TelegramUser } from "grammy/types";
 import { approvedChats, chatsOfUser, setCurrentChat, type Chat } from "../core/chats.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
-import { escapeHtml } from "../core/text.js";
 import { ensureMember, getPerson, resolveUser, type Person, type User } from "../core/users.js";
 import { clampTelegram } from "./format.js";
 import type { MembershipCache } from "./membership.js";
@@ -19,7 +18,7 @@ export type PendingInput =
 
 const INPUT_TTL_MS = 10 * 60 * 1000;
 
-/** Remembers what the bot asked a user to type next in DM («Напиши однострочник…»). */
+/** Remembers what the bot asked a user to type next in DM («Write a one-liner…»). */
 export class PendingInputs {
   private readonly entries = new Map<number, { input: PendingInput; expiresAt: number }>();
 
@@ -101,7 +100,7 @@ export function createKit(bot: Bot<BotContext>, sql: Sql, config: Config, member
   const chatPicker: BotKit["chatPicker"] = (ctx, _user, chats, edit = false) => {
     const keyboard = new InlineKeyboard();
     for (const chat of chats) keyboard.text(chat.title ?? String(chat.id), `chat:${encodeChat(chat.id)}`).row();
-    return show(ctx, "🐝 <b>Какой чат открыть?</b>\nТы состоишь в нескольких чатах с Waggle — у каждого свои карточки и летопись.", keyboard, { edit });
+    return show(ctx, "🐝 <b>Which chat should I open?</b>\nYou're in several chats with Waggle — each has its own cards and chronicle.", keyboard, { edit });
   };
 
   return {
@@ -132,7 +131,7 @@ export function createKit(bot: Bot<BotContext>, sql: Sql, config: Config, member
       if (chats.length === 0) {
         await show(
           ctx,
-          `🐝 Ты пока не состоишь ни в одном чате с Waggle.\n\nДобавь бота в свою группу — после одобрения он начнёт вести там летопись и карточки.\nТвой Telegram ID: <code>${escapeHtml(String(ctx.from.id))}</code>`,
+          "🐝 You're not in any chat with Waggle yet.\n\nAdd the bot to your group — once it's approved, it starts keeping the chronicle and cards there.",
         );
         return undefined;
       }
@@ -181,8 +180,8 @@ export function grid(buttons: InlineKeyboardButton[], perRow: number): InlineKey
 export function pager(prefix: string, page: number, totalPages: number): InlineKeyboardButton[] {
   if (totalPages <= 1) return [];
   const buttons: InlineKeyboardButton[] = [];
-  if (page > 0) buttons.push(InlineKeyboard.text("← Назад", `${prefix}:${page - 1}`));
+  if (page > 0) buttons.push(InlineKeyboard.text("← Back", `${prefix}:${page - 1}`));
   buttons.push(InlineKeyboard.text(`${page + 1}/${totalPages}`, "noop"));
-  if (page + 1 < totalPages) buttons.push(InlineKeyboard.text("Дальше →", `${prefix}:${page + 1}`));
+  if (page + 1 < totalPages) buttons.push(InlineKeyboard.text("Next →", `${prefix}:${page + 1}`));
   return buttons;
 }

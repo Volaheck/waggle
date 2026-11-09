@@ -47,7 +47,7 @@ const MIN_CATCHUP_MESSAGES = 20;
 const FALLBACK_HOURS = 24;
 const MAX_LOOKBACK_HOURS = 7 * 24;
 
-/** Builds «что я пропустил» purely from stored chronicle entries. */
+/** Builds «what I missed» (/catchup) purely from stored chronicle entries. */
 export async function catchupFor(sql: Sql, chatId: number, user: Person, sinceHours?: number): Promise<CatchupData> {
   const now = Date.now();
   const floor = new Date(now - MAX_LOOKBACK_HOURS * 3_600_000);

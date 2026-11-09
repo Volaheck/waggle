@@ -35,22 +35,22 @@ const MANUAL_KINDS: FactKind[] = [
 ];
 
 const KIND_PROMPTS: Record<FactKind, string> = {
-  role: "Чем занимаешься? Например: «бэкенд-разработчик», «3D-художник в геймдеве»",
+  role: "What do you do? For example: “backend developer”, “3D artist in gamedev”",
   stack:
-    "Чем пользуешься? Можно несколько через запятую: «Rust, Tauri, Claude Code»",
+    "What do you use? Several, comma-separated, is fine: “Rust, Tauri, Claude Code”",
   expertise:
-    "О чём тебя можно спросить? Например: «self-hosted VPN», «Unity-шейдеры»",
-  interest: "Чем увлекаешься? Например: «скайдайвинг», «ретро-консоли»",
+    "What can people ask you about? For example: “self-hosted VPN”, “Unity shaders”",
+  interest: "What are you into? For example: “skydiving”, “retro consoles”",
   looking_for:
-    "Что ищешь? Например: «тестеров для бета-версии», «кофаундера-дизайнера»",
+    "What are you looking for? For example: “beta testers”, “a designer co-founder”",
   can_help:
-    "Чем можешь помочь другим? Например: «ревью архитектуры», «настройка серверов»",
-  link: "Скинь ссылку: GitHub, сайт, портфолио, канал",
-  timezone: "Где ты / какой часовой пояс? Например: «Берлин», «UTC+3»",
-  project: "Опиши проект в двух словах",
+    "How can you help others? For example: “architecture reviews”, “server setup”",
+  link: "Send a link: GitHub, website, portfolio, channel",
+  timezone: "Where are you / what's your time zone? For example: “Berlin”, “UTC+3”",
+  project: "Describe the project in a few words",
 };
 
-const cancelKeyboard = () => new InlineKeyboard().text("Отмена", "me:cancel");
+const cancelKeyboard = () => new InlineKeyboard().text("Cancel", "me:cancel");
 
 export interface ProfileHandlers {
   handleInput: (
@@ -90,10 +90,10 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
       personCard(person, facts, projects),
       "",
       person.opted_out
-        ? "🚫 Сбор информации о тебе в этом чате выключен."
-        : "Эту карточку видят участники чата. Летописец пополняет её сам по ходу общения, а ты можешь поправить что угодно.",
+        ? "🚫 Data collection about you is off in this chat."
+        : "Chat members can see this card. The chronicler fills it in as you chat, and you can fix anything.",
       chats.length > 1 && chatTitle
-        ? `\n💬 Чат: <b>${escapeHtml(chatTitle)}</b>`
+        ? `\n💬 Chat: <b>${escapeHtml(chatTitle)}</b>`
         : "",
     ]
       .join("\n")
@@ -101,21 +101,21 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     const keyboard = new InlineKeyboard();
     if (!person.opted_out) {
       keyboard
-        .text("✏️ Однострочник", "me:tagline")
-        .text("➕ Добавить", "me:add")
+        .text("✏️ One-liner", "me:tagline")
+        .text("➕ Add", "me:add")
         .row();
       if (facts.length)
         keyboard
-          .text("❌ Убрать неверное", "me:wrong")
-          .text("🙈 Скрыть", "me:hide")
+          .text("❌ Remove wrong", "me:wrong")
+          .text("🙈 Hide", "me:hide")
           .row();
-      if (hiddenCount) keyboard.text(`👁 Скрытые (${hiddenCount})`, "me:hidden");
+      if (hiddenCount) keyboard.text(`👁 Hidden (${hiddenCount})`, "me:hidden");
     }
-    keyboard.text("🛠 Мои проекты", "me:projects").row();
-    keyboard.text("🔒 Приватность", "me:privacy");
-    const app = kit.appButton(ctx, chatId, "📱 В приложении", "/me", "me");
+    keyboard.text("🛠 My projects", "me:projects").row();
+    keyboard.text("🔒 Privacy", "me:privacy");
+    const app = kit.appButton(ctx, chatId, "📱 In the app", "/me", "me");
     if (app) keyboard.add(app);
-    if (chats.length > 1) keyboard.row().text("🔁 Другой чат", "chat:pick");
+    if (chats.length > 1) keyboard.row().text("🔁 Other chat", "chat:pick");
     await kit.show(ctx, text, keyboard, { edit });
   }
 
@@ -132,9 +132,9 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
         : await visibleFacts(sql, scope.chatId, scope.user.id);
     const title = {
       wrong:
-        "❌ <b>Что неверно?</b> Нажми номер — факт исчезнет, и летописец больше его не добавит.",
-      hide: "🙈 <b>Что скрыть?</b> Скрытое не видно другим, но его можно вернуть.",
-      hidden: "👁 <b>Скрытые факты.</b> Нажми номер, чтобы вернуть в карточку.",
+        "❌ <b>What's wrong?</b> Tap a number — the fact disappears and the chronicler won't add it again.",
+      hide: "🙈 <b>What should be hidden?</b> Others can't see hidden facts, and you can bring them back.",
+      hidden: "👁 <b>Hidden facts.</b> Tap a number to put it back on your card.",
     }[mode];
     const action = { wrong: "rej", hide: "hide", hidden: "unhide" }[mode];
     const icon = { wrong: "❌", hide: "🙈", hidden: "↩️" }[mode];
@@ -143,7 +143,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
       .map((fact, index) =>
         InlineKeyboard.text(`${icon} ${index + 1}`, `${action}:${fact.id}`),
       );
-    const keyboard = grid(buttons, 5).row().text("← Назад", "me:home");
+    const keyboard = grid(buttons, 5).row().text("← Back", "me:home");
     await kit.show(
       ctx,
       `${title}\n\n${factsWithSources(facts, scope.chatId)}`,
@@ -154,19 +154,19 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
 
   async function privacyScreen(ctx: BotContext, scope: Scope) {
     const text = scope.person.opted_out
-      ? "🚫 <b>Сбор выключен.</b> Летописец ничего о тебе в этом чате не записывает, карточки нет. Сообщения остаются в общем архиве чата."
+      ? "🚫 <b>Collection is off.</b> The chronicler records nothing about you in this chat, and there's no card. Your messages stay in the chat's shared archive."
       : [
-          "🔒 <b>Приватность</b>",
-          "Летописец раз в несколько часов разбирает новые сообщения и пополняет карточки. Он никогда не записывает политику, здоровье, финансы, личную жизнь, адреса и секреты.",
-          "Каждый факт можно убрать кнопкой «❌ Убрать неверное».",
+          "🔒 <b>Privacy</b>",
+          "Every few hours the chronicler goes through new messages and updates the cards. It never records politics, health, finances, personal life, addresses or secrets.",
+          "Any fact can be removed with the “❌ Remove wrong” button.",
         ].join("\n\n");
     const keyboard = new InlineKeyboard()
-      .text("📋 Что ты обо мне знаешь", "me:know")
+      .text("📋 What do you know about me", "me:know")
       .row();
     if (scope.person.opted_out)
-      keyboard.text("✅ Снова вести мою карточку", "priv:on");
-    else keyboard.text("🚫 Не собирать обо мне", "priv:off");
-    keyboard.row().text("← Назад", "me:home");
+      keyboard.text("✅ Keep my card again", "priv:on");
+    else keyboard.text("🚫 Stop collecting about me", "priv:off");
+    keyboard.row().text("← Back", "me:home");
     await kit.show(ctx, text, keyboard, { edit: true });
   }
 
@@ -178,19 +178,19 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     const text = [
       userHeader(user),
       person.tagline
-        ? `Однострочник: ${escapeHtml(person.tagline)}${person.tagline_manual ? " ✍️" : ""}`
-        : "Однострочника нет",
-      `Сообщений в архиве этого чата: ${stats?.messages ?? 0}${stats?.first ? ` (с ${stats.first.toLocaleDateString("ru-RU")})` : ""}`,
+        ? `One-liner: ${escapeHtml(person.tagline)}${person.tagline_manual ? " ✍️" : ""}`
+        : "No one-liner",
+      `Messages in this chat's archive: ${stats?.messages ?? 0}${stats?.first ? ` (since ${stats.first.toLocaleDateString("en-GB")})` : ""}`,
       "",
-      "<b>Факты</b> (✍️ — добавлены тобой, 🙈 — скрыты, цифры — сообщения-источники):",
+      "<b>Facts</b> (✍️ — added by you, 🙈 — hidden, numbers — source messages):",
       factsWithSources(facts, chatId),
       "",
-      "Сообщения хранятся для летописи и /catchup. Удалить всё о себе во всех чатах — /forgetme.",
+      "Messages are kept for the chronicle and /catchup. To delete everything about you in all chats — /forgetme.",
     ].join("\n");
     await kit.show(
       ctx,
       text,
-      edit ? new InlineKeyboard().text("← Назад", "me:privacy") : undefined,
+      edit ? new InlineKeyboard().text("← Back", "me:privacy") : undefined,
       { edit },
     );
   }
@@ -202,12 +202,12 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     );
     const keyboard = grid(buttons, 2)
       .row()
-      .text("➕ Новый проект", "np:start")
+      .text("➕ New project", "np:start")
       .row()
-      .text("← Назад", "me:home");
+      .text("← Back", "me:home");
     const text = projects.length
-      ? "🛠 <b>Твои проекты</b>\nНажми на проект, чтобы поправить статус, описание, стек или ссылки."
-      : "🛠 У тебя пока нет проектов в каталоге. Добавь — так о них узнают остальные, а проект попадёт в рейтинг.";
+      ? "🛠 <b>Your projects</b>\nTap a project to edit its status, description, stack or links."
+      : "🛠 You have no projects in the catalog yet. Add one — others will hear about it, and it gets into the rating.";
     await kit.show(ctx, text, keyboard, { edit: true });
   }
 
@@ -220,7 +220,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     async (ctx) => {
       if (!kit.isPrivate(ctx))
         return ctx.answerCallbackQuery({
-          text: "Это работает в личке с ботом",
+          text: "This works in a DM with the bot",
         });
       await ctx.answerCallbackQuery();
       const scope = await dmScope(ctx);
@@ -234,10 +234,10 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
           pending.set(ctx.from.id, { kind: "tagline", chatId: scope.chatId });
           return kit.show(
             ctx,
-            `✏️ Напиши однострочник «кто ты» — до 90 символов.\nСейчас: ${scope.person.tagline ? `<i>${escapeHtml(scope.person.tagline)}</i>` : "нет"}`,
+            `✏️ Write a one-liner about who you are — up to 90 characters.\nNow: ${scope.person.tagline ? `<i>${escapeHtml(scope.person.tagline)}</i>` : "none"}`,
             new InlineKeyboard()
-              .text("Сбросить", "me:tagline_reset")
-              .text("Отмена", "me:cancel"),
+              .text("Reset", "me:tagline_reset")
+              .text("Cancel", "me:cancel"),
             { edit: true },
           );
         case "tagline_reset":
@@ -253,7 +253,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
         case "add":
           return kit.show(
             ctx,
-            "➕ <b>Что добавить?</b>",
+            "➕ <b>What should I add?</b>",
             grid(
               MANUAL_KINDS.map((kind) =>
                 InlineKeyboard.text(FACT_KIND_LABELS[kind], `addk:${kind}`),
@@ -261,7 +261,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
               2,
             )
               .row()
-              .text("← Назад", "me:home"),
+              .text("← Back", "me:home"),
             { edit: true },
           );
         case "wrong":
@@ -303,7 +303,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     const fact = await getFact(sql, Number(ctx.match[2]));
     const isOwn = fact?.user_id === user.id;
     if (!fact || (!isOwn && !kit.isOwner(user)))
-      return ctx.answerCallbackQuery({ text: "Это не твой факт" });
+      return ctx.answerCallbackQuery({ text: "That's not your fact" });
     const source = isOwn ? "user" : "admin";
     const action = ctx.match[1];
     if (action === "rej") await rejectFact(sql, fact.id, user.id, source);
@@ -311,10 +311,10 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     await ctx.answerCallbackQuery({
       text:
         action === "rej"
-          ? "Убрал и больше не верну 👌"
+          ? "Removed for good 👌"
           : action === "hide"
-            ? "Скрыл 🙈"
-            : "Вернул 👁",
+            ? "Hidden 🙈"
+            : "Back on your card 👁",
     });
     if (!isOwn || !kit.isPrivate(ctx)) return;
     const person = await getPerson(sql, fact.chat_id, user.id);
@@ -342,19 +342,19 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
 
   const forgetPrompt = (where: "here" | "all") =>
     where === "here"
-      ? "Удалить все факты о тебе в этом чате и больше ничего в нём не собирать? Можно удалить и тексты твоих сообщений из архива этого чата."
-      : "Удалить все факты о тебе во всех чатах и больше ничего не собирать? Можно удалить и тексты твоих сообщений из архивов.";
+      ? "Delete all facts about you in this chat and stop collecting anything here? You can also delete the text of your messages from this chat's archive."
+      : "Delete all facts about you in all chats and stop collecting anything? You can also delete the text of your messages from the archives.";
   const forgetKeyboard = (where: "here" | "all") =>
     new InlineKeyboard()
-      .text("Да, удалить факты", `forget:${where}:facts`)
+      .text("Yes, delete facts", `forget:${where}:facts`)
       .row()
-      .text("Удалить и тексты сообщений", `forget:${where}:messages`)
+      .text("Delete message texts too", `forget:${where}:messages`)
       .row()
-      .text("Отмена", "forget:no");
+      .text("Cancel", "forget:no");
 
   bot.command("forgetme", async (ctx) => {
     if (!kit.isPrivate(ctx))
-      return kit.show(ctx, "Это в личку: напиши мне /forgetme");
+      return kit.show(ctx, "That one's for DMs: send me /forgetme");
     await kit.show(ctx, forgetPrompt("all"), forgetKeyboard("all"));
   });
 
@@ -363,7 +363,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     async (ctx) => {
       await ctx.answerCallbackQuery();
       const [, where, what] = ctx.match;
-      if (!where) return ctx.editMessageText("Окей, ничего не трогаю 🙂");
+      if (!where) return ctx.editMessageText("Okay, leaving everything as is 🙂");
       let chatId: number | undefined;
       const user = await kit.identity(ctx.from);
       if (where === "here") {
@@ -377,11 +377,11 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
         UPDATE messages SET text = '', extracted_at = now()
         WHERE user_id = ${user.id} AND (${chatId ?? null}::bigint IS NULL OR chat_id = ${chatId ?? null}::bigint)`;
       }
-      const scopeText = where === "here" ? " в этом чате" : "";
+      const scopeText = where === "here" ? " in this chat" : "";
       await ctx.editMessageText(
         what === "messages"
-          ? `Удалил факты и тексты твоих сообщений${scopeText}. Больше ничего о тебе не собираю. Передумаешь — /me → 🔒 Приватность.`
-          : `Удалил все факты${scopeText}. Больше ничего о тебе не собираю. Передумаешь — /me → 🔒 Приватность.`,
+          ? `Deleted the facts and the text of your messages${scopeText}. I'm no longer collecting anything about you. Changed your mind? /me → 🔒 Privacy.`
+          : `Deleted all facts${scopeText}. I'm no longer collecting anything about you. Changed your mind? /me → 🔒 Privacy.`,
       );
     },
   );
@@ -389,7 +389,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
   bot.command("whatyouknow", async (ctx) => {
     if (!ctx.from) return;
     if (!kit.isPrivate(ctx))
-      return kit.show(ctx, "Это в личку: напиши мне /whatyouknow 🙂");
+      return kit.show(ctx, "That one's for DMs: send me /whatyouknow 🙂");
     const scope = await kit.scope(ctx);
     if (scope) await knowledgeScreen(ctx, scope, false);
   });
@@ -407,7 +407,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
       ctx,
       personCard(scope.person, facts, projects, { compact: true }),
       new InlineKeyboard().url(
-        "✏️ Править в личке",
+        "✏️ Edit in DM",
         `https://t.me/${bot.botInfo.username}?start=${encodeChat(scope.chatId)}_me`,
       ),
     );
@@ -416,7 +416,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
   bot.callbackQuery("np:start", async (ctx) => {
     if (!kit.isPrivate(ctx))
       return ctx.answerCallbackQuery({
-        text: "Добавить проект можно в личке с ботом",
+        text: "You can add a project in a DM with the bot",
       });
     await ctx.answerCallbackQuery();
     const scope = await dmScope(ctx);
@@ -427,7 +427,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     });
     await kit.show(
       ctx,
-      "🛠 <b>Новый проект.</b> Как он называется?",
+      "🛠 <b>New project.</b> What's it called?",
       cancelKeyboard(),
       { edit: true },
     );
@@ -442,8 +442,8 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     if (project)
       await kit.show(
         ctx,
-        `Готово ✅ Открой проект, чтобы добавить описание и стек: /project ${escapeHtml(project.slug)}`,
-        new InlineKeyboard().text("Открыть проект", `p:${project.slug}`),
+        `Done ✅ Open the project to add a description and stack: /project ${escapeHtml(project.slug)}`,
+        new InlineKeyboard().text("Open project", `p:${project.slug}`),
         { edit: true },
       );
   });
@@ -455,7 +455,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
   ) {
     const user = await kit.identity(ctx.from!);
     const person = await getPerson(sql, input.chatId, user.id);
-    if (!person) return void (await ctx.reply("Ты больше не в этом чате 🤔"));
+    if (!person) return void (await ctx.reply("You're no longer in this chat 🤔"));
     const scope: Scope = { user, chatId: input.chatId, person };
     const text = rawText.trim();
     switch (input.kind) {
@@ -467,7 +467,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
           text.slice(0, 90),
           user.id,
         );
-        await ctx.reply("Однострочник обновлён ✅");
+        await ctx.reply("One-liner updated ✅");
         return profileScreen(ctx, await refreshed(scope));
       }
       case "fact": {
@@ -495,8 +495,8 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
         }
         await ctx.reply(
           added
-            ? `Добавил ✅ (${added})`
-            : "Ничего не добавил — может, это уже есть в карточке?",
+            ? `Added ✅ (${added})`
+            : "Nothing added — maybe it's already on your card?",
         );
         return profileScreen(ctx, scope);
       }
@@ -518,8 +518,8 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
         });
         await kit.show(
           ctx,
-          `Проект <b>${escapeHtml(project.name)}</b> добавлен ✅\nСкинь ссылку — репозиторий или сайт:`,
-          new InlineKeyboard().text("Пропустить", `np:skip:${project.id}`),
+          `Project <b>${escapeHtml(project.name)}</b> added ✅\nSend a link — repository or website:`,
+          new InlineKeyboard().text("Skip", `np:skip:${project.id}`),
         );
         return;
       }
@@ -553,7 +553,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
           if (urls.length === 0) {
             pending.set(ctx.from!.id, input);
             await ctx.reply(
-              "Не вижу ссылки. Пришли что-то вроде https://github.com/you/project",
+              "I don't see a link. Send something like https://github.com/you/project",
               { reply_markup: cancelKeyboard() },
             );
             return;
@@ -573,9 +573,9 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
             actorUserId: user.id,
           });
         }
-        await ctx.reply("Сохранил ✅", {
+        await ctx.reply("Saved ✅", {
           reply_markup: new InlineKeyboard().text(
-            "Открыть проект",
+            "Open project",
             `p:${current.slug}`,
           ),
         });

@@ -45,7 +45,7 @@ Settings → Secrets and variables → Actions → New repository secret:
 | `DEPLOY_SSH_KEY` | private half of the deploy key |
 | `BOT_TOKEN` | token from @BotFather |
 | `ANTHROPIC_API_KEY` | Claude API key |
-| `ADMIN_TG_IDS` | Telegram IDs of the bot owners, comma-separated (message the bot to learn yours) |
+| `ADMIN_TG_IDS` | Telegram IDs of the bot owners, comma-separated (get yours from a bot like @userinfobot) |
 
 The bot token, API key and owner IDs are written into the server's `.env` on every deploy, so rotating one is: change the secret, re-run `Deploy`.
 

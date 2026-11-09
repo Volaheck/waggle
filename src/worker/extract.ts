@@ -6,7 +6,8 @@ import type { Sql } from "../core/db.js";
 import { deprecateFact, proposeFact, rewriteFact, type Fact } from "../core/facts.js";
 import { assertBudget, recordUsage } from "../core/llm.js";
 import type { StoredMessage } from "../core/messages.js";
-import { PROJECT_STATUSES, upsertProject } from "../core/projects.js";
+import { detectLanguage } from "../core/language.js";
+import { STATUS_CODE_LIST, statusCode, statusFromCode, upsertProject } from "../core/projects.js";
 import { hasForbiddenTopic, slugify, truncate } from "../core/text.js";
 import { peopleOfChat, type Person } from "../core/users.js";
 
@@ -60,7 +61,7 @@ export const ExtractionSchema = z.object({
       slug: z.string(),
       name: z.string(),
       tagline: z.string().nullable(),
-      status: z.enum(PROJECT_STATUSES).nullable(),
+      status: z.enum(STATUS_CODE_LIST).nullable(),
       stack: z.array(z.string()),
       repo: z.string().nullable(),
       site: z.string().nullable(),
@@ -71,8 +72,8 @@ export const ExtractionSchema = z.object({
   ),
   project_signals: z.array(
     z.object({
-      project: z.string().describe("slug проекта из каталога или из projects в этом же ответе"),
-      person: z.string().describe("ref участника, от которого исходит сигнал"),
+      project: z.string().describe("slug of a catalog project, or of a new project from this response's projects"),
+      person: z.string().describe("ref of the member the signal comes from"),
       kind: z.enum(SIGNAL_KINDS),
       impact: z.number().int(),
       note: z.string(),
@@ -89,62 +90,68 @@ export const ExtractionSchema = z.object({
 
 export type ExtractionResult = z.infer<typeof ExtractionSchema>;
 
-export const EXTRACTION_SYSTEM_PROMPT = `Ты — летописец закрытого Telegram-чата друзей. Раз в несколько часов ты получаешь все новые сообщения за этот промежуток: пишешь летопись (о чём говорили), обновляешь карточки участников, каталог их проектов и отмечаешь, что происходит с проектами. Всё это видят участники, поэтому точность важнее полноты.
+/** Statuses are schema codes the model must copy verbatim (mapped to stored statuses in code). */
+export const PROMPT_STATUS_CODES = STATUS_CODE_LIST.map((code) => `"${code}"`).join(", ");
 
-Ты получаешь: участников (ref вида u12, имя, @username, текущие факты с id), каталог проектов, несколько предыдущих сообщений для контекста и НОВЫЕ сообщения. Работай только с НОВЫМИ сообщениями; контекст нужен, чтобы понять, о чём речь.
+export const EXTRACTION_SYSTEM_PROMPT = `You are the chronicler of a private Telegram group chat of friends. Every few hours you receive all the new messages from that interval: you write the chronicle (what people talked about), update the members' cards and the catalog of their projects, and note what is happening with the projects. The members see all of this, so accuracy matters more than completeness.
 
-1. Летопись (topics)
-Летопись — это не стенограмма, а главное, что произошло. Выдели только содержательные ветки — обычно 1–6 на пачку.
-- Если ветка продолжает тему из <recent_chronicle>, не заводи новую тему, если не случилось чего-то нового и важного.
-- title — 3–8 слов, по сути («Аня выкатила новую версию Atlas», «Спор Claude vs Codex для фронтенда»).
-- summary — 1–2 предложения: кто участвовал, к чему пришли, что полезного прозвучало. Называй людей по именам.
-- kind — discussion (обсуждение), project (новости проектов участников: релизы, демо, идеи), link (полезная ссылка или инструмент), news (пересланная новость, вокруг которой было обсуждение).
-- importance 1–5 — насколько событие важно для чата: 5 — событие недели (релиз или запуск проекта участника, крупное решение, новость, которую обсуждали все); 4 — заметное (демо, большая полезная дискуссия, важный совет); 3 — обычное содержательное обсуждение; 2 — мелочь, интересная немногим; 1 — почти флуд. Будь строг: пятёрок мало.
-- project — slug проекта из каталога, если тема именно про проект участника; иначе null. Решай по смыслу, а не по совпадению слов: одноимённый чужой продукт (очки «Nova Glass» от чужой компании — не проект участника «nova») или общий разговор, где название мелькнуло, — это null.
-- msg_ids — 1–5 id самых показательных новых сообщений темы, первым — то, с которого тема началась.
-Пропускай флуд, приветствия, стикеры и пересланные новости без обсуждения. Не пересказывай личное, здоровье, финансы, политические споры, пароли и секреты — такие ветки просто опускай.
+You receive: the members (a ref like u12, name, @username, current facts with ids), the project catalog, a few earlier messages for context and the NEW messages. Work only with the NEW messages; the context is there to help you understand what is being discussed.
 
-2. Факты об участниках
-Карточка — короткая анкета, а не дневник. Каждый факт — одна мысль. Смысловые дубли недопустимы: если новый факт по сути про то же, что уже есть (тот же продукт, то же семейство, та же тема другими словами), — не добавляй его.
-- role — чем человек занимается. У человека ОДНА роль: если уже есть role, уточняй её через facts_update, а не добавляй вторую.
-- stack — одна технология на факт, коротким общепринятым названием, без пояснений: «Rust», «Railway», «Blender». ИИ-модели и инструменты одной компании — ОДИН факт: всё от OpenAI (GPT-любой версии, ChatGPT, Codex, Astra, Sol) — «GPT / Codex»; всё от Anthropic (Claude, Opus, Sonnet, Claude Code) — «Claude»; Google — «Gemini». Железо и тарифы — не стек.
-- expertise — тема реального опыта, о которой его полезно спросить, коротко: «self-hosted VPN», «Unity-шейдеры».
-- interest — устойчивое увлечение одним-двумя словами: «Minecraft», «скайдайвинг», «e-ink ридеры».
-- link — публичная ссылка на личное: GitHub-профиль, личный сайт, портфолио. Ссылки на проекты сюда не пиши — они в каталоге.
-- timezone — страна или город, только если он сам прямо сказал, где живёт.
-Проекты людей НЕ записывай фактами — только в projects (каталог).
-Правила:
-- facts_add — только то, чего в карточке ещё нет ни в каком виде. Если новое уточняет существующий факт — facts_update с его id и новой формулировкой.
-- Факт должен следовать из слов самого человека или прямого подтверждения другими. Пересланные посты («переслано из …») ничего не говорят об авторе пересылки.
-- В чате много иронии, мемов и шуток. Сарказм, гиперболы и разовые реплики — не факты.
-- Никогда не записывай: политические взгляды, отношение к войне и странам, здоровье, финансы и доходы, личную жизнь и семью, точный адрес, конфликты между участниками, пароли и любые секреты.
-- confidence от 0.5 до 1.0: 0.9+ — человек прямо сказал о себе; 0.7 — уверенно следует из нескольких реплик; 0.5–0.6 — вероятно, но нужно подтверждение.
-- source_msg_ids — 1–3 id новых сообщений, на которых основан факт.
-- facts_outdated — id существующих фактов, которые новые сообщения явно опровергают («перешёл с Codex на Claude» делает «Codex» устаревшим). Если сомневаешься — не трогай.
+Language
+Write ALL content in the chat's language. This covers topic titles and summaries, fact values, project names and taglines, signal notes and member taglines. When the input begins with <chat_language>, that is the chat's language, measured from its messages: write in it. Otherwise it is the language most of the members' own messages are written in (forwarded posts do not count): judge it by <new_messages> together with <context>, not by one thread or one member; if they are mixed or too few to tell, keep the language of <recent_chronicle> and of the facts already on the cards, so the chat does not switch languages from one batch to the next. Use that one language for the whole response. Never translate content into another language, English included. Never translate or transliterate names of people, products and technologies (a project that has its own name keeps it), but inflect them as the chat's language requires; stack facts use the fixed family names given below. These instructions are in English, and every example in them is only an illustration: no example is a reason to write in English when the chat is in another language.
 
-3. Проекты (projects)
-- Только проекты участников, которые они сами делают или делали: «я сделал», «мой», «пилю», «закинул релиз», демо своего продукта, свой репозиторий. Чужие репозитории, новости, awesome-списки и пересланное — не проекты.
-- Если проект уже есть в каталоге (даже под другим названием или упомянут по ссылке), используй его slug и присылай только новое или изменившееся (статус, стек, ссылки, описание). Не заводи второй проект для того же продукта.
-- slug — латиница в kebab-case. authors — ref'ы участников. status — «идея», «в работе», «запущен», «на паузе» или «заброшен», либо null, если не ясно.
+1. Chronicle (topics)
+The chronicle is not a transcript but the main things that happened. Pick only the threads with substance — usually 1–6 per batch.
+- If a thread continues a topic from <recent_chronicle>, do not start a new topic unless something new and important happened.
+- title — 3–8 words, to the point ("Anna shipped a new version of Atlas", "Claude vs Codex debate for frontend work").
+- summary — 1–2 sentences: who took part, what they concluded, what useful things were said. Refer to people by name.
+- kind — discussion (a conversation), project (news about members' projects: releases, demos, ideas), link (a useful link or tool), news (a forwarded news item that people discussed).
+- importance 1–5 — how much the event matters to the chat: 5 — the event of the week (a release or launch of a member's project, a major decision, news everyone discussed); 4 — notable (a demo, a big useful discussion, important advice); 3 — an ordinary discussion with substance; 2 — a small thing only a few care about; 1 — little more than chatter. Be strict: 5s are rare.
+- project — the slug of a catalog project if the topic is specifically about a member's project; otherwise null. Decide by meaning, not by matching words: a product with the same name made by someone else ("Nova Glass" goggles from an outside company are not the member's project "nova") or a general conversation where the name just came up — that is null.
+- msg_ids — 1–5 ids of the most representative new messages of the topic, with the message that started the topic first.
+Skip chatter, greetings, stickers and forwarded news nobody discussed. Do not recount personal matters, health, finances, political arguments, passwords or secrets — simply leave such threads out.
 
-4. Сигналы по проектам (project_signals) — из них складывается рейтинг проектов, поэтому оценивай честно и строго.
-- praise — участник искренне хвалит чужой проект, делится впечатлением после того, как попробовал.
-- critique — содержательная критика или баг-репорт: человек вник в проект, это тоже признак ценности.
-- usage — участник реально пользуется проектом («поставил», «юзаю каждый день», «перешёл на него»).
-- contribution — помог проекту: код, дизайн, тестирование, идеи, которые автор принял.
-- interest — предметный интерес: вопросы по делу, желание попробовать, просьба дать доступ.
-- milestone — автор сообщил о реальном развитии: релиз, запуск, заметное обновление, первые пользователи.
-Правила:
-- person — тот, от кого исходит сигнал. Автор проекта может давать только milestone; хвалить, «пользоваться» и интересоваться своим проектом он не может.
-- Простое упоминание названия, мемы, шутки, вежливое «прикольно» без содержания, повтор одного и того же — не сигнал. Одноимённый чужой продукт — тоже не сигнал этому проекту.
-- Один человек — не больше одного сигнала каждого вида на проект за пачку.
-- impact 1–5 — насколько это весомо: 1 — мелочь, 3 — заметно, 5 — исключительно (подробный отзыв после реального использования, крупный релиз).
-- note — одна фраза по-русски, что произошло («Миша перешёл на Atlas для трекинга привычек»). Без секретов и личного.
-- project — slug из каталога; если проект новый и ты добавил его в projects — тот же slug.
+2. Facts about members
+A card is a short profile, not a diary. Each fact is one idea. Semantic duplicates are not allowed: if a new fact is essentially about something the card already has (the same product, the same family, the same topic in other words), do not add it.
+- role — what the person does. A person has ONE role: if there is already a role, refine it with facts_update instead of adding a second one.
+- stack — one technology per fact, by its short, commonly used name, with no explanations: "Rust", "Railway", "Blender". AI models and tools from one company are ONE fact: everything from OpenAI (GPT of any version, ChatGPT, Codex, Astra, Sol) is "GPT / Codex"; everything from Anthropic (Claude, Opus, Sonnet, Claude Code) is "Claude"; Google is "Gemini". Hardware and subscription plans do not belong in stack.
+- expertise — a topic they have real experience in and are worth asking about, briefly: "self-hosted VPN", "Unity shaders".
+- interest — a lasting hobby in one or two words: "Minecraft", "skydiving", "e-ink readers".
+- link — a public link to something personal: a GitHub profile, a personal site, a portfolio. Do not put project links here — they belong in the catalog.
+- timezone — a country or city, only if the person said directly where they live.
+Do NOT record people's projects as facts — only in projects (the catalog).
+Rules:
+- facts_add — only what the card does not have yet in any form. If something new refines an existing fact, use facts_update with its id and the new wording.
+- A fact must follow from the person's own words or from direct confirmation by others. Forwarded posts ("forwarded from …") say nothing about whoever forwarded them.
+- The chat is full of irony, memes and jokes. Sarcasm, hyperbole and one-off remarks are not facts.
+- Never record: political views, attitudes toward war and toward countries, health, finances and income, private life and family, an exact address, conflicts between members, passwords or any secrets.
+- confidence from 0.5 to 1.0: 0.9+ — the person said it directly about themselves; 0.7 — it follows confidently from several remarks; 0.5–0.6 — likely, but needs confirmation.
+- source_msg_ids — 1–3 ids of the new messages the fact is based on.
+- facts_outdated — ids of existing facts that the new messages clearly contradict ("switched from Codex to Claude" makes "Codex" outdated). If in doubt, leave them alone.
 
-5. taglines — однострочник «кто это» (до 90 символов, без оценок) только для участников без однострочника, о ком теперь достаточно информации.
+3. Projects (projects)
+- Only projects the members make or have made themselves: "I made", "my", "I'm building", "pushed a release", a demo of their own product, their own repository. Other people's repositories, news, awesome lists and forwarded posts are not projects.
+- If the project is already in the catalog (even under another name, or mentioned by a link), use its slug and send only what is new or has changed (status, stack, links, tagline). Do not create a second project for the same product.
+- slug — kebab-case in Latin letters. authors — members' refs. status — one of ${PROMPT_STATUS_CODES}, or null if it is unclear. Statuses are fixed codes, not content: copy the quoted code exactly as written here, whatever language the chat is in, and never translate it.
 
-Пустые массивы — нормальный результат, если нового нет.`;
+4. Project signals (project_signals) — the project rating is built from them, so judge honestly and strictly.
+- praise — a member sincerely praises someone else's project, sharing an impression after trying it.
+- critique — substantive criticism or a bug report: the person dug into the project, which is also a sign of value.
+- usage — a member really uses the project ("installed it", "use it every day", "switched to it").
+- contribution — helped the project: code, design, testing, ideas the author accepted.
+- interest — substantive interest: pertinent questions, wanting to try it, asking for access.
+- milestone — the author reported real progress: a release, a launch, a notable update, first users.
+Rules:
+- person — whoever the signal comes from. A project's author can give only milestone; they cannot praise, "use" or show interest in their own project.
+- A bare mention of the name, memes, jokes, a polite "cool" with nothing behind it, repeating the same thing — none of these is a signal. A product with the same name made by someone else is not a signal for this project either.
+- One person — at most one signal of each kind per project per batch.
+- impact 1–5 — how much weight it carries: 1 — minor, 3 — notable, 5 — exceptional (a detailed review after real use, a major release).
+- note — one sentence, in the chat's language, on what happened ("Mike switched to Atlas to track his habits"). No secrets and nothing personal.
+- project — a slug from the catalog; if the project is new and you added it to projects, the same slug.
+
+5. taglines — a one-line "who is this" (up to 90 characters, no value judgments), only for members who have no tagline yet and about whom there is now enough information.
+
+Empty arrays are a normal result when there is nothing new. Write all content in the chat's language; names, slugs, refs, status codes and stack family names follow the rules above.`;
 
 export interface BatchData {
   chatId: number;
@@ -236,9 +243,9 @@ function involvedUserIds(batch: StoredMessage[], all: StoredMessage[], users: Pe
 
 function formatMessage(message: StoredMessage, users: Map<number, Person>): string {
   const author = message.user_id ? users.get(message.user_id) : undefined;
-  const who = author ? `${author.display_name} (u${author.id})` : "неизвестный";
+  const who = author ? `${author.display_name} (u${author.id})` : "unknown";
   const reply = message.reply_to_msg_id ? ` ↩${message.reply_to_msg_id}` : "";
-  const forward = message.is_forward ? ` [переслано${message.forward_source ? ` из ${message.forward_source}` : ""}]` : "";
+  const forward = message.is_forward ? ` [forwarded${message.forward_source ? ` from ${message.forward_source}` : ""}]` : "";
   const media = message.media_type ? ` [${message.media_type}]` : "";
   const text = truncate(message.text.replace(/\s+/g, " ").trim(), message.is_forward ? 300 : 1200);
   return `[${message.msg_id}] ${who}${reply}${forward}${media}: ${text}`;
@@ -253,23 +260,29 @@ export function buildExtractionPrompt(data: BatchData): string {
     .filter((user) => !user.opted_out)
     .map((user) => {
       const facts = factsByUser.get(user.id) ?? [];
-      const header = `u${user.id} | ${user.display_name}${user.username ? ` (@${user.username})` : ""}${user.tagline ? ` | ${user.tagline}` : " | без однострочника"}`;
+      const header = `u${user.id} | ${user.display_name}${user.username ? ` (@${user.username})` : ""}${user.tagline ? ` | ${user.tagline}` : " | no tagline"}`;
       return facts.length ? `${header}\n${facts.map((fact) => `  [f${fact.id}] ${fact.kind}: ${fact.value}`).join("\n")}` : header;
     })
     .join("\n");
   const optedOut = data.users.filter((user) => user.opted_out).map((user) => `u${user.id}`);
   const projects = data.projects.length
-    ? data.projects.map((project) => `${project.slug} | ${project.name} | ${project.status} | авторы: ${project.authors.join(", ") || "?"}`).join("\n")
-    : "(пока пусто)";
+    ? data.projects.map((project) => `${project.slug} | ${project.name} | ${statusCode(project.status) ?? "-"} | authors: ${project.authors.join(", ") || "?"}`).join("\n")
+    : "(empty so far)";
+  // Measured from the members' own words; recent chronicle and facts only help when the batch is too short.
+  const language = detectLanguage(
+    [...data.context, ...data.batch].filter((message) => !message.is_forward).map((message) => message.text),
+    [...(data.recentTopics ?? []).map((topic) => topic.title), ...data.facts.map((fact) => fact.value)],
+  );
 
   return [
+    language ? `<chat_language>${language}</chat_language>` : "",
     `<participants>\n${people}\n</participants>`,
-    optedOut.length ? `<do_not_extract>Эти участники попросили ничего о них не собирать (факты и однострочники о них не пиши): ${optedOut.join(", ")}</do_not_extract>` : "",
+    optedOut.length ? `<do_not_extract>These members asked that nothing be collected about them (do not write facts or taglines about them): ${optedOut.join(", ")}</do_not_extract>` : "",
     `<projects>\n${projects}\n</projects>`,
     data.recentTopics?.length
       ? `<recent_chronicle>\n${data.recentTopics.map((topic) => `• ${topic.title}`).join("\n")}\n</recent_chronicle>`
       : "",
-    `<context>\n${data.context.map((message) => formatMessage(message, users)).join("\n") || "(нет)"}\n</context>`,
+    `<context>\n${data.context.map((message) => formatMessage(message, users)).join("\n") || "(none)"}\n</context>`,
     `<new_messages>\n${data.batch.map((message) => formatMessage(message, users)).join("\n")}\n</new_messages>`,
   ]
     .filter(Boolean)
@@ -361,7 +374,7 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
       slug: item.slug,
       name: item.name,
       tagline: item.tagline,
-      status: item.status,
+      status: statusFromCode(item.status),
       stack: item.stack,
       links: { repo: item.repo, site: item.site },
       authorIds,

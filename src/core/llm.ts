@@ -48,7 +48,7 @@ export class BudgetExceededError extends Error {
     limit: number,
     readonly chatId?: number,
   ) {
-    super(`${chatId === undefined ? "Общий месячный бюджет" : "Месячный лимит этого чата"} на нейронку исчерпан: $${spent.toFixed(2)} из $${limit.toFixed(2)}`);
+    super(`${chatId === undefined ? "The overall monthly AI budget" : "This chat's monthly AI limit"} is used up: $${spent.toFixed(2)} of $${limit.toFixed(2)}`);
   }
 }
 

@@ -2,10 +2,15 @@ import { describe, expect, it } from "vitest";
 import { signInitData, validateInitData } from "../src/api/init-data.js";
 import { catchupHtml, clampTelegram } from "../src/bot/format.js";
 import { extractUrls, hasForbiddenTopic, messageLink, normalizeUrl, normalizeValue, slugify } from "../src/core/text.js";
-import { isPassDue } from "../src/worker/extract.js";
+import { buildExtractionPrompt, EXTRACTION_SYSTEM_PROMPT, isPassDue } from "../src/worker/extract.js";
+import { CONSOLIDATION_SYSTEM_PROMPT } from "../src/worker/consolidate.js";
 import { factCore, isNearDuplicate, isSameFact } from "../src/core/facts.js";
+import { detectLanguage } from "../src/core/language.js";
+import { PROJECT_STATUSES, STATUS_CODE_LIST, statusCode, statusFromCode } from "../src/core/projects.js";
 import { canonicalStackValue, splitStackValue, stackFamily } from "../src/core/stack.js";
 import { topLimitFor } from "../src/core/chronicle.js";
+import type { StoredMessage } from "../src/core/messages.js";
+import type { Person } from "../src/core/users.js";
 
 const TOKEN = "123456:TEST-TOKEN";
 
@@ -46,6 +51,15 @@ describe("text helpers", () => {
     expect(hasForbiddenTopic("долгие задачи с ИИ-агентами")).toBe(false);
     expect(hasForbiddenTopic("взял в долг")).toBe(true);
     expect(hasForbiddenTopic("налоги в Польше")).toBe(true);
+  });
+
+  it("blocks the same topics in English, but not lookalike tech words", () => {
+    for (const value of ["Mike talked about his salary", "got divorced", "therapy", "Putin", "Trump's tariffs", "taxes in Poland", "my wife", "political views", "war in Ukraine"]) {
+      expect(hasForbiddenTopic(value), value).toBe(true);
+    }
+    for (const value of ["taxi app", "trumpet", "software warnings", "award-winning", "taxonomy", "incoming webhook", "health check endpoint", "network diagnostics", "screen orientation", "dating app", "IP address", "tech debt"]) {
+      expect(hasForbiddenTopic(value), value).toBe(false);
+    }
   });
 
   it("extracts and normalizes urls", () => {
@@ -112,7 +126,7 @@ describe("telegram formatting", () => {
     );
     expect(html).toContain("&lt;Claude&gt;");
     expect(html).toContain("&amp;");
-    expect(html).toContain("Ещё 7 сообщ.");
+    expect(html).toContain("7 more messages not chronicled yet");
     expect(html).toContain("https://t.me/c/1/99");
   });
 });
@@ -158,5 +172,70 @@ describe("stack families", () => {
     expect(splitStackValue("Vercel, Scaleway")).toEqual(["Vercel", "Scaleway"]);
     expect(splitStackValue("GPT / Codex")).toEqual(["GPT / Codex"]);
     expect(splitStackValue("Rust")).toEqual(["Rust"]);
+  });
+});
+
+describe("chronicler prompts", () => {
+  // Even one Russian word in the instructions made the model write an English chat's content in Russian.
+  const cyrillic = /\p{Script=Cyrillic}/u;
+
+  it("are written in English and list the exact status codes the schemas accept", () => {
+    for (const prompt of [EXTRACTION_SYSTEM_PROMPT, CONSOLIDATION_SYSTEM_PROMPT]) {
+      for (const code of STATUS_CODE_LIST) expect(prompt).toContain(`"${code}"`);
+      expect(prompt).not.toMatch(cyrillic);
+    }
+  });
+
+  it("map the chronicler's status codes to stored statuses and back", () => {
+    for (const status of PROJECT_STATUSES) expect(statusFromCode(statusCode(status))).toBe(status);
+    expect(statusCode("whatever")).toBeNull();
+    expect(statusFromCode(null)).toBeNull();
+  });
+
+  it("tell the model the chat's language when it can be measured", () => {
+    const person: Person = { id: 7, tg_id: 7, username: null, display_name: "Ann", is_admin: false, dm_started: false, current_chat_id: null, chat_id: -1, user_id: 7, tagline: null, tagline_manual: false, opted_out: false, first_seen_at: null, last_message_at: null, left_at: null };
+    const message = (msgId: number, text: string, isForward = false): StoredMessage => ({ chat_id: -1, msg_id: msgId, user_id: 7, sent_at: new Date(), text, reply_to_msg_id: null, is_forward: isForward, forward_source: null, media_type: null });
+    const build = (batch: StoredMessage[]) => buildExtractionPrompt({ chatId: -1, batch, context: [], users: [person], facts: [], projects: [] });
+    const english = build([message(1, "Shipped the new version of my habit tracker tonight, and it is so much faster than the old one")]);
+    expect(english.startsWith("<chat_language>English</chat_language>")).toBe(true);
+    expect(english).not.toMatch(cyrillic);
+    // A forwarded post says nothing about the chat's language.
+    const russian = build([message(1, "Выкатила новую версию трекера привычек, работает намного быстрее старой"), message(2, "Breaking news from the tech world: a long English article about something", true)]);
+    expect(russian.startsWith("<chat_language>Russian</chat_language>")).toBe(true);
+    expect(build([message(1, "ok")])).not.toContain("<chat_language>");
+  });
+
+  it("keep an English chat's prompt free of words in other languages", () => {
+    const mike: Person = { id: 7, tg_id: 7, username: "mike", display_name: "Mike", is_admin: false, dm_started: false, current_chat_id: null, chat_id: -1, user_id: 7, tagline: null, tagline_manual: false, opted_out: false, first_seen_at: null, last_message_at: null, left_at: null };
+    const forward: StoredMessage = { chat_id: -1, msg_id: 2, user_id: 7, sent_at: new Date(), text: "Look at this", reply_to_msg_id: 1, is_forward: true, forward_source: "Tech News", media_type: "photo" };
+    const prompt = buildExtractionPrompt({
+      chatId: -1,
+      batch: [forward, { ...forward, msg_id: 3, user_id: null, reply_to_msg_id: null, is_forward: false, forward_source: null, media_type: null }],
+      context: [],
+      users: [mike, { ...mike, id: 8, user_id: 8, opted_out: true }],
+      facts: [],
+      projects: [{ slug: "atlas", name: "Atlas", status: PROJECT_STATUSES[0], authors: ["u7"] }],
+    });
+    expect(prompt).toContain("u7 | Mike (@mike) | no tagline");
+    expect(prompt).toContain("atlas | Atlas | idea | authors: u7");
+    expect(prompt).toContain("These members asked that nothing be collected about them (do not write facts or taglines about them): u8");
+    expect(prompt).toContain("[2] Mike (u7) ↩1 [forwarded from Tech News] [photo]: Look at this");
+    expect(prompt).toContain("[3] unknown: Look at this");
+    expect(prompt).not.toMatch(cyrillic);
+  });
+});
+
+describe("chat language detection", () => {
+  it("names the language of the members' messages", () => {
+    expect(detectLanguage(["Привет! Кто-нибудь уже пробовал новый Claude Code? Мне интересно, как он работает с большими проектами"])).toBe("Russian");
+    expect(detectLanguage(["Привіт! Хтось уже пробував новий редактор? Мені цікаво, як він працює з великими проєктами"])).toBe("Ukrainian");
+    expect(detectLanguage(["Has anyone tried the new editor yet? I want to know how it works with big projects"])).toBe("English");
+    expect(detectLanguage(["¿Alguien ya probó el nuevo editor? Quiero saber cómo funciona con proyectos grandes y también con los pequeños"])).toBe("Spanish");
+  });
+
+  it("stays silent when the text is too short or too mixed, and uses fallbacks only when needed", () => {
+    expect(detectLanguage(["ok", "👍"])).toBeNull();
+    expect(detectLanguage(["Shipped it today, works great with the new sync", "Выкатил сегодня, отлично работает с новой синхронизацией"])).toBeNull();
+    expect(detectLanguage(["ok"], ["фронтенд-разработчик", "скайдайвинг и путешествия", "Летопись чата: релиз нового бота"])).toBe("Russian");
   });
 });

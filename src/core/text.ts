@@ -7,7 +7,10 @@ export function normalizeValue(value: string): string {
     .trim();
 }
 
-/** Word stems matched from the start of a word, so «налог» does not fire on «аналог». */
+/**
+ * Word stems matched from the start of a word, so «налог» does not fire on «аналог».
+ * Words a tech chat uses in another sense stay out of both lists: health check, flutter doctor, tech debt, cost savings.
+ */
 const FORBIDDEN_STEMS = [
   "политик", "путин", "зеленск", "трамп", "войн", "всу", "мобилиз", "оппозиц", "санкци",
   "здоров", "болезн", "болеет", "диагноз", "лечени", "таблетк", "депресс", "терапи", "врач",
@@ -15,10 +18,19 @@ const FORBIDDEN_STEMS = [
   "девушк", "развод", "отношени", "свидани", "секс",
   "адрес", "улиц", "квартир", "прописк",
   "религи", "национальн", "ориентац",
+  "politic", "putin", "zelensk", "mobiliz", "mobilis", "sanction",
+  "illness", "disease", "diagnosis", "diagnosed", "medicat", "depression", "depressed", "therap", "hospital", "pregnan", "mental health",
+  "salar", "income", "mortgage",
+  "girlfriend", "boyfriend", "divorc", "sexual",
+  "home address", "apartment",
+  "religio", "nationalit", "ethnic",
 ];
 
-/** Short words that are forbidden only as whole words («долг», but not «долгие»). */
-const FORBIDDEN_WORDS = ["долг", "долги", "долгов", "жена", "жены", "жене", "муж", "мужа", "мужем"];
+/** Short words that are forbidden only as whole words («долг», but not «долгие»; «tax», but not «taxi»). */
+const FORBIDDEN_WORDS = [
+  "долг", "долги", "долгов", "жена", "жены", "жене", "муж", "мужа", "мужем",
+  "war", "wars", "trump", "tax", "taxes", "loan", "loans", "wife", "wives", "husband", "husbands", "sex",
+];
 
 const FORBIDDEN_PATTERN = new RegExp(
   `(?<![\\p{L}])(?:${FORBIDDEN_STEMS.join("|")})|(?<![\\p{L}])(?:${FORBIDDEN_WORDS.join("|")})(?![\\p{L}])`,

@@ -6,15 +6,15 @@ export const FACT_KINDS = ["role", "stack", "expertise", "interest", "project", 
 export type FactKind = (typeof FACT_KINDS)[number];
 
 export const FACT_KIND_LABELS: Record<FactKind, string> = {
-  role: "Чем занимается",
-  stack: "Стек",
-  expertise: "Можно спросить про",
-  interest: "Интересы",
-  project: "Проекты",
-  link: "Ссылки",
-  timezone: "Где / часовой пояс",
-  looking_for: "Ищет",
-  can_help: "Чем может помочь",
+  role: "Does",
+  stack: "Stack",
+  expertise: "Ask about",
+  interest: "Interests",
+  project: "Projects",
+  link: "Links",
+  timezone: "Where / time zone",
+  looking_for: "Looking for",
+  can_help: "Can help with",
 };
 
 export const MIN_VISIBLE_CONFIDENCE = 0.6;
@@ -178,7 +178,7 @@ export async function getFact(sql: Sql, factId: number): Promise<Fact | undefine
   return fact;
 }
 
-/** «❌ Неверно»: the fact disappears and the extractor may never bring it back. */
+/** «❌ Remove wrong»: the fact disappears and the extractor may never bring it back. */
 export async function rejectFact(sql: Sql, factId: number, actorUserId: number, source: FactSource): Promise<boolean> {
   return sql.begin(async (tx) => {
     const [fact] = await tx<(Fact & { value_norm: string })[]>`DELETE FROM facts WHERE id = ${factId} RETURNING *`;
@@ -224,7 +224,7 @@ export interface ExpertHit {
   matches: string[];
 }
 
-/** «Кто шарит в X»: members whose visible facts mention the topic (Russian stemming). */
+/** «Who knows X» (/whoknows): members whose visible facts mention the topic (Russian stemming). */
 export async function whoKnows(sql: Sql, chatId: number, topic: string, limit = 8): Promise<ExpertHit[]> {
   const words = topic.trim();
   if (!words) return [];

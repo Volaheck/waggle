@@ -4,7 +4,7 @@
 
 Honeybees do a *waggle dance* to tell the hive where the good flowers are. Waggle does the same for a group chat: it keeps a chronicle of what mattered, a card for every member and a catalog of everyone's projects with a rating — so newcomers get up to speed in minutes and nobody has to scroll back through thousands of messages.
 
-> The bot speaks Russian to its users (it was built for a Russian-speaking community). Code, docs and logs are in English.
+> The bot's interface is in English; what it collects from a chat — the chronicle, member facts and taglines — is written in that chat's own language. Code, docs and logs are in English.
 
 ## What it does
 
@@ -17,7 +17,7 @@ Honeybees do a *waggle dance* to tell the hive where the good flowers are. Waggl
 
 ## How it spends tokens
 
-Bot commands never call the LLM — they read the database. The model runs on a schedule: every `EXTRACTION_INTERVAL_HOURS` (6 by default) it takes everything that piled up since the previous pass and processes it in one call to `claude-haiku-5-5`. If nothing new was written, there is no call. A weekly clean-up pass runs only if cards changed. Spending is capped per month for the whole bot (`MONTHLY_LLM_BUDGET_USD`) and for each chat (`CHAT_MONTHLY_BUDGET_USD`); owners get a message when a cap is hit. For a chat with ~100 messages a day this is well under a dollar a month.
+Bot commands never call the LLM — they read the database. The model runs on a schedule: every `EXTRACTION_INTERVAL_HOURS` (6 by default) it takes everything that piled up since the previous pass and processes it in one call to `claude-sonnet-5-5` (configurable with `EXTRACTION_MODEL`). If nothing new was written, there is no call. A weekly clean-up pass runs only if cards changed. Spending is capped per month for the whole bot (`MONTHLY_LLM_BUDGET_USD`) and for each chat (`CHAT_MONTHLY_BUDGET_USD`); owners get a message when a cap is hit. For a busy chat with 100–250 messages a day this comes to roughly $4–7 a month on Sonnet 5.5; `claude-haiku-5-5` costs about 20 times less per token.
 
 ## Commands
 
@@ -42,7 +42,7 @@ In DM the bot works with one chat at a time; if you are in several, it asks whic
 ## Running it
 
 1. Create a bot with [@BotFather](https://t.me/BotFather), disable privacy mode (`/setprivacy` → Disable) and add it to your group as an admin without moderation rights.
-2. `cp .env.example .env` and fill it in. Put your Telegram ID into `ADMIN_TG_IDS` (message the bot to learn it).
+2. `cp .env.example .env` and fill it in. Put your Telegram ID into `ADMIN_TG_IDS` (get it from a bot like @userinfobot).
 3. `docker compose up -d --build`
 4. Add the bot to a group. If an owner added it, the chat is approved at once; otherwise owners get an approve/reject request in DM. Until then the bot reads and stores nothing from that chat.
 5. Optional: load starting cards and a project catalog — `docker compose exec -e SEED_CHAT_ID=-100… bot node dist/scripts/seed.js seed/people.json seed/projects.json`. Without `SEED_CHAT_ID` they wait as imported history, and `/chats` offers to attach them to a chat. See `seed/example-*.json` for the format. Real community data stays out of git (`seed/*.json` is ignored).

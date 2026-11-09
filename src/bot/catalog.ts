@@ -10,6 +10,7 @@ import {
   projectsOfUser,
   RATING_EXPLANATION,
   setVote,
+  STATUS_LABELS,
   upsertProject,
   type ProjectSort,
 } from "../core/projects.js";
@@ -49,9 +50,9 @@ const CHRONICLE_PER_PAGE = 5;
 const LINKS_PER_PAGE = 10;
 
 const SORT_LABELS: Record<ProjectSort, string> = {
-  top: "🏆 Топ",
-  alive: "🔥 Живые",
-  new: "🆕 Новые",
+  top: "🏆 Top",
+  alive: "🔥 Active",
+  new: "🆕 New",
 };
 
 export interface CatalogHandlers {
@@ -130,7 +131,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     const app = kit.appButton(
       ctx,
       scope.chatId,
-      "📱 Все в приложении",
+      "📱 All in the app",
       "/people",
       "people",
     );
@@ -138,11 +139,11 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     await kit.show(
       ctx,
       [
-        `👥 <b>Участники чата</b> (${people.length})`,
+        `👥 <b>Chat members</b> (${people.length})`,
         "",
         ...lines,
         "",
-        "Нажми на имя — откроется карточка.",
+        "Tap a name to open their card.",
       ].join("\n"),
       keyboard,
       { edit },
@@ -159,7 +160,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     if (!person)
       return void (await kit.show(
         ctx,
-        "Не нашёл такого участника в этом чате.",
+        "Couldn't find that member in this chat.",
       ));
     const [facts, projects] = await Promise.all([
       person.opted_out
@@ -179,12 +180,12 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
       2,
     );
     if (scope.user.id === person.id && kit.isPrivate(ctx))
-      keyboard.row().text("✏️ Править мою карточку", "me:home");
-    keyboard.row().text("👥 Все участники", "pp:0");
+      keyboard.row().text("✏️ Edit my card", "me:home");
+    keyboard.row().text("👥 All members", "pp:0");
     const app = kit.appButton(
       ctx,
       scope.chatId,
-      "📱 Подробнее",
+      "📱 More",
       `/u/${person.id}`,
       `u_${person.id}`,
     );
@@ -220,7 +221,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
       if (!targetId)
         return void (await kit.show(
           ctx,
-          `Не знаю, кто такой «${escapeHtml(ref)}». Попробуй @username, имя или ответь командой на его сообщение. Все участники — /people`,
+          `I don't know who “${escapeHtml(ref)}” is. Try an @username, a name, or reply to their message with the command. All members — /people`,
         ));
       await personScreen(ctx, scope, targetId);
     }),
@@ -233,13 +234,13 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
       if (!topic)
         return void (await kit.show(
           ctx,
-          "Про что спросить? Например: /whoknows swift или /whoknows сервера",
+          "Ask about what? For example: /whoknows swift or /whoknows docker",
         ));
       const people = await whoKnows(sql, scope.chatId, topic);
       if (people.length === 0)
         return void (await kit.show(
           ctx,
-          `Пока не знаю, кто разбирается в «${escapeHtml(topic)}». Карточки пополняются по ходу общения.`,
+          `I don't know yet who's into “${escapeHtml(topic)}”. Cards fill in as people chat.`,
         ));
       const lines = people.map(
         (person) =>
@@ -253,7 +254,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
       );
       await kit.show(
         ctx,
-        [`🧠 <b>Кто шарит в «${escapeHtml(topic)}»</b>`, "", ...lines].join(
+        [`🧠 <b>Who knows “${escapeHtml(topic)}”</b>`, "", ...lines].join(
           "\n",
         ),
         keyboard,
@@ -277,7 +278,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     if (projects.length === 0) {
       return void (await kit.show(
         ctx,
-        "Каталог пока пуст. Добавь свой: /addproject ссылка описание",
+        "The catalog is empty for now. Add yours: /addproject link description",
         undefined,
         { edit },
       ));
@@ -312,11 +313,11 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     keyboard.row();
     for (const button of pager(`pl:${sort}`, current, totalPages))
       keyboard.add(button);
-    keyboard.row().text("❓ Как считается рейтинг", "rating:help");
-    if (kit.isPrivate(ctx)) keyboard.text("➕ Добавить свой", "np:start");
+    keyboard.row().text("❓ How the rating works", "rating:help");
+    if (kit.isPrivate(ctx)) keyboard.text("➕ Add yours", "np:start");
     await kit.show(
       ctx,
-      [`🛠 <b>Проекты чата</b> · ${SORT_LABELS[sort]}`, "", ...lines].join("\n"),
+      [`🛠 <b>Chat projects</b> · ${SORT_LABELS[sort]}`, "", ...lines].join("\n"),
       keyboard,
       { edit },
     );
@@ -333,15 +334,15 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     if (!project)
       return void (await kit.show(
         ctx,
-        "Проект не найден — может, его удалили. Список: /projects",
+        "Project not found — maybe it was deleted. The list: /projects",
         undefined,
         { edit },
       ));
     const keyboard = new InlineKeyboard()
       .text(
         project.voted_by_me
-          ? `👍 ${project.votes} · убрать голос`
-          : `👍 ${project.votes} · голосую`,
+          ? `👍 ${project.votes} · remove vote`
+          : `👍 ${project.votes} · vote`,
         `vote:${project.id}`,
       )
       .row();
@@ -353,19 +354,19 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
       (await canEditProject(sql, project.id, viewer.id, kit.isOwner(viewer)))
     ) {
       keyboard
-        .text("📌 Статус", `pe:${project.id}:status`)
-        .text("📝 Описание", `pe:${project.id}:tagline`)
+        .text("📌 Status", `pe:${project.id}:status`)
+        .text("📝 Description", `pe:${project.id}:tagline`)
         .row()
-        .text("🧰 Стек", `pe:${project.id}:stack`)
-        .text("🔗 Ссылки", `pe:${project.id}:links`)
+        .text("🧰 Stack", `pe:${project.id}:stack`)
+        .text("🔗 Links", `pe:${project.id}:links`)
         .text("🗑", `pe:${project.id}:delete`)
         .row();
     }
-    keyboard.text("← Проекты", "pl:top:0");
+    keyboard.text("← Projects", "pl:top:0");
     const app = kit.appButton(
       ctx,
       scope.chatId,
-      "📱 Открыть",
+      "📱 Open",
       `/p/${project.slug}`,
       `p_${project.slug}`,
     );
@@ -385,7 +386,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     await kit.show(
       ctx,
       RATING_EXPLANATION,
-      new InlineKeyboard().text("← Проекты", "pl:top:0"),
+      new InlineKeyboard().text("← Projects", "pl:top:0"),
       { edit: true },
     );
   });
@@ -399,7 +400,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
       if (!found)
         return void (await kit.show(
           ctx,
-          `Не нашёл проект «${escapeHtml(query)}». Список — /projects`,
+          `Couldn't find a project called “${escapeHtml(query)}”. The list — /projects`,
         ));
       await projectScreen(ctx, scope, found.slug);
     }),
@@ -413,14 +414,14 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     >`
       SELECT slug, chat_id, EXISTS (SELECT 1 FROM votes WHERE project_id = ${projectId} AND user_id = ${user.id}) AS voted
       FROM projects WHERE id = ${projectId}`;
-    if (!project) return ctx.answerCallbackQuery({ text: "Проект не найден" });
+    if (!project) return ctx.answerCallbackQuery({ text: "Project not found" });
     const result = await setVote(sql, projectId, user.id, !project.voted);
     if (result === "own_project")
       return ctx.answerCallbackQuery({
-        text: "За свой проект голосовать нельзя 🙂",
+        text: "You can't vote for your own project 🙂",
       });
     await ctx.answerCallbackQuery({
-      text: project.voted ? "Голос убран" : "Засчитано 👍",
+      text: project.voted ? "Vote removed" : "Counted 👍",
     });
     const person = await getPerson(sql, project.chat_id, user.id);
     if (person)
@@ -442,7 +443,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
         !(await canEditProject(sql, projectId, user.id, kit.isOwner(user)))
       )
         return ctx.answerCallbackQuery({
-          text: "Править может только автор, в личке с ботом",
+          text: "Only the author can edit, in a DM with the bot",
         });
       await ctx.answerCallbackQuery();
       const [project] = await sql<
@@ -456,23 +457,23 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
       >`
       SELECT slug, chat_id, name, tagline, stack FROM projects WHERE id = ${projectId}`;
       if (!project) return;
-      const back = new InlineKeyboard().text("Отмена", `p:${project.slug}`);
+      const back = new InlineKeyboard().text("Cancel", `p:${project.slug}`);
       switch (ctx.match[2]) {
         case "status":
           return void (await kit.show(
             ctx,
-            `📌 Статус проекта <b>${escapeHtml(project.name)}</b>:`,
+            `📌 Status of <b>${escapeHtml(project.name)}</b>:`,
             grid(
               PROJECT_STATUSES.map((status, index) =>
                 InlineKeyboard.text(
-                  `${STATUS_EMOJI[status]} ${status}`,
+                  `${STATUS_EMOJI[status]} ${STATUS_LABELS[status]}`,
                   `ps:${projectId}:${index}`,
                 ),
               ),
               2,
             )
               .row()
-              .text("Отмена", `p:${project.slug}`),
+              .text("Cancel", `p:${project.slug}`),
             { edit: true },
           ));
         case "tagline":
@@ -484,7 +485,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
           });
           return void (await kit.show(
             ctx,
-            `📝 Опиши <b>${escapeHtml(project.name)}</b> одной фразой.\nСейчас: ${project.tagline ? escapeHtml(project.tagline) : "нет"}`,
+            `📝 Describe <b>${escapeHtml(project.name)}</b> in one sentence.\nNow: ${project.tagline ? escapeHtml(project.tagline) : "none"}`,
             back,
             { edit: true },
           ));
@@ -497,7 +498,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
           });
           return void (await kit.show(
             ctx,
-            `🧰 Стек через запятую.\nСейчас: ${project.stack.length ? escapeHtml(project.stack.join(", ")) : "нет"}`,
+            `🧰 Stack, comma-separated.\nNow: ${project.stack.length ? escapeHtml(project.stack.join(", ")) : "none"}`,
             back,
             { edit: true },
           ));
@@ -510,17 +511,17 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
           });
           return void (await kit.show(
             ctx,
-            "🔗 Пришли ссылки — репозиторий и/или сайт (можно обе в одном сообщении).",
+            "🔗 Send the links — repository and/or website (both in one message is fine).",
             back,
             { edit: true },
           ));
         case "delete":
           return void (await kit.show(
             ctx,
-            `Удалить <b>${escapeHtml(project.name)}</b> из каталога?`,
+            `Remove <b>${escapeHtml(project.name)}</b> from the catalog?`,
             new InlineKeyboard()
-              .text("Да, удалить", `pdel:${projectId}`)
-              .text("Отмена", `p:${project.slug}`),
+              .text("Yes, remove", `pdel:${projectId}`)
+              .text("Cancel", `p:${project.slug}`),
             { edit: true },
           ));
       }
@@ -550,7 +551,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
       source: kit.isOwner(user) ? "admin" : "user",
       actorUserId: user.id,
     });
-    await ctx.answerCallbackQuery({ text: `Статус: ${status}` });
+    await ctx.answerCallbackQuery({ text: `Status: ${STATUS_LABELS[status]}` });
     const person = await getPerson(sql, project.chat_id, user.id);
     if (person)
       await projectScreen(
@@ -565,13 +566,13 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     const user = await kit.identity(ctx.from);
     const projectId = Number(ctx.match[1]);
     if (!(await canEditProject(sql, projectId, user.id, kit.isOwner(user))))
-      return ctx.answerCallbackQuery({ text: "Удалить может только автор" });
+      return ctx.answerCallbackQuery({ text: "Only the author can remove it" });
     await hideProject(sql, projectId, user.id);
-    await ctx.answerCallbackQuery({ text: "Удалено" });
+    await ctx.answerCallbackQuery({ text: "Removed" });
     await kit.show(
       ctx,
-      "Проект удалён из каталога.",
-      new InlineKeyboard().text("← Проекты", "pl:top:0"),
+      "Project removed from the catalog.",
+      new InlineKeyboard().text("← Projects", "pl:top:0"),
       { edit: true },
     );
   });
@@ -585,12 +586,12 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
         if (kit.isPrivate(ctx))
           return void (await kit.show(
             ctx,
-            "Можно ссылкой: /addproject https://github.com/you/repo Короткое описание — или по шагам:",
-            new InlineKeyboard().text("➕ Новый проект", "np:start"),
+            "Use a link: /addproject https://github.com/you/repo Short description — or step by step:",
+            new InlineKeyboard().text("➕ New project", "np:start"),
           ));
         return void (await kit.show(
           ctx,
-          "Формат: /addproject https://github.com/you/repo Короткое описание",
+          "Format: /addproject https://github.com/you/repo Short description",
         ));
       }
       const user = scope.user;
@@ -616,8 +617,8 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
       });
       await kit.show(
         ctx,
-        `${created ? "Добавил" : "Обновил"} проект <b>${escapeHtml(project.name)}</b> ✅`,
-        new InlineKeyboard().text("Открыть карточку", `p:${project.slug}`),
+        `${created ? "Added" : "Updated"} project <b>${escapeHtml(project.name)}</b> ✅`,
+        new InlineKeyboard().text("Open card", `p:${project.slug}`),
       );
     }),
   );
@@ -648,10 +649,10 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     );
     const keyboard = new InlineKeyboard();
     for (const [value, label] of [
-      [1, "Сутки"],
-      [3, "3 дня"],
-      [7, "Неделя"],
-      [30, "Месяц"],
+      [1, "24 h"],
+      [3, "3 days"],
+      [7, "Week"],
+      [30, "Month"],
     ] as const) {
       keyboard.text(value === days ? `· ${label} ·` : label, `ch:${value}:0`);
     }
@@ -665,8 +666,8 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
               `<i>${formatDate(entry.period_to, config.DISPLAY_TIMEZONE)}</i>\n${chronicleLine(entry, scope.chatId)}`,
           )
           .join("\n\n")
-      : `За этот период летопись пуста. Летописец садится за новые сообщения раз в ${config.EXTRACTION_INTERVAL_HOURS} ч.`;
-    await kit.show(ctx, `📜 <b>Главное в чате</b>\n\n${body}`, keyboard, {
+      : `The chronicle is empty for this period. The chronicler goes through new messages every ${config.EXTRACTION_INTERVAL_HOURS} h.`;
+    await kit.show(ctx, `📜 <b>Chat highlights</b>\n\n${body}`, keyboard, {
       edit,
     });
   }
@@ -736,9 +737,9 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     await kit.show(
       ctx,
       [
-        `🔗 <b>Ссылки из чата</b> (свежие сверху)`,
+        `🔗 <b>Links from the chat</b> (newest first)`,
         "",
-        ...(lines.length ? lines : ["Пока пусто."]),
+        ...(lines.length ? lines : ["Nothing yet."]),
       ].join("\n"),
       keyboard,
       { edit },

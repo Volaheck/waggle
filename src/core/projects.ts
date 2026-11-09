@@ -5,6 +5,39 @@ import { normalizeUrl, slugify } from "./text.js";
 export const PROJECT_STATUSES = ["идея", "в работе", "запущен", "на паузе", "заброшен"] as const;
 export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
 
+/** Statuses are stored in Russian; these are the labels users see. */
+export const STATUS_LABELS: Record<ProjectStatus, string> = {
+  идея: "idea",
+  "в работе": "in progress",
+  запущен: "launched",
+  "на паузе": "paused",
+  заброшен: "abandoned",
+};
+
+/**
+ * Status codes the chronicler (an LLM) reads and writes. Its prompts must contain no Russian:
+ * a single Russian word there is enough to make it write the content of an English chat in Russian.
+ */
+export const STATUS_CODE_LIST = ["idea", "in_progress", "launched", "paused", "abandoned"] as const;
+export type StatusCode = (typeof STATUS_CODE_LIST)[number];
+
+const STATUS_BY_CODE: Record<StatusCode, ProjectStatus> = {
+  idea: "идея",
+  in_progress: "в работе",
+  launched: "запущен",
+  paused: "на паузе",
+  abandoned: "заброшен",
+};
+const CODE_BY_STATUS = new Map(Object.entries(STATUS_BY_CODE).map(([code, status]) => [status as string, code as StatusCode]));
+
+export function statusCode(status: string): StatusCode | null {
+  return CODE_BY_STATUS.get(status) ?? null;
+}
+
+export function statusFromCode(code: StatusCode | null | undefined): ProjectStatus | null {
+  return code ? STATUS_BY_CODE[code] : null;
+}
+
 export interface ProjectLinks {
   repo?: string | null;
   site?: string | null;
@@ -104,11 +137,11 @@ export async function listProjects(sql: Sql, chatId: number, options: { sort?: P
 }
 
 export const RATING_EXPLANATION = [
-  "<b>Как считается рейтинг</b>",
+  "<b>How the rating works</b>",
   "",
-  "Рейтинг ведёт летописец — нейронка, которая раз в несколько часов читает чат. Она замечает, что реально происходит с проектами: отзывы участников, кто чем пользуется, кто помогает, как проект развивается, — и сама решает, насколько это весомо.",
+  "The rating is kept by the chronicler, an AI that reads the chat every few hours. It notices what is really happening with projects: feedback from members, who uses what, who helps out, how a project is moving along — and decides for itself how much that counts.",
   "",
-  "Голоса 👍 участников тоже учитываются. Свежее весит больше старого, а накрутить рейтинг повторными упоминаниями не получится.",
+  "Members' 👍 votes count too. Recent activity weighs more than old, and repeated mentions won't inflate the rating.",
 ].join("\n");
 
 export async function getProjectBySlug(sql: Sql, chatId: number, slug: string, viewerUserId?: number): Promise<ProjectListItem | undefined> {
