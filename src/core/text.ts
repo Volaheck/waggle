@@ -151,6 +151,24 @@ export function slugify(name: string): string {
   return latin.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "project";
 }
 
+/**
+ * Cyrillic letters whose capitals look like Latin ones, in lower case: a card named «Тор» is found as "Top" too,
+ * whichever keyboard typed it, and «тор» as well.
+ */
+const LOOKALIKE_LETTERS: Record<string, string> = {
+  а: "a", в: "b", е: "e", ё: "e", к: "k", м: "m", н: "h", о: "o", р: "p", с: "c", т: "t", у: "y", х: "x",
+};
+
+/** A person's name reduced for comparison: look-alike letters, fancy Unicode letters, case, emoji and punctuation do not count. */
+export function nameKey(name: string): string {
+  return [...name.normalize("NFKC").toLowerCase()]
+    .map((char) => LOOKALIKE_LETTERS[char] ?? char)
+    .join("")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+/** Cuts on whole characters: half an emoji is invalid UTF-16, and Telegram refuses the message. */
 export function truncate(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
+  return text.length <= max ? text : `${text.slice(0, max - 1).replace(/[\uD800-\uDBFF]$/, "").trimEnd()}…`;
 }

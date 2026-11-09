@@ -6,11 +6,11 @@ import { allChats, approvedChats, attachLegacyData, chatsOfUser, getChat, isAppr
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
 import { monthSpendUsd } from "../core/llm.js";
-import { mergeSeedUser } from "../core/merge.js";
+import { mergeSeedUser, rankCards, unlinkedCards, type UnlinkedCard } from "../core/merge.js";
 import { saveMessage, updateEditedMessage } from "../core/messages.js";
 import { catchupFor } from "../core/chronicle.js";
-import { escapeHtml } from "../core/text.js";
-import { ensureMember, fullName, markLeft, SERVICE_TG_IDS, type User } from "../core/users.js";
+import { escapeHtml, nameKey, truncate } from "../core/text.js";
+import { accountByUsername, fullName, getUser, markLeft, SERVICE_TG_IDS, type User } from "../core/users.js";
 import { nextConsolidationRetryAt } from "../worker/consolidate.js";
 import { chatBudgetUsd, nextExtractionRetryAt } from "../worker/scheduler.js";
 import { registerCatalog } from "./catalog.js";
@@ -129,15 +129,128 @@ function upgradeOf(error: unknown, fallbackChatId?: number): { from: number; to:
   return from === undefined ? undefined : { from, to: error.parameters.migrate_to_chat_id };
 }
 
-export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: MembershipCache; assistant?: Assistant } {
+/** An unlinked card is offered for a newcomer only while it has written within this many days. */
+const CARD_OFFER_ACTIVE_DAYS = 60;
+const CARD_OFFER_BUTTONS = 6;
+/** Questions to the owners about newcomers, per chat per day: a crowd joining at once does not flood their DMs. */
+const CARD_OFFERS_PER_CHAT_PER_DAY = 10;
+
+export function createBot(deps: BotDeps): {
+  bot: Bot<BotContext>;
+  membership: MembershipCache;
+  assistant?: Assistant;
+  /** Call when an account appears in a chat for the first time outside the bot (the Mini App): the owners may be asked about it. */
+  onJoined: (chatId: number, user: User) => void;
+  /** Resolves once the questions to the owners about accounts seen so far have been sent. */
+  cardOffersIdle: () => Promise<void>;
+} {
   const { sql, config } = deps;
   // Answers are off without a key or with a zero cap; a mention then gets the help text instead.
   const assistant =
     deps.anthropic && config.REPLIES_MONTHLY_BUDGET_USD > 0 ? createAssistant({ sql, anthropic: deps.anthropic, config, limits: deps.answerLimits }) : undefined;
   const bot = new Bot<BotContext>(config.BOT_TOKEN);
   const membership = new MembershipCache(bot.api);
-  const kit = createKit(bot, sql, config, membership);
+  const pendingOffers = new Set<Promise<void>>();
+  const onJoined = (chatId: number, user: User) => {
+    const offer = offerCardLinks(chatId, user)
+      .catch((error) => console.error(`[bot] could not ask about a newcomer in ${chatId}:`, error))
+      .finally(() => pendingOffers.delete(offer));
+    pendingOffers.add(offer);
+  };
+  const kit = createKit(bot, sql, config, membership, onJoined);
   const isGroup = (ctx: BotContext) => ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
+
+  // ---------- Linking imported cards: an account the automatic match missed is offered to the owners ----------
+
+  const offersToday = new Map<number, { day: string; asked: number; overflowTold: boolean }>();
+  const offerQuota = (chatId: number) => {
+    const day = new Date().toISOString().slice(0, 10);
+    let quota = offersToday.get(chatId);
+    if (quota?.day !== day) offersToday.set(chatId, (quota = { day, asked: 0, overflowTold: false }));
+    return quota;
+  };
+
+  /** True when at least one owner got the message. */
+  async function tellOwners(text: string, keyboard?: InlineKeyboard): Promise<boolean> {
+    let delivered = false;
+    for (const tgId of new Set(config.ADMIN_TG_IDS)) {
+      try {
+        await bot.api.sendMessage(tgId, text, { parse_mode: "HTML", reply_markup: keyboard, link_preview_options: { is_disabled: true } });
+        delivered = true;
+      } catch (error) {
+        console.warn(`[bot] could not message owner ${tgId}: ${String(error)}`);
+      }
+    }
+    return delivered;
+  }
+
+  const cardButtons = (chatId: number, cards: UnlinkedCard[], account: User) => {
+    const keyboard = new InlineKeyboard();
+    for (const card of cards) {
+      keyboard.text(`${truncate(card.display_name, 32)} · ${countOf(card.messages, "message")}`, `cardlink:${encodeChat(chatId)}:${card.id}:${account.id}`).row();
+    }
+    return keyboard;
+  };
+
+  /**
+   * An account seen in a chat for the first time while the chat still has recently active cards from imported
+   * history: the owners pick the card that is this person, or none. The export names people as the exporter's
+   * contact list does, so a name match alone misses people, and a card that authors projects is never handed
+   * over on a name match at all. A card with its own @username waits for that account instead.
+   */
+  async function offerCardLinks(chatId: number, account: User): Promise<void> {
+    if (account.tg_id === null || SERVICE_TG_IDS.includes(account.tg_id)) return;
+    const chat = await getChat(sql, chatId);
+    if (chat?.status !== "approved") return;
+    const unclaimed = (await unlinkedCards(sql, chatId, { activeWithinDays: CARD_OFFER_ACTIVE_DAYS })).filter((card) => !card.username);
+    const cards = rankCards(unclaimed, account).slice(0, CARD_OFFER_BUTTONS);
+    if (cards.length === 0) return;
+    const title = escapeHtml(chat.title ?? String(chatId));
+    const quota = offerQuota(chatId);
+    if (quota.asked >= CARD_OFFERS_PER_CHAT_PER_DAY) {
+      if (quota.overflowTold) return;
+      quota.overflowTold = true;
+      await tellOwners(`🔗 More people turned up in <b>${title}</b> today than I ask about in a day. /botstatus lists the cards still unlinked there; /link @username Name links one.`);
+      return;
+    }
+    const [likely] = cards;
+    const guess = likely && likely.match !== "none" ? ` Looks like the card “${escapeHtml(likely.display_name)}”.` : "";
+    const text = [
+      `🔗 I'm seeing ${userHeader(account)} in <b>${title}</b> for the first time.${guess}`,
+      "Is this one of the cards from the imported history? Linking moves the card's messages, facts and projects to this account.",
+    ].join("\n");
+    quota.asked += 1;
+    if (!(await tellOwners(text, cardButtons(chatId, cards, account).text("None of them", `cardnone:${account.id}`)))) quota.asked -= 1;
+  }
+
+  bot.callbackQuery(/^cardlink:c(\d+):(\d+):(\d+)$/, async (ctx) => {
+    const owner = await kit.identity(ctx.from);
+    if (!kit.isOwner(owner)) return ctx.answerCallbackQuery({ text: "That's up to the bot owner" });
+    const chatId = -Number(ctx.match[1]);
+    const [card] = await sql<User[]>`
+      SELECT u.* FROM users u JOIN members m ON m.user_id = u.id
+      WHERE u.id = ${Number(ctx.match[2])} AND u.tg_id IS NULL AND m.chat_id = ${chatId}`;
+    const [account] = await sql<User[]>`
+      SELECT u.* FROM users u JOIN members m ON m.user_id = u.id
+      WHERE u.id = ${Number(ctx.match[3])} AND u.tg_id IS NOT NULL AND m.chat_id = ${chatId}`;
+    if (!card || !account) {
+      await ctx.answerCallbackQuery({ text: "Nothing to link anymore" });
+      const why = card ? "I no longer find that account in the chat." : "That card is linked already.";
+      return kit.show(ctx, why, undefined, { edit: true });
+    }
+    await mergeSeedUser(sql, card.id, account.id, owner.id);
+    await ctx.answerCallbackQuery({ text: "Linked" });
+    return kit.show(ctx, `✅ Linked the card “${escapeHtml(card.display_name)}” to ${userHeader(account)}: its messages, facts and projects are theirs now.`, undefined, { edit: true });
+  });
+
+  bot.callbackQuery(/^cardnone:(\d+)$/, async (ctx) => {
+    const owner = await kit.identity(ctx.from);
+    if (!kit.isOwner(owner)) return ctx.answerCallbackQuery({ text: "That's up to the bot owner" });
+    await ctx.answerCallbackQuery();
+    const account = await getUser(sql, Number(ctx.match[1]));
+    const who = account ? userHeader(account) : "This person";
+    return kit.show(ctx, `👌 ${who} keeps a card of their own. The unlinked cards stay listed in /botstatus; /link joins one later.`, undefined, { edit: true });
+  });
 
   // ---------- Joining chats: a new group waits until a bot owner approves it ----------
 
@@ -290,6 +403,11 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
       moved.projectsMerged ? `${countOf(moved.projectsMerged, "imported project")} merged into projects the chat already had` : "",
       moved.cardsLinked ? `${countOf(moved.cardsLinked, "card")} linked to the members' accounts` : "",
     ].filter(Boolean);
+    const unlinked = await unlinkedCards(sql, chatId);
+    if (unlinked.length) {
+      const names = unlinked.slice(0, 20).map((card) => `“${escapeHtml(card.display_name)}”`).join(", ");
+      notes.push(`not linked yet: ${names}${unlinked.length > 20 ? "…" : ""} (in the chat, /link @username Name links one; people who appear from now on are put to you as they come)`);
+    }
     await kit.show(
       ctx,
       `📥 Import attached to <b>${title}</b>: ${countOf(moved.messages, "message")}, ${countOf(moved.members, "card")}, ${countOf(moved.projects, "project")}, ${countOf(moved.topics, "chronicle topic")}.${notes.length ? `\n${notes.join("; ")}.` : ""}`,
@@ -437,7 +555,7 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     const user = await kit.identity(ctx.from);
     let chats = await chatsOfUser(sql, user.id);
     if (!chats.some((chat) => chat.id === chatId) && (await isApproved(sql, chatId)) && (await membership.isMember(chatId, ctx.from.id))) {
-      await ensureMember(sql, chatId, user.id);
+      await kit.join(chatId, user);
       chats = await chatsOfUser(sql, user.id);
     }
     if (chats.some((chat) => chat.id === chatId)) await setCurrentChat(sql, user.id, chatId);
@@ -515,18 +633,31 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     if (!ctx.from || !isGroup(ctx)) return;
     const admin = await kit.identity(ctx.from, ctx.chat.id);
     if (!kit.isOwner(admin)) return;
-    const target = realReply(ctx.msg)?.from;
-    const seedName = commandArgs(ctx);
-    if (!target || target.is_bot || SERVICE_TG_IDS.includes(target.id) || !seedName) {
-      return void (await kit.show(ctx, "Reply to the person's message: /link Name from the seed cards"));
+    const args = commandArgs(ctx);
+    const named = /^@(\w+)\s+(.+)$/su.exec(args);
+    const replied = realReply(ctx.msg)?.from;
+    const cardName = (named ? named[2]! : args).trim();
+    const repliedPerson = replied && !replied.is_bot && !SERVICE_TG_IDS.includes(replied.id) ? replied : undefined;
+    if (!cardName || (!named && !repliedPerson)) {
+      return void (await kit.show(ctx, "Reply to the person's message with /link Card name, or write /link @username Card name"));
     }
-    const into = await kit.identity(target, ctx.chat.id);
-    const [seed] = await sql<User[]>`
-      SELECT u.* FROM users u JOIN members m ON m.user_id = u.id
-      WHERE u.tg_id IS NULL AND m.chat_id = ${ctx.chat.id} AND lower(u.display_name) = lower(${seedName})`;
-    if (!seed) return void (await kit.show(ctx, `No unlinked card named “${escapeHtml(seedName)}”`));
-    await mergeSeedUser(sql, seed.id, into.id, admin.id);
-    await kit.show(ctx, `Linked the card “${escapeHtml(seed.display_name)}” to ${userHeader(into)} ✅`);
+    const into = named ? await accountByUsername(sql, ctx.chat.id, named[1]!) : await kit.identity(repliedPerson!, ctx.chat.id);
+    if (!into) return void (await kit.show(ctx, `I haven't seen @${escapeHtml(named![1]!)} in this chat yet: people show up here once they write or join.`));
+    const cards = await unlinkedCards(sql, ctx.chat.id);
+    if (cards.length === 0) return void (await kit.show(ctx, "Every card in this chat is linked already"));
+    const typed = cardName.toLowerCase();
+    const key = nameKey(cardName);
+    const exact = cards.filter((card) => card.display_name.toLowerCase() === typed);
+    const matching = exact.length > 0 ? exact : key ? cards.filter((card) => nameKey(card.display_name) === key) : [];
+    if (matching.length === 0) {
+      return void (await kit.show(ctx, `No unlinked card called “${escapeHtml(cardName)}”. Unlinked here: ${cards.map((card) => `“${escapeHtml(card.display_name)}”`).join(", ")}`));
+    }
+    if (matching.length > 1) {
+      return void (await kit.show(ctx, `Several unlinked cards are called “${escapeHtml(cardName)}”. Which one is ${userHeader(into)}?`, cardButtons(ctx.chat.id, matching.slice(0, CARD_OFFER_BUTTONS), into)));
+    }
+    const card = matching[0]!;
+    await mergeSeedUser(sql, card.id, into.id, admin.id);
+    await kit.show(ctx, `Linked the card “${escapeHtml(card.display_name)}” to ${userHeader(into)} ✅`);
   });
 
   bot.command("botstatus", async (ctx) => {
@@ -569,7 +700,9 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
           later(cleanupRetry) ? `⚠️ The weekly card clean-up failed; next attempt ${later(cleanupRetry)}` : "",
           skipped?.messages ? `⚠️ Skipped in the last 30 days: ${countOf(skipped.messages, "message")} the chronicler could not process` : "",
           `Members: ${counts?.members}, facts: ${counts?.facts}, projects: ${counts?.projects}, topics: ${counts?.topics}`,
-          counts?.unlinked?.length ? `Unlinked cards: ${counts.unlinked.map(escapeHtml).join(", ")} — reply with /link Name` : "All cards are linked",
+          counts?.unlinked?.length
+            ? `Unlinked cards: ${counts.unlinked.map(escapeHtml).join(", ")} — /link @username Name in the chat, or /link Name as a reply to the person`
+            : "All cards are linked",
           `AI this month: $${spent.toFixed(3)} of $${budget.toFixed(2)}`,
         ].filter(Boolean),
       );
@@ -608,7 +741,7 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     if (error.ctx.callbackQuery) void error.ctx.answerCallbackQuery({ text: "Something went wrong 😕" }).catch(() => {});
   });
 
-  return { bot, membership, assistant };
+  return { bot, membership, assistant, onJoined, cardOffersIdle: async () => void (await Promise.allSettled([...pendingOffers])) };
 }
 
 const OWNER_COMMANDS = [

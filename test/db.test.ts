@@ -76,7 +76,16 @@ describe.skipIf(!DATABASE_URL)("with postgres", () => {
   it("merges a seed card that did not auto-link", async () => {
     const real = await resolveUser(sql, { id: 2002, first_name: "Миша", username: "mike_real" }, [], CHAT_ID);
     const [seed] = await sql<{ id: number }[]>`SELECT id FROM users WHERE display_name = 'Mike' AND tg_id IS NULL`;
+    const topic = async (userIds: number[]) =>
+      (await sql<{ id: number }[]>`
+        INSERT INTO chronicle (run_id, period_from, period_to, title, summary, user_ids, chat_id)
+        VALUES (0, now(), now(), 'Topic', 'Summary', ${userIds}::int[], ${CHAT_ID}) RETURNING id`)[0]!.id;
+    const both = await topic([seed!.id, 424242, real.id]);
+    const cardOnly = await topic([424242, seed!.id]);
     await mergeSeedUser(sql, seed!.id, real.id, real.id);
+    const participants = async (id: number) => (await sql<{ user_ids: number[] }[]>`SELECT user_ids FROM chronicle WHERE id = ${id}`)[0]!.user_ids;
+    expect(await participants(both)).toEqual([real.id, 424242]);
+    expect(await participants(cardOnly)).toEqual([424242, real.id]);
     const facts = await visibleFacts(sql, CHAT_ID, real.id);
     expect(facts.some((fact) => fact.kind === "role")).toBe(true);
     const [pixelChess] = await sql<{ user_id: number }[]>`SELECT pm.user_id FROM project_members pm JOIN projects p ON p.id = pm.project_id WHERE p.slug = 'pixel-chess'`;

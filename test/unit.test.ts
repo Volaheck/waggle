@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { signInitData, validateInitData } from "../src/api/init-data.js";
 import { catchupHtml, clampTelegram } from "../src/bot/format.js";
-import { extractUrls, hasForbiddenTopic, messageLink, normalizeUrl, normalizeValue, slugify } from "../src/core/text.js";
+import { extractUrls, hasForbiddenTopic, messageLink, nameKey, normalizeUrl, normalizeValue, slugify, truncate } from "../src/core/text.js";
+import { rankCards } from "../src/core/merge.js";
+import { replyEffort, replySystemPrompt } from "../src/bot/assistant.js";
 import { buildExtractionPrompt, EXTRACTION_SYSTEM_PROMPT, isPassDue } from "../src/worker/extract.js";
 import { CONSOLIDATION_SYSTEM_PROMPT } from "../src/worker/consolidate.js";
 import { factCore, isNearDuplicate, isSameFact } from "../src/core/facts.js";
@@ -41,6 +43,33 @@ describe("validateInitData", () => {
 describe("text helpers", () => {
   it("normalizes values for dedupe", () => {
     expect(normalizeValue("  Ёлка, «Rust»! ")).toBe("елка rust");
+  });
+
+  it("compares names the way people see them, whichever keyboard or font wrote them", () => {
+    expect(nameKey("Тор")).toBe(nameKey("Top"));
+    expect(nameKey("ТОР")).toBe(nameKey("top"));
+    expect(nameKey("MAESTRO (THE ONE AND ONLY)")).toBe("maestro the one and only");
+    expect(nameKey("𝐌𝐚𝐞𝐬𝐭𝐫𝐨 🐝")).toBe("maestro");
+    expect(nameKey("Ника / Nick K.")).not.toBe(nameKey("Ника"));
+    expect(nameKey("Арсений")).not.toBe(nameKey("Арсен"));
+    for (const [a, b] of [["тор", "Тор"], ["миша", "Миша"], ["АННА", "Анна"], ["вера", "ВЕРА"]] as const) expect(nameKey(a), a).toBe(nameKey(b));
+    expect(nameKey("🦊")).toBe("");
+  });
+
+  it("never cuts an emoji in half", () => {
+    const cut = truncate("Константин Константинопольский 🐝 dev", 31);
+    expect(cut.endsWith("…")).toBe(true);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(cut)).toBe(false);
+    expect(truncate("short", 31)).toBe("short");
+  });
+
+  it("puts the card a newcomer's name points to first, and keeps the rest in their order", () => {
+    const cards = [{ display_name: "Kit" }, { display_name: "Тор" }, { display_name: "Maestro" }, { display_name: "Oscar the Owl" }];
+    const maestro = rankCards(cards, { display_name: "MAESTRO (THE ONE AND ONLY)", username: "night_owl_42" });
+    expect(maestro.map((card) => [card.display_name, card.match])).toEqual([["Maestro", "part"], ["Kit", "none"], ["Тор", "none"], ["Oscar the Owl", "none"]]);
+    expect(rankCards(cards, { display_name: "Top", username: null })[0]).toMatchObject({ display_name: "Тор", match: "same" });
+    expect(rankCards(cards, { display_name: "Max", username: "oscar" })[0]).toMatchObject({ display_name: "Oscar the Owl", match: "part" });
+    expect(rankCards(cards, { display_name: "Gleb [Pumpkin]", username: "Pumpkin" }).every((card) => card.match === "none")).toBe(true);
   });
 
   it("blocks forbidden topics but not lookalike tech words", () => {
@@ -304,5 +333,18 @@ describe("masking personal data before a prompt", () => {
       maskPersonalData(text);
       expect(performance.now() - started).toBeLessThan(50);
     }
+  });
+});
+
+describe("answer prompt", () => {
+  it("has only the larger models weigh several angles first, and runs Opus at the effort it was tested with", () => {
+    expect(replySystemPrompt("claude-haiku-5-5")).not.toContain("draft three different angles");
+    expect(replySystemPrompt("claude-sonnet-5-5")).toContain("draft three different angles");
+    expect(replySystemPrompt("claude-opus-5-5")).toContain("draft three different angles");
+    for (const model of ["claude-haiku-5-5", "claude-opus-5-5"]) {
+      expect(replySystemPrompt(model)).toContain("never in stock motifs");
+      expect(replySystemPrompt(model)).not.toContain("${");
+    }
+    expect([replyEffort("claude-haiku-5-5"), replyEffort("claude-sonnet-5-5"), replyEffort("claude-opus-5-5")]).toEqual(["high", "high", "medium"]);
   });
 });

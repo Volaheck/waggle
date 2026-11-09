@@ -20,6 +20,8 @@ export interface ApiDeps {
   adminTgIds: number[];
   /** Asks Telegram whether the account is in the chat (cached by the caller). */
   isMember: (chatId: number, tgUserId: number) => Promise<boolean>;
+  /** Hears about an account that appears in a chat for the first time here (a silent member opening the app). */
+  onJoined?: (chatId: number, user: User) => void;
   webDistDir: string;
   /** Local development: a request carrying this secret acts as `devLoginAs` without Telegram. */
   devLogin?: { token: string; loginAs: string };
@@ -144,7 +146,7 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     const chats = await chatsOfUser(sql, user.id);
     if (chats.length > 0 || user.tg_id === null) return chats;
     for (const chat of await approvedChats(sql)) {
-      if (await deps.isMember(chat.id, user.tg_id)) await ensureMember(sql, chat.id, user.id);
+      if ((await deps.isMember(chat.id, user.tg_id)) && (await ensureMember(sql, chat.id, user.id))) deps.onJoined?.(chat.id, user);
     }
     return chatsOfUser(sql, user.id);
   };

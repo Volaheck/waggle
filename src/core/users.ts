@@ -75,6 +75,11 @@ async function claimableSeed(sql: Sql, username: string | null, name: string, ch
  * With a chat id the person also becomes (again) a member of that chat.
  */
 export async function resolveUser(sql: Sql, identity: TelegramIdentity, adminTgIds: number[], chatId?: number): Promise<User> {
+  return (await resolveAccount(sql, identity, adminTgIds, chatId)).user;
+}
+
+/** resolveUser that also says whether the account has just appeared in the chat for the first time, as itself and not as a card it took over. */
+export async function resolveAccount(sql: Sql, identity: TelegramIdentity, adminTgIds: number[], chatId?: number): Promise<{ user: User; joined: boolean }> {
   const name = fullName(identity) || identity.username || `user${identity.id}`;
   const username = identity.username ?? null;
   const isAdmin = adminTgIds.includes(identity.id);
@@ -107,14 +112,26 @@ export async function resolveUser(sql: Sql, identity: TelegramIdentity, adminTgI
     }
   }
   if (!user) throw new Error("Could not resolve the Telegram user");
-  if (chatId !== undefined) await ensureMember(sql, chatId, user.id);
-  return user;
+  const joined = chatId !== undefined && (await ensureMember(sql, chatId, user.id));
+  return { user, joined };
 }
 
-export async function ensureMember(sql: Sql, chatId: number, userId: number): Promise<void> {
-  await sql`
+/** Makes the person a member of the chat again; true when this is their first time there. */
+export async function ensureMember(sql: Sql, chatId: number, userId: number): Promise<boolean> {
+  const [row] = await sql<{ joined: boolean }[]>`
     INSERT INTO members (chat_id, user_id) VALUES (${chatId}, ${userId})
-    ON CONFLICT (chat_id, user_id) DO UPDATE SET left_at = NULL`;
+    ON CONFLICT (chat_id, user_id) DO UPDATE SET left_at = NULL
+    RETURNING (xmax = 0) AS joined`;
+  return row?.joined ?? false;
+}
+
+/** A Telegram account (not a card) that is a member of the chat, by its @username. */
+export async function accountByUsername(sql: Sql, chatId: number, username: string): Promise<User | undefined> {
+  const [user] = await sql<User[]>`
+    SELECT u.* FROM users u JOIN members m ON m.user_id = u.id
+    WHERE m.chat_id = ${chatId} AND u.tg_id IS NOT NULL AND u.tg_id <> ALL(${SERVICE_TG_IDS}::bigint[])
+      AND lower(u.username) = lower(${username.replace(/^@/, "")})`;
+  return user;
 }
 
 export async function getPerson(sql: Sql, chatId: number, userId: number): Promise<Person | undefined> {

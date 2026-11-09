@@ -35,7 +35,7 @@ Bot commands never call the LLM — they read the database. Only a mention of th
 | `/chronicle`, `/today`, `/week` | the chronicle |
 | `/whatyouknow`, `/forgetme` | privacy |
 | `/chats` | owner: approve or reject chats, attach imported history |
-| `/botstatus`, `/link Name` | owner: status per chat; link a seeded card to an account (reply to their message) |
+| `/botstatus`, `/link @username Name` | owner: status per chat; link an imported card to an account (or `/link Name` as a reply to their message) |
 
 In DM the bot works with one chat at a time; if you are in several, it asks which one and remembers the choice (🔁 switches).
 
@@ -53,7 +53,7 @@ In DM the bot works with one chat at a time; if you are in several, it asks whic
    ```
 
    `--user` lets the container read files that only you can read. Without `SEED_CHAT_ID` the cards wait as imported history, and `/chats` offers to attach them to a chat.
-6. Cards link to Telegram accounts automatically when people write: by @username, or by name when the match is unambiguous and harmless — the only unlinked card with that name in the chat, with no @username of its own, no other chat and no projects. Anyone left over can be linked with `/link Name` as a reply to their message; `/botstatus` lists unlinked cards.
+6. Cards link to Telegram accounts automatically when people write: by @username, or by name when the match is unambiguous and harmless — the only unlinked card with that name in the chat, with no @username of its own, no other chat and no projects. An export names people as the exporter's contacts do, so some are missed. When the bot sees an account in a chat for the first time while the chat still has unlinked cards active in the last 60 days (a card without messages counts from its import), the owners get a DM with those cards as buttons, the likeliest by name first, and link one with a tap or answer "None of them"; a card with its own @username is left for that account. Up to 10 such questions per chat a day, then one note instead. `/link @username Name` (or `/link Name` as a reply) links one by hand: the exact name first, then one that differs only in case, emoji or Cyrillic letters that look Latin; namesakes come back as buttons. `/botstatus` lists unlinked cards, and so does the message after attaching an import. Linking moves the card's messages, facts, projects, votes and chronicle topics to the account; an opt-out on either side wins.
 
 **Mini App:** create it with `/newapp` in BotFather pointing to `https://<your-domain>/app/`, then set `PUBLIC_URL` and `BOT_APP_SHORT_NAME`.
 

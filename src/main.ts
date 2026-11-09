@@ -53,7 +53,7 @@ for (const [name, model] of [["EXTRACTION_MODEL", config.EXTRACTION_MODEL], ["RE
 }
 
 const anthropic = config.ANTHROPIC_API_KEY ? createAnthropic(config.ANTHROPIC_API_KEY) : undefined;
-const { bot, membership, assistant } = createBot({ sql, config, anthropic });
+const { bot, membership, assistant, onJoined } = createBot({ sql, config, anthropic });
 await bot.init();
 // With sql, owners removed from ADMIN_TG_IDS also lose their owner command menu.
 await registerCommands(bot, config.ADMIN_TG_IDS, sql).catch((error) => console.warn("[bot] could not register commands:", error));
@@ -68,6 +68,7 @@ const app = createApi({
   botToken: config.BOT_TOKEN,
   adminTgIds: config.ADMIN_TG_IDS,
   isMember: (chatId, tgUserId) => membership.isMember(chatId, tgUserId),
+  onJoined,
   webDistDir: config.WEB_DIST_DIR,
   devLogin,
   avatars: new AvatarCache(bot.api, config.BOT_TOKEN),

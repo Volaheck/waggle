@@ -400,8 +400,11 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       }
       return { ok: true, result: true };
     };
+    /** Questions to the owners about accounts seen for the first time go out in the background; tests wait for them. */
+    const offersSent = new WeakMap<object, () => Promise<void>>();
     const makeBot = (admins: number[] = [OWNER]) => {
-      const { bot } = createBot({ sql, config: config(admins) });
+      const { bot, cardOffersIdle } = createBot({ sql, config: config(admins) });
+      offersSent.set(bot, cardOffersIdle);
       bot.botInfo = botInfo as typeof bot.botInfo;
       bot.api.config.use(fakeApi as never);
       return bot;
@@ -834,6 +837,110 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
         await sql`DELETE FROM extraction_runs WHERE id = ${run!.id}`;
         await sql`DELETE FROM app_state WHERE key = ${`consolidation_attempt:${A}`}`;
       }
+    });
+
+    const joins = (chatId: number, user: Record<string, unknown>) => ({
+      update_id: updateId++,
+      chat_member: {
+        chat: { id: chatId, type: "supergroup", title: "Alpha" }, from: user, date: now(),
+        old_chat_member: { status: "left", user }, new_chat_member: { status: "member", user },
+      },
+    });
+
+    const leaves = (chatId: number, user: Record<string, unknown>) => ({
+      update_id: updateId++,
+      chat_member: {
+        chat: { id: chatId, type: "supergroup", title: "Alpha" }, from: user, date: now(),
+        old_chat_member: { status: "member", user }, new_chat_member: { status: "left", user },
+      },
+    });
+    const card = async (name: string, options: { username?: string; message?: number } = {}) => {
+      const [row] = await sql<{ id: number }[]>`INSERT INTO users (username, display_name) VALUES (${options.username ?? null}, ${name}) RETURNING id`;
+      await sql`INSERT INTO members (chat_id, user_id) VALUES (${A}, ${row!.id})`;
+      if (options.message !== undefined) {
+        await saveMessage(sql, {
+          chatId: A, msgId: options.message, userId: row!.id, sentAt: new Date(Date.now() - 2 * 86_400_000), text: "a message from the export",
+          replyToMsgId: null, isForward: false, forwardSource: null, mediaType: null,
+        });
+      }
+      return row!.id;
+    };
+
+    it("asks the owners once whether an account seen for the first time is one of the imported cards, and only an owner links them", async () => {
+      const owner = tg(OWNER, "Owner");
+      const maestroCard = await card("Maestro", { message: 77001 });
+      const ghostCard = await card("Ghost", { username: "ghost_real", message: 77002 });
+      const maestro = { id: 9871, is_bot: false, first_name: "MAESTRO (THE ONE AND ONLY)", username: "maestro_test" };
+      const questions = () => calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === OWNER && String(call.payload.text).includes("for the first time"));
+
+      await bot.handleUpdate(joins(A, maestro) as never);
+      await offersSent.get(bot)!();
+      expect(questions()).toHaveLength(1);
+      const [question] = questions();
+      expect(String(question!.payload.text)).toContain("Looks like the card “Maestro”");
+      const [account] = await sql<{ id: number }[]>`SELECT id FROM users WHERE tg_id = ${maestro.id}`;
+      const link = `cardlink:${key(A)}:${maestroCard}:${account!.id}`;
+      const buttons = JSON.stringify(question!.payload.reply_markup);
+      expect(buttons).toContain(link);
+      expect(buttons).toContain(`cardnone:${account!.id}`);
+      // A card with an @username of its own waits for that account.
+      expect(buttons).not.toContain(`:${ghostCard}:`);
+
+      // Writing, leaving and coming back are no first time.
+      await bot.handleUpdate(inGroup(A, maestro, "hello") as never);
+      await bot.handleUpdate(leaves(A, maestro) as never);
+      await bot.handleUpdate(joins(A, maestro) as never);
+      // Taking over a harmless card by its exact name is no question either.
+      await card("Quill");
+      await bot.handleUpdate(joins(A, { id: 9873, is_bot: false, first_name: "Quill" }) as never);
+      await offersSent.get(bot)!();
+      expect(questions()).toHaveLength(1);
+
+      await bot.handleUpdate(tap(alice, link) as never);
+      expect(answers().at(-1)).toBe("That's up to the bot owner");
+      expect(await sql`SELECT 1 FROM users WHERE id = ${maestroCard}`).toHaveLength(1);
+      await bot.handleUpdate(tap(owner, link) as never);
+      expect(answers().at(-1)).toBe("Linked");
+      expect(await sql`SELECT 1 FROM users WHERE id = ${maestroCard}`).toHaveLength(0);
+      const [moved] = await sql<{ user_id: number }[]>`SELECT user_id FROM messages WHERE chat_id = ${A} AND msg_id = 77001`;
+      expect(moved!.user_id).toBe(account!.id);
+      await bot.handleUpdate(tap(owner, link) as never);
+      expect(answers().at(-1)).toBe("Nothing to link anymore");
+    });
+
+    it("/link joins a card by @username for someone who never wrote, finds look-alike letters, and lets the owner pick among namesakes", async () => {
+      const owner = tg(OWNER, "Owner");
+      const thor = await card("Тор");
+      const moon = await card("Echo 🌙");
+      const sun = await card("Echo ☀️");
+      await card("🌸");
+      await bot.handleUpdate(joins(A, { id: 9872, is_bot: false, first_name: "Gleb", username: "thunder_test" }) as never);
+      const [gleb] = await sql<{ id: number }[]>`SELECT id FROM users WHERE tg_id = 9872`;
+
+      await bot.handleUpdate(inGroup(A, owner, "/link @thunder_test Thor") as never);
+      expect(sent().at(-1)).toContain("No unlinked card called “Thor”");
+      expect(sent().at(-1)).toContain("“Тор”");
+      await bot.handleUpdate(inGroup(A, owner, "/link @thunder_test 🦊") as never);
+      expect(sent().at(-1)).toContain("No unlinked card called “🦊”");
+      await bot.handleUpdate(inGroup(A, owner, "/link @nobody_here Top") as never);
+      expect(sent().at(-1)).toContain("I haven't seen @nobody_here");
+
+      await bot.handleUpdate(inGroup(A, owner, "/link @thunder_test echo") as never);
+      const choice = calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === A).at(-1)!;
+      expect(String(choice.payload.text)).toContain("Several unlinked cards are called “echo”");
+      const choiceButtons = JSON.stringify(choice.payload.reply_markup);
+      expect(choiceButtons).toContain(`cardlink:${key(A)}:${moon}:${gleb!.id}`);
+      expect(choiceButtons).toContain(`cardlink:${key(A)}:${sun}:${gleb!.id}`);
+      await bot.handleUpdate(tap(owner, `cardlink:${key(A)}:${moon}:${gleb!.id}`, { id: A, type: "supergroup", title: "Alpha" }) as never);
+      expect(answers().at(-1)).toBe("Linked");
+      expect(await sql`SELECT 1 FROM users WHERE id = ${moon}`).toHaveLength(0);
+      expect(await sql`SELECT 1 FROM users WHERE id = ${sun}`).toHaveLength(1);
+
+      await bot.handleUpdate(inGroup(A, alice, "/link @thunder_test Top") as never);
+      expect(await sql`SELECT 1 FROM users WHERE id = ${thor}`).toHaveLength(1);
+      await bot.handleUpdate(inGroup(A, owner, "/link @thunder_test Top") as never);
+      expect(sent().at(-1)).toContain("Linked the card “Тор”");
+      expect(await sql`SELECT 1 FROM users WHERE id = ${thor}`).toHaveLength(0);
     });
 
     describe("a group that becomes a supergroup", () => {

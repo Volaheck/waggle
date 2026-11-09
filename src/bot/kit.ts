@@ -3,7 +3,7 @@ import type { InlineKeyboardButton, Message, User as TelegramUser } from "grammy
 import { approvedChats, chatsOfUser, isApproved, setCurrentChat, type Chat } from "../core/chats.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
-import { ensureMember, getPerson, markLeft, resolveUser, type Person, type User } from "../core/users.js";
+import { ensureMember, getPerson, markLeft, resolveAccount, type Person, type User } from "../core/users.js";
 import { clampTelegram } from "./format.js";
 import type { MembershipCache } from "./membership.js";
 
@@ -78,6 +78,8 @@ export interface BotKit {
   pending: PendingInputs;
   membership: MembershipCache;
   identity: (from: TelegramUser, chatId?: number) => Promise<User>;
+  /** Makes the person a member of the chat again; a first time there is reported like a new face in identity(). */
+  join: (chatId: number, user: User) => Promise<void>;
   isPrivate: (ctx: BotContext) => boolean;
   /** Owners are exactly the configured ADMIN_TG_IDS: removing an id revokes everything at the next start. */
   isOwner: (user: User) => boolean;
@@ -102,8 +104,20 @@ export interface BotKit {
   show: (ctx: BotContext, html: string, keyboard?: InlineKeyboard, options?: { edit?: boolean }) => Promise<unknown>;
 }
 
-export function createKit(bot: Bot<BotContext>, sql: Sql, config: Config, membership: MembershipCache): BotKit {
+/**
+ * `onJoined` hears about every account that appears in a chat for the first time — by writing, joining, or being
+ * confirmed as a silent member — so the owners can be asked whether it is someone from the imported history.
+ */
+export function createKit(bot: Bot<BotContext>, sql: Sql, config: Config, membership: MembershipCache, onJoined?: (chatId: number, user: User) => void): BotKit {
   const isPrivate = (ctx: BotContext) => ctx.chat?.type === "private";
+  const identity = async (from: TelegramUser, chatId?: number): Promise<User> => {
+    const { user, joined } = await resolveAccount(sql, from, config.ADMIN_TG_IDS, chatId);
+    if (joined && chatId !== undefined) onJoined?.(chatId, user);
+    return user;
+  };
+  const join = async (chatId: number, user: User): Promise<void> => {
+    if (await ensureMember(sql, chatId, user.id)) onJoined?.(chatId, user);
+  };
   const appUrl = (chatId: number, path: string) =>
     config.PUBLIC_URL ? `${config.PUBLIC_URL.replace(/\/$/, "")}/app/?chat=${encodeChat(chatId)}#${path}` : null;
 
@@ -131,7 +145,7 @@ export function createKit(bot: Bot<BotContext>, sql: Sql, config: Config, member
   };
 
   const memberOf = async (chatId: number, from: TelegramUser): Promise<{ user: User; person: Person } | undefined> => {
-    const user = await resolveUser(sql, from, config.ADMIN_TG_IDS);
+    const user = await identity(from);
     if (!(await isApproved(sql, chatId))) return undefined;
     const state = await membership.status(chatId, from.id);
     if (state === "left") {
@@ -140,7 +154,7 @@ export function createKit(bot: Bot<BotContext>, sql: Sql, config: Config, member
     }
     let person = await getPerson(sql, chatId, user.id);
     if (state === "member" && (!person || person.left_at)) {
-      await ensureMember(sql, chatId, user.id);
+      await join(chatId, user);
       person = await getPerson(sql, chatId, user.id);
     }
     return person && !person.left_at ? { user, person } : undefined;
@@ -152,22 +166,23 @@ export function createKit(bot: Bot<BotContext>, sql: Sql, config: Config, member
     config,
     pending: new PendingInputs(),
     membership,
-    identity: (from, chatId) => resolveUser(sql, from, config.ADMIN_TG_IDS, chatId),
+    identity,
+    join,
     isPrivate,
     isOwner: (user) => user.tg_id !== null && config.ADMIN_TG_IDS.includes(user.tg_id),
     scope: async (ctx) => {
       if (!ctx.from || !ctx.chat) return undefined;
       if (!isPrivate(ctx)) {
-        const user = await resolveUser(sql, ctx.from, config.ADMIN_TG_IDS, ctx.chat.id);
+        const user = await identity(ctx.from, ctx.chat.id);
         const person = await getPerson(sql, ctx.chat.id, user.id);
         return person ? { user, chatId: ctx.chat.id, person } : undefined;
       }
-      const user = await resolveUser(sql, ctx.from, config.ADMIN_TG_IDS);
+      const user = await identity(ctx.from);
       let chats = await chatsOfUser(sql, user.id);
       if (chats.length === 0) {
         // Silent members never wrote, so the bot has no row for them yet — ask Telegram.
         for (const chat of await approvedChats(sql)) {
-          if (await membership.isMember(chat.id, ctx.from.id)) await ensureMember(sql, chat.id, user.id);
+          if (await membership.isMember(chat.id, ctx.from.id)) await join(chat.id, user);
         }
         chats = await chatsOfUser(sql, user.id);
       }
