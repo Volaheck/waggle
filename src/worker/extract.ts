@@ -152,7 +152,7 @@ Rules:
 - note — one sentence, in the chat's language, on what happened ("Mike switched to Atlas to track his habits"). No secrets and nothing personal.
 - project — a slug from the catalog; if the project is new and you added it to projects, the same slug.
 
-5. taglines — a one-line "who is this" (up to 90 characters, no value judgments), only for members who have no tagline yet and about whom there is now enough information.
+5. taglines — a one-line "who is this" (up to 90 characters, no value judgments), only for members who have no tagline yet and about whom there is now enough information: what they do, make or are into. Never write a placeholder that says nothing ("a chat member", "a new member", "quiet so far", "hasn't said much yet") — without real information, leave the member out.
 
 Empty arrays are a normal result when there is nothing new. Write all content in the chat's language; names, slugs, refs, status codes and stack family names follow the rules above.`;
 
