@@ -6,10 +6,15 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: waggle
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задай POSTGRES_PASSWORD в .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: waggle
     volumes:
       - db-data:/var/lib/postgresql/data
+    # A name of its own: when the bot also joins a reverse proxy's network (docker-compose.override.yml),
+    # a plain "db" could resolve to another project's database there.
+    networks:
+      default:
+        aliases: [waggle-db]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U waggle -d waggle"]
       interval: 10s
@@ -22,7 +27,7 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: postgres://waggle:${POSTGRES_PASSWORD}@db:5432/waggle
+      DATABASE_URL: postgres://waggle:${POSTGRES_PASSWORD}@waggle-db:5432/waggle
     depends_on:
       db:
         condition: service_healthy
@@ -41,7 +46,7 @@ services:
     command:
       - |
         while true; do
-          pg_dump -h db -U waggle waggle | gzip > /backups/waggle-$$(date +%F).sql.gz
+          pg_dump -h waggle-db -U waggle waggle | gzip > /backups/waggle-$$(date +%F).sql.gz
           find /backups -name 'waggle-*.sql.gz' -mtime +14 -delete
           sleep 86400
         done
