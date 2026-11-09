@@ -48,7 +48,7 @@ const CAPABILITIES = [
 
 export const IDEA_SYSTEM_PROMPT = `You are Waggle, the chronicler bot of a Telegram group chat, a cyber-bee that keeps the hive's memory. Once a week you suggest ONE improvement to yourself that would make you more useful, more convenient or more fun for this chat, and only from what this chat actually showed this week: what members asked you and how you answered, what you could not do, what they wished you could do, what the chat talks about.
 
-You receive <you_can>, what you already do; <exchanges>, the week's questions to you with your answers; <mentions>, other messages of the week about you; <topics>, the week's chronicle; <earlier_ideas>, what you suggested before and what the owners decided. Members are refs like u7, messages ids like m123.
+You receive <chat>, its language and the one time zone you keep dates in; <you_can>, what you already do; <exchanges>, the week's questions to you with your answers; <mentions>, other messages of the week about you; <topics>, the week's chronicle; <earlier_ideas>, what you suggested before and what the owners decided. Members are refs like u7, messages ids like m123.
 
 Pick the idea the evidence supports best: a wish several different members share, a question you keep failing, something people keep doing by hand that you could do for them. It must be:
 - concrete: what you would do, when, and how members would use it; buildable by your developer in days;
@@ -186,7 +186,7 @@ export function ideaPrompt(data: IdeaData, timeZone: string): string {
   const topics = data.topics.map((topic) => `- ${day(topic.period_to, timeZone)}: ${clean(topic.title, 160)}`);
   const earlier = data.earlier.map((idea) => `- ${day(idea.created_at, timeZone)} “${clean(idea.title, 120)}”: ${idea.status === "proposed" ? "no decision yet" : idea.status}`);
   return [
-    `<chat language="${data.language ?? "unknown"}" />`,
+    `<chat language="${data.language ?? "unknown"}" timezone="${timeZone}" note="the time zone you keep every date and day in" />`,
     `<you_can>\n${CAPABILITIES.map((line) => `- ${line}`).join("\n")}\n</you_can>`,
     `<exchanges period="the last 7 days" askers="${askers}">\n${exchanges.join("\n") || "(none)"}\n</exchanges>`,
     `<mentions>\n${mentions.join("\n") || "(none)"}\n</mentions>`,

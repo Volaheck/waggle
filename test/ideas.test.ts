@@ -157,6 +157,7 @@ describe.skipIf(!DATABASE_URL)("the weekly idea", () => {
     expect(prompt).toContain(`[m${week.digest} `);
     expect(prompt).toContain(`u${week.kit.id}: @waggle_test_bot can you post a digest every evening? → you: I write a digest when asked: /catchup`);
     expect(prompt).toContain('askers="2"');
+    expect(prompt).toContain(`timezone="${TZ}"`);
     expect(prompt).toContain("call me [phone]");
     for (const absent of ["Kit", "Dora", "Quiet", "diary", "912"]) expect(prompt).not.toContain(absent);
     if (outcome.kind !== "idea") return;
