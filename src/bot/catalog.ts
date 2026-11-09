@@ -1,4 +1,5 @@
 import { InlineKeyboard } from "grammy";
+import { memberAliases } from "../core/aliases.js";
 import { visibleFacts, whoKnows } from "../core/facts.js";
 import {
   addUserProject,
@@ -167,11 +168,12 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
         ctx,
         "Couldn't find that member in this chat.",
       ));
-    const [facts, projects] = await Promise.all([
+    const [facts, projects, aliases] = await Promise.all([
       person.opted_out
         ? Promise.resolve([])
         : visibleFacts(sql, scope.chatId, person.id),
       projectsOfUser(sql, scope.chatId, person.id),
+      memberAliases(sql, scope.chatId, person.id),
     ]);
     const keyboard = grid(
       projects
@@ -197,7 +199,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     if (app) keyboard.add(app);
     await kit.show(
       ctx,
-      personCard(person, facts, projects, { compact: !kit.isPrivate(ctx) }),
+      personCard(person, facts, projects, { compact: !kit.isPrivate(ctx), aliases }),
       keyboard,
       { edit },
     );

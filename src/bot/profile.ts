@@ -1,4 +1,5 @@
 import { InlineKeyboard } from "grammy";
+import { memberAliases } from "../core/aliases.js";
 import { chatsOfUser, getChat } from "../core/chats.js";
 import {
   FACT_KIND_LABELS,
@@ -83,18 +84,19 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
 
   async function profileScreen(ctx: BotContext, scope: Scope, edit = false) {
     const { person, chatId, user } = scope;
-    const [facts, projects, hidden, chats] = await Promise.all([
+    const [facts, projects, hidden, chats, aliases] = await Promise.all([
       visibleFacts(sql, chatId, user.id),
       projectsOfUser(sql, chatId, user.id),
       sql<
         { count: number }[]
       >`SELECT count(*)::int AS count FROM facts WHERE chat_id = ${chatId} AND user_id = ${user.id} AND status = 'hidden'`,
       chatsOfUser(sql, user.id),
+      memberAliases(sql, chatId, user.id),
     ]);
     const hiddenCount = hidden[0]?.count ?? 0;
     const chatName = chats.find((chat) => chat.id === chatId)?.title;
     const text = [
-      personCard(person, facts, projects),
+      personCard(person, facts, projects, { aliases }),
       "",
       person.opted_out
         ? "🚫 Data collection about you is off in this chat."
@@ -401,13 +403,14 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     const scope = await kit.scope(ctx);
     if (!scope) return;
     if (kit.isPrivate(ctx)) return profileScreen(ctx, scope);
-    const [facts, projects] = await Promise.all([
+    const [facts, projects, aliases] = await Promise.all([
       visibleFacts(sql, scope.chatId, scope.user.id),
       projectsOfUser(sql, scope.chatId, scope.user.id),
+      memberAliases(sql, scope.chatId, scope.user.id),
     ]);
     await kit.show(
       ctx,
-      personCard(scope.person, facts, projects, { compact: true }),
+      personCard(scope.person, facts, projects, { compact: true, aliases }),
       new InlineKeyboard().url(
         "✏️ Edit in DM",
         `https://t.me/${bot.botInfo.username}?start=${encodeChat(scope.chatId)}_me`,

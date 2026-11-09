@@ -1,6 +1,7 @@
 import { moveAliases } from "./aliases.js";
 import type { Chat, ChatStatus } from "./chats.js";
 import type { Queryable, Sql } from "./db.js";
+import { moveNotes } from "./notes.js";
 import { freeSlug } from "./projects.js";
 
 /**
@@ -52,9 +53,9 @@ async function carryStanding(tx: Queryable, oldChatId: number, newChatId: number
   const carried: ChatStatus | null = old.status === "left" ? (holdsData ? "approved" : null) : old.status;
   if (carried) {
     await tx`
-      INSERT INTO chats (id, title, status, added_by, decided_by, decided_at, monthly_budget_usd, chronicle_paused_at, chronicle_pause_reason, chronicle_resumed_at)
+      INSERT INTO chats (id, title, status, added_by, decided_by, decided_at, monthly_budget_usd, chronicle_paused_at, chronicle_pause_reason, chronicle_resumed_at, interjections)
       VALUES (${newChatId}, ${old.title}, ${carried}, ${old.added_by}, ${old.decided_by}, ${old.decided_at}, ${old.monthly_budget_usd},
-              ${old.chronicle_paused_at}, ${old.chronicle_pause_reason}, ${old.chronicle_resumed_at})
+              ${old.chronicle_paused_at}, ${old.chronicle_pause_reason}, ${old.chronicle_resumed_at}, ${old.interjections})
       ON CONFLICT (id) DO UPDATE SET
         status = CASE WHEN chats.status IN ('pending', 'left') THEN excluded.status ELSE chats.status END,
         decided_by = CASE WHEN chats.status IN ('pending', 'left') THEN excluded.decided_by ELSE chats.decided_by END,
@@ -65,7 +66,9 @@ async function carryStanding(tx: Queryable, oldChatId: number, newChatId: number
         -- A paused chronicler stays paused on the new id until an owner resumes it.
         chronicle_paused_at = coalesce(chats.chronicle_paused_at, excluded.chronicle_paused_at),
         chronicle_pause_reason = coalesce(chats.chronicle_pause_reason, excluded.chronicle_pause_reason),
-        chronicle_resumed_at = greatest(chats.chronicle_resumed_at, excluded.chronicle_resumed_at)`;
+        chronicle_resumed_at = greatest(chats.chronicle_resumed_at, excluded.chronicle_resumed_at),
+        -- An owner who turned the bot's interjections off on either id keeps them off.
+        interjections = chats.interjections AND excluded.interjections`;
   }
   await tx`UPDATE chats SET status = 'left' WHERE id = ${oldChatId}`;
   return carried;
@@ -119,8 +122,9 @@ async function moveChatData(tx: Queryable, from: number, to: number): Promise<Ch
   await tx`DELETE FROM rejected_facts r USING members m WHERE r.chat_id = ${to} AND m.chat_id = ${to} AND m.user_id = r.user_id AND m.opted_out`;
   await tx`UPDATE members SET tagline = NULL, tagline_manual = false WHERE chat_id = ${to} AND opted_out AND tagline IS NOT NULL`;
 
-  // Projects keep their ids, so a project's aliases only change chats.
+  // Projects keep their ids, so a project's aliases only change chats; topics keep theirs too, so do the notes' links to them.
   await moveAliases(tx, from, to);
+  await moveNotes(tx, from, to, (column) => shiftedIds(tx, column));
 
   // A project keeps its id (votes, authors and signals stay attached); a slug the new id already uses gets a suffix.
   const projects = await tx<{ id: number; slug: string }[]>`SELECT id, slug FROM projects WHERE chat_id = ${from} ORDER BY hidden, id`;

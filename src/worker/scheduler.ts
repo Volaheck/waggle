@@ -4,6 +4,7 @@ import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
 import { BudgetExceededError } from "../core/llm.js";
 import { clearExpiredTexts } from "../core/messages.js";
+import { consentObjectionsSince, consentObjectionText } from "../core/notes.js";
 import { messageLink } from "../core/text.js";
 import { isConsolidationDue, nextConsolidationRetryAt, runConsolidation } from "./consolidate.js";
 import { isPassDue, lastSuccessfulRunAt, latestRunId, pendingStats, refusalsAfter, refusalsSince, runExtractionPass, type SkippedRange } from "./extract.js";
@@ -11,7 +12,8 @@ import { isPassDue, lastSuccessfulRunAt, latestRunId, pendingStats, refusalsAfte
 export interface SchedulerOptions {
   sql: Sql;
   anthropic: Anthropic;
-  config: Pick<Config, "EXTRACTION_MODEL" | "MONTHLY_LLM_BUDGET_USD" | "CHAT_MONTHLY_BUDGET_USD" | "EXTRACTION_INTERVAL_HOURS"> & Partial<Pick<Config, "ADMIN_TG_IDS">>;
+  config: Pick<Config, "EXTRACTION_MODEL" | "MONTHLY_LLM_BUDGET_USD" | "CHAT_MONTHLY_BUDGET_USD" | "EXTRACTION_INTERVAL_HOURS"> &
+    Partial<Pick<Config, "ADMIN_TG_IDS" | "DISPLAY_TIMEZONE">>;
   checkEveryMs?: number;
   /** A message to the bot owners; `resumeChatId` adds a button that resumes the chronicler paused in that chat. */
   notifyAdmins: (text: string, offer?: { resumeChatId: number }) => Promise<void>;
@@ -124,6 +126,15 @@ export function createChatProcessor(options: SchedulerOptions, signals?: StopSig
     return true;
   };
 
+  /** Whoever objected in this pass to being recorded is named to the owners, once: a later objection by them repeats nothing. */
+  const reportObjections = async (chat: Chat, title: string, afterRunId: number) => {
+    const [run] = await sql<{ started_at: Date }[]>`SELECT started_at FROM extraction_runs WHERE chat_id = ${chat.id} AND id > ${afterRunId} ORDER BY id LIMIT 1`;
+    if (!run) return;
+    const objectors = await consentObjectionsSince(sql, chat.id, run.started_at);
+    if (objectors.length === 0) return;
+    await options.notifyAdmins(consentObjectionText(objectors, title)).catch((error) => log(`[extract] could not notify admins: ${String(error)}`));
+  };
+
   const reportBudget = (error: BudgetExceededError, title: string) => {
     const where = error.chatId === undefined ? "in all chats" : `in “${title}”`;
     return alertOnce(`budget:${error.chatId ?? "all"}`, `⚠️ ${error.message}. The chronicle and cards ${where} are paused until next month or until you raise the limit.`);
@@ -156,8 +167,11 @@ export function createChatProcessor(options: SchedulerOptions, signals?: StopSig
           endUserId: options.endUserIdOf?.(chat.id),
         });
         log(
-          `[extract] ${title}: ${result.messages} messages in ${result.calls} call(s): ${result.topics} topics, facts +${result.factsAdded} ↑${result.factsReinforced} ✎${result.factsUpdated}, projects +${result.projectsCreated} ~${result.projectsUpdated}`,
+          `[extract] ${title}: ${result.messages} messages in ${result.calls} call(s): ${result.topics} topics, facts +${result.factsAdded} ↑${result.factsReinforced} ✎${result.factsUpdated}, projects +${result.projectsCreated} ~${result.projectsUpdated}; notes ${result.notes}, aliases +${result.aliases} in ${result.notesCalls} call(s)`,
         );
+        if (result.notesFailures.length) {
+          log(`[extract] ${title}: the notes call failed for ${result.notesFailures.map((failure) => `${failure.firstMsgId}–${failure.lastMsgId} (${failure.reason})`).join("; ")}`);
+        }
         if (result.skipped.length) {
           const ranges = result.skipped.map((range) => `${range.firstMsgId}–${range.lastMsgId} (${range.reason})`).join("; ");
           log(`[extract] ${title}: skipped messages ${ranges}`);
@@ -183,6 +197,7 @@ export function createChatProcessor(options: SchedulerOptions, signals?: StopSig
     if (passAfterRunId !== null) {
       const afterRunId = passAfterRunId;
       paused = (await reviewRefusals(chat, title, afterRunId).catch((error) => (log(`[extract] ${title}: could not review refusals: ${String(error)}`), false))) || paused;
+      await reportObjections(chat, title, afterRunId).catch((error) => log(`[extract] ${title}: could not report objections: ${String(error)}`));
     }
 
     try {

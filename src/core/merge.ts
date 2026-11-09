@@ -1,4 +1,5 @@
 import type { Sql } from "./db.js";
+import { moveNotesToUser } from "./notes.js";
 import { nameKey } from "./text.js";
 import type { User } from "./users.js";
 
@@ -112,6 +113,7 @@ export async function mergeSeedUser(sql: Sql, seedUserId: number, intoUserId: nu
       DELETE FROM project_signals s USING projects p, members m
       WHERE s.project_id = p.id AND p.chat_id = m.chat_id AND m.user_id = ${intoUserId} AND m.opted_out AND s.user_id = ${intoUserId}`;
     await tx`DELETE FROM aliases a USING members m WHERE m.user_id = ${intoUserId} AND m.opted_out AND a.chat_id = m.chat_id AND a.user_id = ${intoUserId}`;
+    await moveNotesToUser(tx, seedUserId, intoUserId);
     // Aliases the account already had are left on the card, and deleting the card deletes those copies.
     await tx`DELETE FROM users WHERE id = ${seedUserId}`;
     if (seed.username) {

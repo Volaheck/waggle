@@ -12,7 +12,7 @@ export const STATUS_EMOJI: Record<ProjectStatus, string> = {
   abandoned: "🪦",
 };
 
-const TOPIC_EMOJI: Record<ChronicleEntry["kind"], string> = { discussion: "💬", project: "🛠", link: "🔗", news: "📰" };
+const TOPIC_EMOJI: Record<ChronicleEntry["kind"], string> = { discussion: "💬", project: "🛠", link: "🔗", news: "📰", debate: "⚔️" };
 
 const SIGNAL_EMOJI: Record<string, string> = { praise: "❤️", critique: "🧐", usage: "✅", contribution: "🤝", interest: "👀", milestone: "🚀" };
 
@@ -46,13 +46,19 @@ export function userHeader(user: Pick<User, "display_name" | "username">): strin
   return `<b>${escapeHtml(user.display_name)}</b>${user.username ? ` @${escapeHtml(user.username)}` : ""}`;
 }
 
-export function personCard(user: Pick<Person, "display_name" | "username" | "tagline" | "opted_out">, facts: Fact[], projects: Project[], options: { compact?: boolean } = {}): string {
+export function personCard(
+  user: Pick<Person, "display_name" | "username" | "tagline" | "opted_out">,
+  facts: Fact[],
+  projects: Project[],
+  options: { compact?: boolean; aliases?: string[] } = {},
+): string {
   const lines = [userHeader(user)];
   if (user.opted_out) {
     lines.push("<i>Opted out of data collection.</i>");
     return lines.join("\n");
   }
   if (user.tagline) lines.push(`<i>${escapeHtml(user.tagline)}</i>`);
+  if (options.aliases?.length) lines.push(`Known here as: ${options.aliases.map(escapeHtml).join(", ")}`);
   const grouped = groupFacts(facts.filter((fact) => fact.kind !== "project"));
   const limit = options.compact ? 4 : 12;
   for (const [kind, items] of grouped) {

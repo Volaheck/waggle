@@ -877,6 +877,8 @@ function groupFacts(facts: Fact[]): [string, Fact[]][] {
 interface PersonResponse {
   person: PersonSummary;
   facts: Fact[];
+  /** What the chat calls them, set by them, an owner or the chronicler. */
+  aliases?: string[];
   projects: Project[];
   messages_30d: number;
   is_me?: boolean;
@@ -924,6 +926,11 @@ function PersonScreen({ id, go }: { id: string; go: Go }) {
             )}
           </div>
         </div>
+        {data.aliases && data.aliases.length > 0 && (
+          <p className="hero-aliases" lang={langOf(data.aliases.join(" "))}>
+            Known here as {data.aliases.join(", ")}
+          </p>
+        )}
         {person.tagline && (
           <p className="hero-text" lang={langOf(person.tagline)}>
             {person.tagline}
@@ -1713,8 +1720,14 @@ function ProjectEditor({ project, viewer, onDirty, onSaved, onDeleted, onMerged 
 
 // ---------- chronicle ----------
 
-const KIND_LABEL: Record<ChronicleEntry["kind"], string> = { discussion: "discussion", project: "project", link: "link", news: "news" };
-const KIND_TONE: Record<ChronicleEntry["kind"], string> = { project: "var(--neon-ink)", discussion: "var(--tg)", link: "var(--green)", news: "var(--muted)" };
+const KIND_LABEL: Record<ChronicleEntry["kind"], string> = { discussion: "discussion", project: "project", link: "link", news: "news", debate: "debate" };
+const KIND_TONE: Record<ChronicleEntry["kind"], string> = {
+  project: "var(--neon-ink)",
+  discussion: "var(--tg)",
+  link: "var(--green)",
+  news: "var(--muted)",
+  debate: "var(--danger-ink)",
+};
 
 function ChronicleCard({ entry, index, compact }: { entry: ChronicleEntry; index: number; compact: boolean }) {
   const url = entry.url;

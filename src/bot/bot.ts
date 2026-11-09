@@ -19,6 +19,7 @@ import { registerAliases } from "./aliases.js";
 import { createAssistant, isAddressedToBot, PREMIUM_REPLY_PURPOSE, repliesSpendUsd, type Assistant, type AssistantDeps } from "./assistant.js";
 import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
 import { isInChat, MembershipCache } from "./membership.js";
+import { registerNotes } from "./notes.js";
 import { outgoingLog } from "./outgoing.js";
 import { registerProfile } from "./profile.js";
 
@@ -542,6 +543,7 @@ export function createBot(deps: BotDeps): {
   const profile = registerProfile(kit);
   const catalog = registerCatalog(kit);
   registerAliases(kit);
+  registerNotes(kit);
 
   // ---------- Switching chats in DM ----------
 
@@ -679,13 +681,14 @@ export function createBot(deps: BotDeps): {
     for (const chat of await approvedChats(sql)) {
       const [last] = await sql<{ at: Date | null; status: string; error: string | null; messages_count: number }[]>`
         SELECT finished_at AS at, status, error, messages_count FROM extraction_runs WHERE chat_id = ${chat.id} ORDER BY id DESC LIMIT 1`;
-      const [counts] = await sql<{ members: number; facts: number; projects: number; messages: number; pending: number; topics: number; unlinked: string[] | null }[]>`
+      const [counts] = await sql<{ members: number; facts: number; projects: number; messages: number; pending: number; topics: number; notes: number; unlinked: string[] | null }[]>`
         SELECT (SELECT count(*)::int FROM members WHERE chat_id = ${chat.id} AND left_at IS NULL) AS members,
                (SELECT count(*)::int FROM facts WHERE chat_id = ${chat.id} AND status IN ('auto', 'manual')) AS facts,
                (SELECT count(*)::int FROM projects WHERE chat_id = ${chat.id} AND NOT hidden) AS projects,
                (SELECT count(*)::int FROM messages WHERE chat_id = ${chat.id} AND NOT from_bot) AS messages,
                (SELECT count(*)::int FROM messages WHERE chat_id = ${chat.id} AND NOT from_bot AND extracted_at IS NULL) AS pending,
                (SELECT count(*)::int FROM chronicle WHERE chat_id = ${chat.id}) AS topics,
+               (SELECT count(*)::int FROM notes WHERE chat_id = ${chat.id} AND superseded_by IS NULL) AS notes,
                (SELECT array_agg(u.display_name ORDER BY u.display_name) FROM users u JOIN members m ON m.user_id = u.id
                 WHERE m.chat_id = ${chat.id} AND u.tg_id IS NULL) AS unlinked`;
       const spent = await monthSpendUsd(sql, chat.id);
@@ -710,7 +713,7 @@ export function createBot(deps: BotDeps): {
           later(passRetry) ? `The chronicler failed; next attempt ${later(passRetry)}` : "",
           later(cleanupRetry) ? `⚠️ The weekly card clean-up failed; next attempt ${later(cleanupRetry)}` : "",
           skipped?.messages ? `⚠️ Skipped in the last 30 days: ${countOf(skipped.messages, "message")} the chronicler could not process` : "",
-          `Members: ${counts?.members}, facts: ${counts?.facts}, projects: ${counts?.projects}, topics: ${counts?.topics}`,
+          `Members: ${counts?.members}, facts: ${counts?.facts}, projects: ${counts?.projects}, topics: ${counts?.topics}, private notes: ${counts?.notes} (/notes)`,
           counts?.unlinked?.length
             ? `Unlinked cards: ${counts.unlinked.map(escapeHtml).join(", ")} — /link @username Name in the chat, or /link Name as a reply to the person`
             : "All cards are linked",
@@ -774,6 +777,7 @@ const OWNER_COMMANDS = [
   ...PRIVATE_COMMANDS,
   { command: "chats", description: "Bot's chats: approve, attach import" },
   { command: "botstatus", description: "Chronicler status and budget" },
+  { command: "notes", description: "Private notes the bot keeps (owners only)" },
 ];
 
 /**

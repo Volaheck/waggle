@@ -18,17 +18,19 @@ CREATE TABLE aliases (
 );
 CREATE UNIQUE INDEX aliases_unique ON aliases (chat_id, alias_norm, coalesce(user_id, 0), coalesce(project_id, 0));
 
--- What only the bot and its owners see: corrections, claims with their status, stances and running jokes (bits).
--- user_id is the person a note is about (NULL for a chat-wide bit); user_ids lists everyone involved.
+-- What only the bot and its owners see: corrections, claims and predictions with their status, stances, running jokes
+-- (bits), bouts with the bot, bait aimed at it and what members say about it. user_id is the person a note is about
+-- (NULL for a chat-wide bit); user_ids lists everyone involved. due_at is when a prediction or a promise can be checked.
 CREATE TABLE notes (
   id             serial PRIMARY KEY,
   chat_id        bigint NOT NULL,
   user_id        integer REFERENCES users(id) ON DELETE CASCADE,
-  kind           text NOT NULL CHECK (kind IN ('correction', 'claim', 'stance', 'bit')),
+  kind           text NOT NULL CHECK (kind IN ('correction', 'claim', 'stance', 'bit', 'bout', 'bait', 'about_bot', 'prediction')),
   about          text,
   value          text NOT NULL,
   value_norm     text NOT NULL,
-  status         text CHECK (status IN ('open', 'done', 'dropped')),
+  status         text CHECK (status IN ('open', 'done', 'dropped', 'right', 'wrong')),
+  due_at         date,
   user_ids       integer[] NOT NULL DEFAULT '{}',
   topic_id       integer REFERENCES chronicle(id) ON DELETE SET NULL,
   confidence     real NOT NULL,
@@ -43,12 +45,10 @@ CREATE INDEX notes_chat_user ON notes (chat_id, user_id);
 CREATE INDEX notes_tsv ON notes USING gin (tsv);
 CREATE UNIQUE INDEX notes_unique_value ON notes (chat_id, coalesce(user_id, 0), kind, value_norm);
 
--- A debate is a chronicle topic of its own kind; its temperature (1–5) is computed from the messages, not by the model.
+-- A debate is a chronicle topic of its own kind: who took which side and how it ended.
 ALTER TABLE chronicle
   DROP CONSTRAINT chronicle_kind_check,
-  ADD CONSTRAINT chronicle_kind_check CHECK (kind IN ('discussion', 'project', 'link', 'news', 'debate')),
-  ADD COLUMN temperature smallint,
-  ADD CONSTRAINT chronicle_temperature_check CHECK (temperature IS NULL OR (kind = 'debate' AND temperature BETWEEN 1 AND 5));
+  ADD CONSTRAINT chronicle_kind_check CHECK (kind IN ('discussion', 'project', 'link', 'news', 'debate'));
 
 -- The bot may speak up uninvited when a recurring argument flares up again; an owner turns that off per chat.
 ALTER TABLE chats ADD COLUMN interjections boolean NOT NULL DEFAULT true;

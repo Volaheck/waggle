@@ -386,6 +386,7 @@ select.input { appearance: none; -webkit-appearance: none; padding-right: 38px; 
 
 .hero-name { margin: 0 0 4px; font-size: 24px; font-weight: 800; letter-spacing: -.02em; line-height: 1.1; overflow-wrap: anywhere; }
 .hero-text { margin: 12px 0 0; font-size: 15px; line-height: 1.5; overflow-wrap: anywhere; }
+.hero-aliases { margin: 10px 0 0; font-size: 13.5px; line-height: 1.45; color: var(--muted); overflow-wrap: anywhere; }
 .hero-edit { margin-top: 14px; }
 .hero-top { display: flex; align-items: flex-start; gap: 14px; }
 .hero-top .badge { margin-top: 6px; }

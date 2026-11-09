@@ -21,19 +21,25 @@ const FORBIDDEN_STEMS = [
   "девушк", "развод", "отношени", "свидани", "секс", "женат", "неженат", "замуж",
   "адрес", "улиц", "квартир", "прописк",
   "религи", "национальн", "ориентац", "гражданств", "паспорт", "внж", "вид на жительств",
+  "лесби", "бисексуал", "трансгендер", "миллиардер", "яхт",
   "politic", "putin", "zelensk", "mobiliz", "mobilis", "sanction",
   "illness", "disease", "diagnosis", "diagnosed", "medicat", "depression", "depressed", "therap", "hospital", "pregnan", "mental health",
   "suicid", "insomni", "funeral",
-  "salar", "mortgage",
-  "girlfriend", "boyfriend", "divorc", "sexual",
+  "salar", "mortgage", "billionaire", "yacht",
+  "girlfriend", "boyfriend", "divorc", "sexual", "lesbian", "bisexual", "transgender",
   "home address", "apartment",
   "religio", "nationalit", "ethnic", "citizenship",
 ];
 
-/** Short words that are forbidden only as whole words («долг», but not «долгие»; «tax», but not «taxi»). */
+/**
+ * Short words that are forbidden only as whole words («долг», but not «долгие»; «tax», but not «taxi»; «гей», but not
+ * «гейм» or «гейминг»).
+ */
 const FORBIDDEN_WORDS = [
   "долг", "долги", "долгов", "жена", "жены", "жене", "муж", "мужа", "мужем", "зп",
+  "гей", "геи", "гея", "гею", "геем", "геев", "геям", "лгбт", "лгбтк",
   "war", "wars", "trump", "tax", "taxes", "loan", "loans", "wife", "wives", "husband", "husbands", "sex",
+  "gay", "gays", "lgbt", "lgbtq",
 ];
 
 /**

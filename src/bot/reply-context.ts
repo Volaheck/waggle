@@ -2,6 +2,7 @@ import type { Message, User as TelegramUser, UserFromGetMe } from "grammy/types"
 import { ambiguousNames, chatAliases, nameForms, namedIn, type Named, type NamedAlias } from "../core/aliases.js";
 import type { Sql } from "../core/db.js";
 import { FACT_KINDS, MIN_VISIBLE_CONFIDENCE } from "../core/facts.js";
+import { CONSENT, type NoteKind, type NoteStatus } from "../core/notes.js";
 import { maskPersonalData } from "../core/privacy.js";
 import {
   ABANDONED_MULTIPLIER,
@@ -14,6 +15,7 @@ import {
   type RatingBreakdown,
 } from "../core/projects.js";
 import { slugify, transliterateName, truncate } from "../core/text.js";
+import { recurringThemes, type Theme } from "../core/themes.js";
 import { peopleOfChat, SERVICE_TG_IDS, type Person } from "../core/users.js";
 import { skippedMessageIds } from "../worker/extract.js";
 import { realReply } from "./kit.js";
@@ -60,16 +62,26 @@ const MAX_PROJECTS = 60;
 const MESSAGE_CHARS = 500;
 const THREAD_HOPS = 12;
 const THREAD_CHARS = 400;
-/** A conversation to referee runs back to the last pause this long, and is quoted in shorter lines. */
+/** The conversation a question is about runs back to the last pause this long, and is quoted in shorter lines. */
 const SEGMENT_PAUSE_MS = 25 * 60_000;
 const SEGMENT_MESSAGES = 120;
 const SEGMENT_CHARS = 250;
 const FOCUS_PEOPLE = 5;
-/** About 400 tokens a person. */
-const FOCUS_CHARS = 1400;
+/** About 500 tokens a person, private notes included. */
+const FOCUS_CHARS = 1800;
 const FOCUS_EXCHANGES = 3;
 const FOCUS_TOPICS = 5;
 const FOCUS_TOPIC_DAYS = 60;
+/** How many of a person's private notes of each kind the focus shows, newest first. */
+const FOCUS_NOTES: Partial<Record<NoteKind, number>> = { claim: 4, prediction: 3, stance: 4, correction: 3, bout: 3, bait: 2, about_bot: 2 };
+const FOCUS_JOKES = 4;
+const FOCUS_THEMES = 3;
+const THEME_DATES = 5;
+/** A claim or a prediction settled this recently still shows. */
+const CLOSED_NOTE_DAYS = 30;
+const RUNNING_JOKES = 6;
+const CORRECTIONS = 6;
+const SAID_ABOUT_YOU = 5;
 const DETAIL_PROJECTS = 3;
 const DETAIL_SIGNALS_PER_KIND = 4;
 const AMBIGUOUS_NAMES = 10;
@@ -93,11 +105,24 @@ export function questionText(message: Message, me: UserFromGetMe): string {
   return withoutMention(message.text ?? message.caption ?? "", me);
 }
 
-const REFEREE = /рассуди(?:те)?(?!\p{L})|кто\s+(?:\S+\s+){0,2}прав(?:а|ы)?(?!\p{L})|кто из нас|о ч[её]м (?:\S+ )?спор|что за спор|разреши(?:те)? (?:\S+ )?спор|кто выиграл|who(?:'s| is) right|settle (?:this|it)|what are (?:they|you|we) arguing about/iu;
+const CONVERSATION = new RegExp(
+  [
+    String.raw`(?<!\p{L})(?:диалог|разговор|разговарива|спор(?!т)|обсужд|перепалк|ветк)`,
+    String.raw`(?<!\p{L})(?:речь|тред(?:а|е|у|ом|ы|ов)?|рассуди(?:те)?)(?!\p{L})`,
+    String.raw`(?<!\p{L})(?:что тут|о ч[её]м вы|мы тут|кто из нас|кто выиграл|запиши(?:те)? это)`,
+    String.raw`(?<!\p{L})кто\s+(?:\S+\s+){0,2}прав(?:а|ы)?(?!\p{L})`,
+    String.raw`\b(?:dialog(?:ue)?s?|conversations?|argu(?:e|ing|ments?)|debat(?:es?|ing)|discuss(?:ions?|ing)?|threads?|who(?:'s| is) right|settle (?:this|it))\b`,
+    String.raw`\bwhat(?:'s| is) going on\b|\bwhat are (?:they|you|we)(?: guys)? (?:talking|arguing) about\b|\bwrite (?:this|that) down\b`,
+  ].join("|"),
+  "iu",
+);
 
-/** «Рассуди», «кто прав», «о чём спор», "settle this": the member wants the bot to referee the conversation under way. */
-export function asksToReferee(text: string): boolean {
-  return REFEREE.test(text);
+/**
+ * The question is about the conversation under way — «запиши этот диалог», «о чём речь ведёте», «рассуди», «кто прав»,
+ * "who is right": the bot then reads all of it.
+ */
+export function refersToConversation(text: string): boolean {
+  return CONVERSATION.test(text);
 }
 
 const RATING_WORDS = /(?<!\p{L})(?:рейтинг|балл|очк|голос|топ(?:е|а|у|ом)?(?!\p{L})|rating|score|points?(?!\p{L})|vot(?:e|es|ed|ing)(?!\p{L}))/iu;
@@ -235,12 +260,30 @@ interface FocusTopic {
 
 type FocusReason = "asking" | "replied to" | "named";
 
+/** A current private note; what someone objected to (consent) never comes into an answer. */
+interface ContextNote {
+  id: number;
+  user_id: number | null;
+  kind: NoteKind;
+  about: string | null;
+  value: string;
+  status: NoteStatus | null;
+  due_at: Date | null;
+  user_ids: number[];
+  said_at: Date;
+}
+
+const NOTE_COLUMNS = "id, user_id, kind, about, value, status, due_at, user_ids, coalesce(said_at, created_at) AS said_at";
+
+const quoted = (note: ContextNote, max = 120) => `“${line(note.value, max)}”`;
+
 function aboutYouBlock(input: {
   me: UserFromGetMe;
   model: string;
   owners: { id: number; display_name: string; username: string | null }[];
   aliasesOf: Map<number, NamedAlias[]>;
   catalogEntry: { project: ProjectListItem; rank: number; total: number } | undefined;
+  saidAboutYou: string[];
 }): string {
   const { me } = input;
   const owners = input.owners.map((owner) => {
@@ -256,10 +299,68 @@ function aboutYouBlock(input: {
     entry
       ? `In the catalog you are the project ${safe(entry.project.name)}: #${entry.rank} of ${entry.total}, ${entry.project.score} rating points, ${entry.project.votes} vote(s).`
       : "",
+    input.saidAboutYou.length ? `What members say about you: ${input.saidAboutYou.join("; ")}.` : "",
     "</about_you>",
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+/** The people in a note, by name: those who are not members any more are left out. */
+function namesIn(ids: number[], names: Map<number, string>): string[] {
+  return ids.flatMap((id) => (names.has(id) ? [safe(names.get(id)!)] : []));
+}
+
+function runningJokesBlock(jokes: ContextNote[], names: Map<number, string>, clock: Clock): string {
+  const lines = jokes.map((joke) => {
+    const people = namesIn(joke.user_ids, names);
+    return `- ${joke.about ? `${line(joke.about, 60)}: ` : ""}${quoted(joke, 160)} (${[people.join(", "), dateLabel(joke.said_at, clock)].filter(Boolean).join("; ")})`;
+  });
+  return lines.length ? `<running_jokes note="the chat's running jokes with their latest twist, newest first">\n${lines.join("\n")}\n</running_jokes>` : "";
+}
+
+function correctionsBlock(corrections: ContextNote[], names: Map<number, string>, clock: Clock): string {
+  const lines = corrections.map((note) => {
+    const about = note.user_id !== null && names.has(note.user_id) ? `about ${safe(names.get(note.user_id)!)}: ` : "";
+    return `- ${about}${quoted(note, 160)} (${dateLabel(note.said_at, clock)})`;
+  });
+  return lines.length ? `<corrections note="what people corrected; it overrides the cards and the chronicle">\n${lines.join("\n")}\n</corrections>` : "";
+}
+
+/** A person's private notes in the focus, one line a kind, each item dated. */
+function privateLines(input: { person: Person; notes: ContextNote[]; jokes: ContextNote[]; themes: Theme[]; names: Map<number, string>; clock: Clock }): string[] {
+  const { person, clock } = input;
+  const of = (kind: NoteKind) => input.notes.filter((note) => note.kind === kind).slice(0, FOCUS_NOTES[kind] ?? 0);
+  const dated = (note: ContextNote, extra: string[] = []) => `${quoted(note)} (${[...extra, dateLabel(note.said_at, clock)].filter(Boolean).join("; ")})`;
+  const status = (note: ContextNote, due: string) =>
+    [note.status, note.due_at && note.status === "open" ? `${due} ${dateLabel(note.due_at, clock)}` : ""].filter(Boolean).join(", ");
+  const item = (label: string, values: string[]) => (values.length ? [`  🔒 ${label}: ${values.join("; ")}`] : []);
+
+  const jokes = input.jokes.filter((joke) => joke.user_ids.includes(person.id)).slice(0, FOCUS_JOKES);
+  const recurring = input.themes
+    .filter((theme) => theme.kind === "debate")
+    .flatMap((theme) => {
+      const own = theme.topics.filter((topic) => topic.user_ids.includes(person.id));
+      if (own.length < 2) return [];
+      const counts = new Map<number, number>();
+      for (const id of own.flatMap((topic) => topic.user_ids)) if (id !== person.id) counts.set(id, (counts.get(id) ?? 0) + 1);
+      const others = namesIn([...counts].sort((a, b) => b[1] - a[1]).slice(0, 2).map(([id]) => id), input.names);
+      const dates = own.slice(-THEME_DATES).map((topic) => dateLabel(topic.period_to, clock));
+      return [`${others.length ? `with ${others.join(" and ")} ` : ""}about “${line(theme.title, 80)}”: ${own.length} times, ${dates.join(", ")}`];
+    })
+    .slice(0, FOCUS_THEMES);
+
+  return [
+    ...item("claims", of("claim").map((note) => dated(note, [status(note, "due")]))),
+    ...item("predictions", of("prediction").map((note) => dated(note, [status(note, "check")]))),
+    ...item("stances", of("stance").map((note) => `${note.about ? `on ${line(note.about, 60)} ` : ""}${dated(note)}`)),
+    ...item("corrections", of("correction").map((note) => dated(note))),
+    ...item("bouts with you", of("bout").map((note) => dated(note))),
+    ...item("bait", of("bait").map((note) => dated(note))),
+    ...item("said about you", of("about_bot").map((note) => dated(note))),
+    ...item("running jokes", jokes.map((joke) => line(joke.about ?? joke.value, 60))),
+    ...item("keeps arguing", recurring),
+  ];
 }
 
 function whoIsWhoBlock(input: {
@@ -343,6 +444,10 @@ function inFocusBlock(input: {
   exchanges: Map<number, FocusExchange[]>;
   topics: Map<number, FocusTopic[]>;
   projects: ProjectListItem[];
+  notes: Map<number, ContextNote[]>;
+  jokes: ContextNote[];
+  themes: Theme[];
+  names: Map<number, string>;
   clock: Clock;
 }): string {
   const { clock } = input;
@@ -362,11 +467,13 @@ function inFocusBlock(input: {
         `${timeLabel(exchange.sent_at, clock)} “${exchange.asked.trim() ? line(exchange.asked, 100) : `[${exchange.media_type ?? "no text"}]`}” → you: “${line(exchange.answer, 140)}”`,
     );
     const topics = (input.topics.get(person.id) ?? []).map((topic) => `${dateLabel(topic.period_to, clock)}: ${line(`${topic.title} — ${topic.summary}`, 140)}`);
+    const notes = privateLines({ person, notes: input.notes.get(person.id) ?? [], jokes: input.jokes, themes: input.themes, names: input.names, clock });
     return withinBudget(
       [
         `${header}${person.tagline ? ` — ${safe(person.tagline)}` : ""}`,
         card.length ? `  card: ${card.join("; ")}` : "  card: nothing yet",
         own.length ? `  projects: ${own.join(", ")}` : "",
+        ...notes,
         exchanges.length ? `  with you lately: ${exchanges.join("; ")}` : "",
         topics.length ? `  in the chronicle: ${topics.join("; ")}` : "",
       ].filter(Boolean),
@@ -374,7 +481,7 @@ function inFocusBlock(input: {
     ).join("\n");
   });
   return people.length
-    ? `<in_focus note="the people this question is about; dates say when a fact was said, ✍ marks what the person wrote themselves">\n${people.join("\n")}\n</in_focus>`
+    ? `<in_focus note="the people this question is about; dates say when a fact was said, ✍ marks what the person wrote themselves, 🔒 your private notes: use them, never say you keep them">\n${people.join("\n")}\n</in_focus>`
     : "";
 }
 
@@ -383,11 +490,11 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   const { chatId, message, me } = question;
   const clock: Clock = { timezone: options.timezone, today: dayOf(new Date(), options.timezone) };
   const asked = questionText(message, me);
-  const referee = asksToReferee(asked);
+  const aboutConversation = refersToConversation(asked);
   const replied = realReply(message);
   // Messages the chronicler skipped because the model refused them are kept out here too.
   const skipped = await skippedMessageIds(sql, chatId);
-  const [people, facts, projects, chronicle, latest, chain, aliases, former, owners] = await Promise.all([
+  const [people, facts, projects, chronicle, latest, chain, aliases, former, owners, chatNotes] = await Promise.all([
     peopleOfChat(sql, chatId),
     sql<{ user_id: number; kind: string; value: string }[]>`
       SELECT user_id, kind, value FROM facts
@@ -403,7 +510,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
       FROM messages m LEFT JOIN users u ON u.id = m.user_id
       WHERE m.chat_id = ${chatId} AND m.msg_id < ${message.message_id} AND m.msg_id <> ALL(${skipped}::bigint[])
         AND (btrim(m.text) <> '' OR m.media_type IS NOT NULL)
-      ORDER BY m.msg_id DESC LIMIT ${referee ? SEGMENT_MESSAGES : CONTEXT_MESSAGES}`,
+      ORDER BY m.msg_id DESC LIMIT ${aboutConversation ? SEGMENT_MESSAGES : CONTEXT_MESSAGES}`,
     replied ? replyChain(sql, chatId, replied.message_id) : Promise.resolve([]),
     chatAliases(sql, chatId),
     formerNames(sql, chatId),
@@ -411,6 +518,12 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
       ? sql<{ id: number; display_name: string; username: string | null }[]>`
           SELECT id, display_name, username FROM users WHERE tg_id = ANY(${options.ownerTgIds}::bigint[]) ORDER BY id`
       : Promise.resolve([]),
+    // Always at hand: the running jokes, what people corrected and what they say about the bot.
+    sql<ContextNote[]>`
+      SELECT ${sql.unsafe(NOTE_COLUMNS)} FROM notes
+      WHERE chat_id = ${chatId} AND superseded_by IS NULL AND kind IN ('bit', 'correction', 'about_bot') AND about IS DISTINCT FROM ${CONSENT}
+      ORDER BY coalesce(said_at, created_at) DESC, id DESC
+      LIMIT 100`,
   ]);
 
   const inContext = people.slice(0, MAX_MEMBERS);
@@ -427,7 +540,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   const shown = (row: ContextMessage) => Boolean(row.text.trim() || row.media_type) && !skipped.includes(row.msg_id);
   const thread = chain.filter(shown);
   const parentStored = replied ? chain.some((row) => row.msg_id === replied.message_id) : false;
-  const conversation = referee ? currentSegment(latest) : [...latest].reverse();
+  const conversation = aboutConversation ? currentSegment(latest) : [...latest].reverse();
 
   // The people this question is about: who asks, whose message it answers, and whoever it or its thread names.
   const named: Named[] = inContext.map((person) => ({
@@ -473,7 +586,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   const answers = options.recentAnswers ?? [];
   const visibleIds = new Set([...conversation, ...thread].map((row) => row.msg_id));
   const answerIds = answers.map((answer) => answer.msgId).filter((id): id is number => id !== undefined);
-  const [focusFacts, exchanges, topics, breakdown, blanked] = await Promise.all([
+  const [focusFacts, exchanges, topics, breakdown, blanked, focusNotes, themes] = await Promise.all([
     focusIds.length
       ? sql<FocusFact[]>`
           SELECT f.user_id, f.kind, f.value, f.status,
@@ -508,6 +621,14 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     answerIds.length
       ? sql<{ msg_id: number }[]>`SELECT msg_id FROM messages WHERE chat_id = ${chatId} AND msg_id = ANY(${answerIds}) AND btrim(text) = ''`
       : Promise.resolve([]),
+    focusIds.length
+      ? sql<ContextNote[]>`
+          SELECT ${sql.unsafe(NOTE_COLUMNS)} FROM notes
+          WHERE chat_id = ${chatId} AND superseded_by IS NULL AND user_id = ANY(${focusIds}) AND kind <> 'bit' AND about IS DISTINCT FROM ${CONSENT}
+            AND (kind NOT IN ('claim', 'prediction') OR status = 'open' OR updated_at > now() - ${`${CLOSED_NOTE_DAYS} days`}::interval)
+          ORDER BY coalesce(said_at, created_at) DESC, id DESC`
+      : Promise.resolve([]),
+    focusIds.length ? recurringThemes(sql, chatId) : Promise.resolve([]),
   ]);
 
   const factsOf = new Map<number, Map<string, string[]>>();
@@ -559,7 +680,17 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   const forgotten = new Set(blanked.map((row) => row.msg_id));
   const earlierAnswers = answers.filter((answer) => answer.msgId === undefined || (!visibleIds.has(answer.msgId) && !forgotten.has(answer.msgId)));
   const askerName = `${question.from.first_name}${question.from.last_name ? ` ${question.from.last_name}` : ""}${question.from.username ? ` (@${question.from.username})` : ""}`;
-  const conversationLines = conversation.map((row) => messageLine(row, clock, referee ? SEGMENT_CHARS : MESSAGE_CHARS));
+  const conversationLines = conversation.map((row) => messageLine(row, clock, aboutConversation ? SEGMENT_CHARS : MESSAGE_CHARS));
+
+  // The focus shows its people's own corrections and words about the bot; the chat-wide lists show everyone else's.
+  const names = new Map(people.filter((person) => !person.opted_out).map((person) => [person.id, person.display_name]));
+  const outOfFocus = (note: ContextNote) => note.user_id === null || !focusIds.includes(note.user_id);
+  const jokes = chatNotes.filter((note) => note.kind === "bit");
+  const corrections = chatNotes.filter((note) => note.kind === "correction" && outOfFocus(note)).slice(0, CORRECTIONS);
+  const saidAboutYou = chatNotes
+    .filter((note) => note.kind === "about_bot" && outOfFocus(note))
+    .slice(0, SAID_ABOUT_YOU)
+    .map((note) => `${quoted(note)} (${[...namesIn(note.user_id === null ? [] : [note.user_id], names), dateLabel(note.said_at, clock)].join(", ")})`);
 
   return [
     `<chat title="${safe(question.chatTitle ?? "").replace(/"/g, "'")}" today="${clock.today}" timezone="${clock.timezone}" />`,
@@ -569,11 +700,14 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
       owners,
       aliasesOf,
       catalogEntry: catalogIndex >= 0 ? { project: projects[catalogIndex]!, rank: catalogIndex + 1, total: projects.length } : undefined,
+      saidAboutYou,
     }),
     `<members>\n${members.join("\n") || "(none yet)"}\n</members>`,
     whoIsWhoBlock({ people: inContext, aliasesOf, projects: projects.slice(0, MAX_PROJECTS), projectAliases, former: formerOf, ambiguous: ambiguousNames(named) }),
+    correctionsBlock(corrections, names, clock),
     `<projects rating="best first">\n${catalog.join("\n") || "(none yet)"}\n</projects>`,
     `<chronicle days="${CHRONICLE_DAYS}" order="newest first">\n${topicsList.join("\n") || "(nothing yet)"}\n</chronicle>`,
+    runningJokesBlock(jokes.slice(0, RUNNING_JOKES), names, clock),
     projectDetailsBlock({ ranked: projects, picked, breakdown, former: formerOf, clock }),
     inFocusBlock({
       focus: focusPeople,
@@ -584,9 +718,13 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
       ),
       topics: groupBy(topics, (topic) => topic.user_id),
       projects,
+      notes: groupBy(focusNotes, (note) => note.user_id!),
+      jokes,
+      themes,
+      names,
       clock,
     }),
-    referee
+    aboutConversation
       ? `<current_conversation note="everything since the last pause of 25 minutes or more, oldest first">\n${conversationLines.join("\n") || "(none)"}\n</current_conversation>`
       : `<recent_messages>\n${conversationLines.join("\n") || "(none)"}\n</recent_messages>`,
     earlierAnswers.length

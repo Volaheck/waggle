@@ -4,6 +4,7 @@ import { relinkForeignTopics } from "./chronicle.js";
 import type { Sql } from "./db.js";
 import { isSameFact } from "./facts.js";
 import { mergeSeedUser } from "./merge.js";
+import { moveNotes } from "./notes.js";
 import { moveProjectAliases, projectForSlug } from "./projects.js";
 import { normalizeUrl } from "./text.js";
 
@@ -23,6 +24,8 @@ export interface Chat {
   chronicle_pause_reason: string | null;
   /** When an owner last resumed it: refusals before that no longer count. */
   chronicle_resumed_at: Date | null;
+  /** Whether the bot may speak up uninvited here; an owner turns it off. */
+  interjections: boolean;
 }
 
 /** Rows imported before multi-chat support carry this chat id until an owner attaches them. */
@@ -141,6 +144,8 @@ export async function attachLegacyData(sql: Sql, chatId: number, actorUserId?: n
       DELETE FROM project_signals s USING projects p, members m
       WHERE s.project_id = p.id AND p.chat_id = ${chatId} AND m.chat_id = ${chatId} AND m.user_id = s.user_id AND m.opted_out`;
     await attachFacts(tx, chatId);
+    // Imported messages keep their ids, and nothing stays about someone who opted out on either side.
+    await moveNotes(tx, LEGACY_CHAT_ID, chatId);
     const topics = (await tx`UPDATE chronicle SET chat_id = ${chatId} WHERE chat_id = ${LEGACY_CHAT_ID}`).count;
     await tx`UPDATE extraction_runs SET chat_id = ${chatId} WHERE chat_id = ${LEGACY_CHAT_ID}`;
     await tx`UPDATE llm_usage SET chat_id = ${chatId} WHERE chat_id = ${LEGACY_CHAT_ID} OR chat_id IS NULL`;

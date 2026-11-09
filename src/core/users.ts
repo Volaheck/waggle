@@ -1,4 +1,5 @@
 import type { Queryable, Sql } from "./db.js";
+import { forgetNotes } from "./notes.js";
 
 /** Telegram's own accounts that post for linked channels, anonymous admins and channel identities: never people. */
 export const SERVICE_TG_IDS = [777000, 1087968824, 136817688];
@@ -180,6 +181,7 @@ async function applyOptOut(tx: Queryable, userId: number, optedOut: boolean, sco
     await tx`DELETE FROM facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     await tx`DELETE FROM rejected_facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     await tx`DELETE FROM aliases WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
+    await forgetNotes(tx, userId, scope);
     // Notes on how the person uses others' projects are shown on those project cards, so they go as well.
     await tx`
       DELETE FROM project_signals s USING projects p

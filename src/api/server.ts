@@ -4,6 +4,7 @@ import path from "node:path";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono, type Context } from "hono";
 import { z } from "zod";
+import { memberAliases } from "../core/aliases.js";
 import type { Sql } from "../core/db.js";
 import { FACT_KINDS, getFact, ownFacts, proposeFact, rejectFact, setFactHidden, visibleFacts } from "../core/facts.js";
 import { addUserProject, canEditProject, getProjectBySlug, hideProject, listProjects, mergeProjects, PROJECT_STATUSES, projectsOfUser, renameProject, setVote, updateProject } from "../core/projects.js";
@@ -272,17 +273,19 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     const chatId = c.get("chatId");
     const person = await getPerson(sql, chatId, Number(c.req.param("id")));
     if (!person) return c.json({ error: "not_found" }, 404);
-    const [facts, projects, stats] = await Promise.all([
+    const [facts, projects, stats, aliases] = await Promise.all([
       person.opted_out ? Promise.resolve([]) : visibleFacts(sql, chatId, person.id),
       projectsOfUser(sql, chatId, person.id),
       sql<{ messages_30d: number }[]>`
         SELECT count(*)::int AS messages_30d FROM messages
         WHERE chat_id = ${chatId} AND user_id = ${person.id} AND sent_at > now() - interval '30 days'`,
+      person.opted_out ? Promise.resolve([]) : memberAliases(sql, chatId, person.id),
     ]);
     const viewer = c.get("user");
     return c.json({
       person: personPayload(person),
       facts: facts.map(withSources(c)),
+      aliases,
       projects,
       messages_30d: stats[0]?.messages_30d ?? 0,
       is_me: viewer.id === person.id,

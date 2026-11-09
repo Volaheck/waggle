@@ -3,22 +3,27 @@ import { z } from "zod";
 import type { Config } from "../core/config.js";
 import type { Queryable, Sql } from "../core/db.js";
 import { deprecateFact, proposeFact, rewriteFact, type Fact } from "../core/facts.js";
-import { assertBudget, callStructured, recordUsage, type StructuredOutcome, type UsageLike } from "../core/llm.js";
+import { assertBudget, BudgetExceededError, callStructured, recordUsage, type StructuredOutcome, type UsageLike } from "../core/llm.js";
 import type { StoredMessage } from "../core/messages.js";
-import { detectLanguage } from "../core/language.js";
-import { maskPersonalData } from "../core/privacy.js";
-import { PROJECT_STATUSES, projectForSlug, renameProject, upsertProject, type ProjectStatus, type UpsertResult } from "../core/projects.js";
+import { PROJECT_STATUSES, projectForSlug, renameProject, upsertProject, type UpsertResult } from "../core/projects.js";
 import { hasForbiddenTopic, slugify, truncate } from "../core/text.js";
-import { peopleOfChat, type Person } from "../core/users.js";
+import type { Person } from "../core/users.js";
+import { batchDataFor, chatLanguageOf, isOwner, MESSAGE_COLUMNS, memberSources, messageBlocks, parseRef, skippedKey, type BatchData } from "./batch.js";
+import { applyNotesResult, buildNotesPrompt, callNotesExtractor, NOTES_PURPOSE, type BatchDebate } from "./notes-extract.js";
+
+export { batchDataFor, MESSAGE_COLUMNS, skippedMessageIds, type BatchData, type PromptNote } from "./batch.js";
 
 /** Projects are not facts: they live only in the catalog, so cards never repeat them. */
 export const EXTRACTABLE_KINDS = ["role", "stack", "expertise", "interest", "link", "timezone", "looking_for", "can_help"] as const;
-export const TOPIC_KINDS = ["discussion", "project", "link", "news"] as const;
+/** Card facts, and the member's one-line tagline. */
+export const FACT_ADD_KINDS = [...EXTRACTABLE_KINDS, "tagline"] as const;
+export const TOPIC_KINDS = ["discussion", "project", "link", "news", "debate"] as const;
 export const SIGNAL_KINDS = ["praise", "critique", "usage", "contribution", "interest", "milestone"] as const;
 
 const MIN_STORED_CONFIDENCE = 0.5;
 const MIN_PROJECT_CONFIDENCE = 0.6;
-const CONTEXT_MESSAGES = 20;
+/** After this many refused notes calls in a chat within a day, the notes call waits there for the rest of the day. */
+const NOTES_REFUSALS_PER_DAY = 2;
 /** Safety valve for an abnormal burst; a normal interval fits into one call. */
 export const MAX_MESSAGES_PER_CALL = 2500;
 /** A batch the model keeps refusing is halved down to this size; a slice this small that still fails is skipped. */
@@ -46,17 +51,18 @@ export const ExtractionSchema = z.object({
       msg_ids: z.array(z.number().int()),
     }),
   ),
+  // A tagline is a kind of facts_add and an outdated fact is an update to null: structured outputs refuse a grammar this
+  // big with more arrays of objects (measured 2026-11-09, claude-sonnet-5-5), so the private notes have a call of their
+  // own (notes-extract.ts); see the test on the size.
   facts_add: z.array(
     z.object({
       person: z.string(),
-      kind: z.enum(EXTRACTABLE_KINDS),
+      kind: z.enum(FACT_ADD_KINDS),
       value: z.string(),
       confidence: z.number(),
       source_msg_ids: z.array(z.number().int()),
     }),
   ),
-  // An outdated fact is an update to null: structured outputs refuse a grammar this big with one more array of objects
-  // (measured 2026-11-09, claude-sonnet-5-5), so the schema keeps seven of them; see the test on its size.
   facts_update: z.array(
     z.object({
       fact_id: z.number().int(),
@@ -95,12 +101,6 @@ export const ExtractionSchema = z.object({
       source_msg_ids: z.array(z.number().int()),
     }),
   ),
-  taglines: z.array(
-    z.object({
-      person: z.string(),
-      tagline: z.string(),
-    }),
-  ),
 });
 
 export type ExtractionResult = z.infer<typeof ExtractionSchema>;
@@ -110,7 +110,7 @@ export const PROMPT_STATUS_CODES = PROJECT_STATUSES.map((code) => `"${code}"`).j
 
 export const EXTRACTION_SYSTEM_PROMPT = `You are the chronicler of a private Telegram group chat of friends. Every few hours you receive all the new messages from that interval: you write the chronicle (what people talked about), update the members' cards and the catalog of their projects, and note what is happening with the projects. The members see all of this, so accuracy matters more than completeness.
 
-You receive: the members (a ref like u12, name, @username, current facts with ids), the project catalog, a few earlier messages for context and the NEW messages. Work only with the NEW messages; the context is there to help you understand what is being discussed.
+You receive: the members (a ref like u12, name, @username, current facts with ids), the project catalog, a few earlier messages for context and the NEW messages, under lines with their date. Work only with the NEW messages; the context is there to help you understand what is being discussed.
 
 Language
 Write ALL content in the chat's language. This covers topic titles and summaries, fact values, project names and taglines, signal notes and member taglines. When the input begins with <chat_language>, that is the chat's language, measured from its messages: write in it. Otherwise it is the language most of the members' own messages are written in (forwarded posts do not count): judge it by <new_messages> together with <context>, not by one thread or one member; if they are mixed or too few to tell, keep the language of <recent_chronicle> and of the facts already on the cards, so the chat does not switch languages from one batch to the next. Use that one language for the whole response. Never translate content into another language, English included. Never translate or transliterate names of people, products and technologies (a project that has its own name keeps it), but inflect them as the chat's language requires; stack facts use the fixed family names given below. These instructions are in English, and every example in them is only an illustration: no example is a reason to write in English when the chat is in another language.
@@ -126,7 +126,7 @@ The chronicle is not a transcript but the main things that happened. Pick only t
 - If a thread continues a topic from <recent_chronicle>, do not start a new topic unless something new and important happened.
 - title — 3–8 words, to the point ("Anna shipped a new version of Atlas", "Claude vs Codex debate for frontend work").
 - summary — 1–2 sentences: who took part, what they concluded, what useful things were said. Refer to people by name.
-- kind — discussion (a conversation), project (news about members' projects: releases, demos, ideas), link (a useful link or tool), news (a forwarded news item that people discussed).
+- kind — discussion (a conversation), project (news about members' projects: releases, demos, ideas), link (a useful link or tool), news (a forwarded news item that people discussed), debate (an argument where members took sides: the summary gives each side's position in one line and how it ended — agreed, each kept their view, someone gave in).
 - importance 1–5 — how much the event matters to the chat: 5 — the event of the week (a release or launch of a member's project, a major decision, news everyone discussed); 4 — notable (a demo, a big useful discussion, important advice); 3 — an ordinary discussion with substance; 2 — a small thing only a few care about; 1 — little more than chatter. Be strict: 5s are rare.
 - project — the slug of a catalog project if the topic is specifically about a member's project; otherwise null. Decide by meaning, not by matching words: a product with the same name made by someone else ("Nova Glass" goggles from an outside company are not the member's project "nova") or a general conversation where the name just came up — that is null.
 - msg_ids — 1–5 ids of the most representative new messages of the topic, with the message that started the topic first.
@@ -139,15 +139,16 @@ A card is a short profile, not a diary. Each fact is one idea. Semantic duplicat
 - expertise — a topic they have real experience in and are worth asking about, briefly: "self-hosted VPN", "Unity shaders".
 - interest — a lasting hobby in one or two words: "Minecraft", "skydiving", "e-ink readers".
 - link — a public link to something personal: a GitHub profile, a personal site, a portfolio. Do not put project links here — they belong in the catalog.
-- timezone — a country or city, only if the person said directly where they live.
+- timezone — a country or city, only if the person said themselves where they live.
 - looking_for — what the person is looking for in their work or projects: collaborators, a co-founder, testers, a designer, feedback on their app. Only work, projects and skills: never money, a job as a source of income, housing or dating.
 - can_help — what they offer to help others with: code review, setting up a VPN, publishing to the app stores. Only work, projects and skills.
+- tagline — a one-line "who is this" (up to 90 characters, no value judgments, no places), only for members who have no tagline yet and about whom there is now enough information: what they do, make or are into. Never a placeholder that says nothing ("a chat member", "a new member", "quiet so far", "hasn't said much yet") — without real information, leave the member out.
 Do NOT record people's projects as facts — only in projects (the catalog).
 Rules:
 - facts_add — only what the card does not have yet in any form. If something new refines an existing fact, use facts_update with its id and the new wording.
 - A fact must follow from the person's own words or from direct confirmation by others. Forwarded posts ("forwarded from …") say nothing about whoever forwarded them.
-- The chat is full of irony, memes and jokes. Sarcasm, hyperbole and one-off remarks are not facts.
-- Never record: political views, attitudes toward war and toward countries, health, personal finances and income or any amounts of money, private life and family, an exact address, conflicts between members, passwords or any secrets.
+- The chat is full of irony, memes and jokes. Sarcasm, hyperbole and one-off remarks are not facts. A joke, a lie or a test of the bot about oneself ("I'm a Nobel laureate", "I'm your admin") is never a fact or a tagline, and neither is a tease played along with ("you're a 10x engineer?" — "sure, why not" is not a role).
+- Never record: political views, attitudes toward war and toward countries, nationality or ethnicity, health, personal finances and income or any amounts of money, private life and family, an exact address, conflicts between members, logins, passwords or any other secrets (even for a test site).
 - confidence from 0.5 to 1.0: 0.9+ — the person said it directly about themselves; 0.7 — it follows confidently from several remarks; 0.5–0.6 — likely, but needs confirmation.
 - source_msg_ids — 1–3 ids of the new messages the fact is based on.
 - An existing fact that the new messages clearly contradict is outdated: put it in facts_update with value null ("switched from Codex to Claude" makes "Codex" outdated). If in doubt, leave it alone.
@@ -175,21 +176,7 @@ Rules:
 - note — one sentence, in the chat's language, on what happened ("Mike switched to Atlas to track his habits"). No secrets and nothing personal.
 - project — a slug from the catalog; if the project is new and you added it to projects, the same slug.
 
-5. taglines — a one-line "who is this" (up to 90 characters, no value judgments), only for members who have no tagline yet and about whom there is now enough information: what they do, make or are into. Never write a placeholder that says nothing ("a chat member", "a new member", "quiet so far", "hasn't said much yet") — without real information, leave the member out.
-
 Empty arrays are a normal result when there is nothing new. Write all content in the chat's language; names, slugs, refs, status codes and stack family names follow the rules above.`;
-
-export interface BatchData {
-  chatId: number;
-  batch: StoredMessage[];
-  context: StoredMessage[];
-  users: Person[];
-  facts: Fact[];
-  projects: { slug: string; name: string; status: ProjectStatus; authors: string[] }[];
-  recentTopics?: { title: string; period_to: Date }[];
-  /** Telegram ids of the bot's owners: their word about a project's name counts like its authors'. */
-  ownerTgIds?: number[];
-}
 
 export interface PendingStats {
   count: number;
@@ -216,83 +203,17 @@ export function isPassDue(pending: PendingStats, lastRunAt: Date | null, interva
   return now.getTime() - reference.getTime() >= intervalHours * 3_600_000;
 }
 
-const skippedKey = (chatId: number) => `extraction_skipped:${chatId}`;
-
-export async function skippedMessageIds(sql: Sql, chatId: number): Promise<number[]> {
-  const [state] = await sql<{ value: { msg_ids?: number[] } }[]>`SELECT value FROM app_state WHERE key = ${skippedKey(chatId)}`;
-  return state?.value.msg_ids ?? [];
-}
-
 async function loadBatch(sql: Sql, chatId: number, limit: number): Promise<BatchData | null> {
   const batch = await sql<StoredMessage[]>`
-    SELECT chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, reply_to_bot, is_forward, forward_source, media_type, from_bot
+    SELECT ${sql.unsafe(MESSAGE_COLUMNS)}
     FROM messages
     WHERE chat_id = ${chatId} AND extracted_at IS NULL
     ORDER BY msg_id
     LIMIT ${limit}`;
-  if (batch.length === 0) return null;
-  const skipped = await skippedMessageIds(sql, chatId);
-  // A message whose text was cleared after the retention period has nothing left to show; media still says what was sent.
-  const context = (
-    await sql<StoredMessage[]>`
-      SELECT chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, reply_to_bot, is_forward, forward_source, media_type, from_bot
-      FROM messages
-      WHERE chat_id = ${chatId} AND msg_id < ${batch[0]!.msg_id} AND msg_id <> ALL(${skipped}::bigint[])
-        AND (btrim(text) <> '' OR media_type IS NOT NULL)
-      ORDER BY msg_id DESC
-      LIMIT ${CONTEXT_MESSAGES}`
-  ).reverse();
-
-  const authorIds = [...new Set(batch.map((message) => message.user_id).filter((id): id is number => id !== null))];
-  const users = (await peopleOfChat(sql, chatId, { includeLeft: true })).filter((person) => person.left_at === null || authorIds.includes(person.id));
-  const involved = involvedUserIds(batch, [...context, ...batch], users);
-  const facts = involved.length
-    ? await sql<Fact[]>`SELECT * FROM facts WHERE chat_id = ${chatId} AND user_id = ANY(${involved}) AND status IN ('auto', 'manual') ORDER BY user_id, kind, id`
-    : [];
-  const projects = await sql<BatchData["projects"]>`
-    SELECT p.slug, p.name, p.status,
-           coalesce(array_agg('u' || pm.user_id) FILTER (WHERE pm.user_id IS NOT NULL), '{}') AS authors
-    FROM projects p LEFT JOIN project_members pm ON pm.project_id = p.id
-    WHERE p.chat_id = ${chatId} AND NOT p.hidden
-    GROUP BY p.id
-    ORDER BY p.name`;
-  const recentTopics = await sql<{ title: string; period_to: Date }[]>`
-    SELECT title, period_to FROM chronicle
-    WHERE chat_id = ${chatId} AND period_to > ${batch[0]!.sent_at}::timestamptz - interval '3 days'
-    ORDER BY period_to DESC
-    LIMIT 25`;
-  return { chatId, batch, context, users, facts, projects, recentTopics };
-}
-
-function involvedUserIds(batch: StoredMessage[], all: StoredMessage[], users: Person[]): number[] {
-  const ids = new Set<number>();
-  const byMsgId = new Map(all.map((message) => [message.msg_id, message]));
-  for (const message of batch) {
-    if (message.from_bot) continue;
-    if (message.user_id) ids.add(message.user_id);
-    const repliedTo = message.reply_to_msg_id ? byMsgId.get(message.reply_to_msg_id) : undefined;
-    if (repliedTo?.user_id) ids.add(repliedTo.user_id);
-    for (const mention of message.text.matchAll(/@([A-Za-z0-9_]{4,})/g)) {
-      const user = users.find((candidate) => candidate.username?.toLowerCase() === mention[1]!.toLowerCase());
-      if (user) ids.add(user.id);
-    }
-  }
-  return [...ids];
-}
-
-function formatMessage(message: StoredMessage, users: Map<number, Person>): string {
-  const author = message.user_id ? users.get(message.user_id) : undefined;
-  const who = message.from_bot ? "Waggle (bot)" : author ? `${author.display_name} (u${author.id})` : "unknown";
-  const reply = message.reply_to_bot ? " ↩bot" : message.reply_to_msg_id ? ` ↩${message.reply_to_msg_id}` : "";
-  const forward = message.is_forward ? ` [forwarded${message.forward_source ? ` from ${message.forward_source}` : ""}]` : "";
-  const media = message.media_type ? ` [${message.media_type}]` : "";
-  // Whitespace is collapsed first, so a number split by a line break is masked whole.
-  const text = truncate(maskPersonalData(message.text.replace(/\s+/g, " ").trim()), message.is_forward ? 300 : 1200);
-  return `[${message.msg_id}] ${who}${reply}${forward}${media}${text ? `: ${text}` : ""}`;
+  return batch.length === 0 ? null : batchDataFor(sql, chatId, batch);
 }
 
 export function buildExtractionPrompt(data: BatchData): string {
-  const users = new Map(data.users.map((user) => [user.id, user]));
   const factsByUser = new Map<number, Fact[]>();
   for (const fact of data.facts) factsByUser.set(fact.user_id, [...(factsByUser.get(fact.user_id) ?? []), fact]);
 
@@ -300,7 +221,7 @@ export function buildExtractionPrompt(data: BatchData): string {
     .filter((user) => !user.opted_out)
     .map((user) => {
       const facts = factsByUser.get(user.id) ?? [];
-      const owner = user.tg_id !== null && (data.ownerTgIds ?? []).includes(user.tg_id) ? " | bot owner" : "";
+      const owner = isOwner(data, user) ? " | bot owner" : "";
       const header = `u${user.id} | ${user.display_name}${user.username ? ` (@${user.username})` : ""}${owner}${user.tagline ? ` | ${user.tagline}` : " | no tagline"}`;
       return facts.length ? `${header}\n${facts.map((fact) => `  [f${fact.id}] ${fact.kind}: ${fact.value}`).join("\n")}` : header;
     })
@@ -309,12 +230,7 @@ export function buildExtractionPrompt(data: BatchData): string {
   const projects = data.projects.length
     ? data.projects.map((project) => `${project.slug} | ${project.name} | ${project.status} | authors: ${project.authors.join(", ") || "?"}`).join("\n")
     : "(empty so far)";
-  // Measured from the members' own words (the bot's commands answer in English anywhere); recent chronicle and facts
-  // only help when the batch is too short.
-  const language = detectLanguage(
-    [...data.context, ...data.batch].filter((message) => !message.is_forward && !message.from_bot).map((message) => message.text),
-    [...(data.recentTopics ?? []).map((topic) => topic.title), ...data.facts.map((fact) => fact.value)],
-  );
+  const language = chatLanguageOf(data);
 
   return [
     language ? `<chat_language>${language}</chat_language>` : "",
@@ -326,16 +242,10 @@ export function buildExtractionPrompt(data: BatchData): string {
     data.recentTopics?.length
       ? `<recent_chronicle>\n${data.recentTopics.map((topic) => `• ${topic.title}`).join("\n")}\n</recent_chronicle>`
       : "",
-    `<context>\n${data.context.map((message) => formatMessage(message, users)).join("\n") || "(none)"}\n</context>`,
-    `<new_messages>\n${data.batch.map((message) => formatMessage(message, users)).join("\n")}\n</new_messages>`,
+    ...messageBlocks(data),
   ]
     .filter(Boolean)
     .join("\n\n");
-}
-
-function parseRef(ref: string): number | null {
-  const match = /^u?(\d+)$/.exec(ref.trim());
-  return match ? Number(match[1]) : null;
 }
 
 export interface ApplyStats {
@@ -374,8 +284,7 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
   const batchById = new Map(data.batch.map((message) => [message.msg_id, message]));
   const users = new Map(data.users.map((user) => [user.id, user]));
   const inBatch = (ids: number[]) => ids.filter((id) => batchById.has(id));
-  // The bot's own lines are context: nothing about people or projects is ever taken from them.
-  const validSources = (ids: number[], max = 3) => inBatch(ids).filter((id) => !batchById.get(id)!.from_bot).slice(0, max);
+  const validSources = memberSources(batchById);
 
   const batchProjects = await applyProjects(sql, data, result, users, validSources, stats);
   await applyRenames(sql, data, result, validSources, batchProjects, stats);
@@ -411,9 +320,15 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
     }
 
     for (const item of result.facts_add) {
+      if (item.kind === "tagline") {
+        stats.taglines += await applyTagline(tx, data, users, item);
+        continue;
+      }
       const userId = parseRef(item.person);
       const sources = validSources(item.source_msg_ids);
-      if (userId === null || !users.has(userId) || sources.length === 0 || item.confidence < MIN_STORED_CONFIDENCE) {
+      // Where someone lives is kept only when they said it themselves.
+      const selfStated = item.kind !== "timezone" || sources.some((id) => batchById.get(id)!.user_id === userId);
+      if (userId === null || !users.has(userId) || sources.length === 0 || !selfStated || item.confidence < MIN_STORED_CONFIDENCE) {
         stats.factsSkipped += 1;
         continue;
       }
@@ -435,20 +350,23 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
 
     stats.signals += await applySignals(tx, data.chatId, runId, result, batchById, users, projectIdOf);
 
-    for (const item of result.taglines) {
-      const userId = parseRef(item.person);
-      const user = userId !== null ? users.get(userId) : undefined;
-      if (!user || user.opted_out || user.tagline_manual || user.tagline || hasForbiddenTopic(item.tagline)) continue;
-      const updated = await tx`
-        UPDATE members SET tagline = ${truncate(item.tagline.trim(), 90)}
-        WHERE chat_id = ${data.chatId} AND user_id = ${user.id} AND tagline IS NULL AND NOT tagline_manual AND NOT opted_out`;
-      stats.taglines += updated.count;
-    }
-
     await markExtracted(tx, data.chatId, data.batch.map((message) => message.msg_id));
   });
 
   return stats;
+}
+
+type FactAdd = ExtractionResult["facts_add"][number];
+
+/** A tagline only for a member who has none; one the person wrote themselves is never replaced. */
+async function applyTagline(tx: Queryable, data: BatchData, users: Map<number, Person>, item: FactAdd): Promise<number> {
+  const userId = parseRef(item.person);
+  const user = userId !== null ? users.get(userId) : undefined;
+  if (!user || user.opted_out || user.tagline_manual || user.tagline || item.confidence < MIN_STORED_CONFIDENCE || hasForbiddenTopic(item.value)) return 0;
+  const updated = await tx`
+    UPDATE members SET tagline = ${truncate(item.value.trim(), 90)}
+    WHERE chat_id = ${data.chatId} AND user_id = ${user.id} AND tagline IS NULL AND NOT tagline_manual AND NOT opted_out`;
+  return updated.count;
 }
 
 async function applyProjects(
@@ -642,7 +560,7 @@ export interface ExtractorDeps {
   chatId: number;
   /** Monthly cap for this chat. */
   chatBudgetUsd: number;
-  config: Pick<Config, "EXTRACTION_MODEL" | "MONTHLY_LLM_BUDGET_USD"> & Partial<Pick<Config, "ADMIN_TG_IDS">>;
+  config: Pick<Config, "EXTRACTION_MODEL" | "MONTHLY_LLM_BUDGET_USD"> & Partial<Pick<Config, "ADMIN_TG_IDS" | "DISPLAY_TIMEZONE">>;
   /** Once aborted (the bot is stopping), the pass starts no new call; what it already applied stays, the rest waits. */
   drain?: AbortSignal;
   /** Cancels the call under way, when the stop cannot wait for it any longer. */
@@ -654,12 +572,82 @@ export interface ExtractorDeps {
 /** `refusal`: the model refused the slice (its safety checks), rather than cutting the answer off or getting it wrong. */
 export type SkippedRange = { firstMsgId: number; lastMsgId: number; messages: number; reason: string; refusal: boolean };
 
-/** `refusals`: calls the model refused, each retry of a refused slice included. */
-export type PassResult = ApplyStats & { calls: number; failedCalls: number; refusals: number; messages: number; skipped: SkippedRange[] };
+/** A notes call that came back unusable: the batch stays applied without notes. */
+export type NotesFailure = { firstMsgId: number; lastMsgId: number; reason: string; refusal: boolean };
 
 /**
- * One pass = everything pending since the previous pass, normally in a single LLM call.
- * A batch the model refuses, cuts off or answers unusably is retried in halves; a slice of
+ * `calls`, `failedCalls` and `refusals` are about the first call: a refused one, each retry of a refused slice included,
+ * is what pauses a chat (see the scheduler). The notes call keeps its own count, and its failures never pause anything.
+ */
+export type PassResult = ApplyStats & {
+  calls: number;
+  failedCalls: number;
+  refusals: number;
+  messages: number;
+  skipped: SkippedRange[];
+  /** Private notes added or added to, and aliases added, by the notes call. */
+  notes: number;
+  aliases: number;
+  notesCalls: number;
+  notesFailures: NotesFailure[];
+};
+
+/** Refused notes calls in the chat over the last day, this pass's own included. */
+async function notesRefusedToday(sql: Sql, chatId: number, runId: number, total: PassResult): Promise<number> {
+  const [row] = await sql<{ refusals: number }[]>`
+    SELECT coalesce(sum((SELECT count(*) FROM jsonb_array_elements(coalesce(r.stats->'notesFailures', '[]'::jsonb)) AS failure
+                         WHERE failure->>'refusal' = 'true')), 0)::int AS refusals
+    FROM extraction_runs r
+    WHERE r.chat_id = ${chatId} AND r.id <> ${runId} AND r.started_at > now() - interval '1 day'`;
+  return (row?.refusals ?? 0) + total.notesFailures.filter((failure) => failure.refusal).length;
+}
+
+/**
+ * The second call for a batch just applied: its private notes and the aliases members gave themselves (notes-extract.ts),
+ * linked to the debates the first call took from it. It never holds the pass up: a failed, refused or cut-off answer is
+ * recorded in the run's stats and the batch stays applied without notes, with no retry. It is skipped while the bot is
+ * stopping, in a paused chat, once a spending cap is reached, and for the rest of the day after NOTES_REFUSALS_PER_DAY
+ * refusals in the chat.
+ */
+async function extractNotes(deps: ExtractorDeps, runId: number, data: BatchData, total: PassResult): Promise<void> {
+  const { sql, config, chatId } = deps;
+  if (deps.drain?.aborted) return;
+  const [chat] = await sql<{ paused: boolean }[]>`SELECT chronicle_paused_at IS NOT NULL AS paused FROM chats WHERE id = ${chatId}`;
+  if (chat?.paused || (await notesRefusedToday(sql, chatId, runId, total)) >= NOTES_REFUSALS_PER_DAY) return;
+  try {
+    await assertBudget(sql, config.MONTHLY_LLM_BUDGET_USD, { id: chatId, limitUsd: deps.chatBudgetUsd });
+  } catch (error) {
+    if (error instanceof BudgetExceededError) return;
+    throw error;
+  }
+  const batchIds = data.batch.map((message) => message.msg_id);
+  const debates = await sql<BatchDebate[]>`
+    SELECT id, title FROM chronicle WHERE chat_id = ${chatId} AND run_id = ${runId} AND kind = 'debate' AND msg_ids && ${batchIds}::bigint[] ORDER BY id`;
+  const failed = (reason: string, refusal: boolean) =>
+    void total.notesFailures.push({ firstMsgId: batchIds[0]!, lastMsgId: batchIds[batchIds.length - 1]!, reason, refusal });
+  total.notesCalls += 1;
+  try {
+    const outcome = await callNotesExtractor(
+      deps.anthropic,
+      config.EXTRACTION_MODEL,
+      buildNotesPrompt(data, debates),
+      (usage) => recordUsage(sql, NOTES_PURPOSE, config.EXTRACTION_MODEL, usage, chatId),
+      deps.signal,
+      deps.endUserId,
+    );
+    if (!outcome.ok) return failed(outcome.message, outcome.failure === "refusal");
+    const applied = await sql.begin((tx) => applyNotesResult(tx, data, outcome.data, debates));
+    total.notes += applied.notes;
+    total.aliases += applied.aliases;
+  } catch (error) {
+    failed(error instanceof Error ? error.message : String(error), false);
+  }
+}
+
+/**
+ * One pass = everything pending since the previous pass, normally in a single call for the chronicle and the cards,
+ * followed by one for the private notes (extractNotes). A batch the model refuses, cuts off or answers unusably in the
+ * first call is retried in halves; a slice of
  * MIN_MESSAGES_PER_CALL messages or fewer that still fails is skipped, so no message can hold up
  * the chat's chronicle for good. Every response is recorded as spending, usable or not.
  */
@@ -670,7 +658,7 @@ export async function runExtractionPass(deps: ExtractorDeps): Promise<PassResult
   await checkBudget();
   const [run] = await sql<{ id: number }[]>`INSERT INTO extraction_runs (chat_id) VALUES (${chatId}) RETURNING id`;
   const runId = run!.id;
-  const total: PassResult = { ...emptyStats(), calls: 0, failedCalls: 0, refusals: 0, messages: 0, skipped: [] };
+  const total: PassResult = { ...emptyStats(), calls: 0, failedCalls: 0, refusals: 0, messages: 0, skipped: [], notes: 0, aliases: 0, notesCalls: 0, notesFailures: [] };
   const onUsage = (usage: UsageLike) => recordUsage(sql, "extract", config.EXTRACTION_MODEL, usage, chatId);
   let firstMsgId: number | null = null;
   let lastMsgId: number | null = null;
@@ -682,6 +670,7 @@ export async function runExtractionPass(deps: ExtractorDeps): Promise<PassResult
       const data = await loadBatch(sql, chatId, limit);
       if (!data) break;
       data.ownerTgIds = deps.config.ADMIN_TG_IDS ?? [];
+      data.timezone = deps.config.DISPLAY_TIMEZONE;
       const batchIds = data.batch.map((message) => message.msg_id);
       firstMsgId ??= batchIds[0]!;
       lastMsgId = batchIds[batchIds.length - 1]!;
@@ -699,6 +688,7 @@ export async function runExtractionPass(deps: ExtractorDeps): Promise<PassResult
         const stats = await applyExtraction(sql, runId, data, outcome.data);
         for (const key of Object.keys(stats) as (keyof ApplyStats)[]) total[key] += stats[key];
         total.messages += batchIds.length;
+        await extractNotes(deps, runId, data, total);
         continue;
       }
 

@@ -2,7 +2,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import type { Message, UserFromGetMe } from "grammy/types";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createBot } from "../src/bot/bot.js";
-import { asksAboutRating, asksToReferee, buildReplyContext, type Question } from "../src/bot/reply-context.js";
+import { asksAboutRating, buildReplyContext, refersToConversation, type Question } from "../src/bot/reply-context.js";
 import { addAlias, ambiguousNames, mentionsName, nameForms, namedIn, wordsOf } from "../src/core/aliases.js";
 import { migrateChat } from "../src/core/chat-migration.js";
 import { attachLegacyData, LEGACY_CHAT_ID, registerChat, setChatStatus } from "../src/core/chats.js";
@@ -16,6 +16,7 @@ import { addUserProject, mergeProjects, renameProject, updateProject } from "../
 import { hasForbiddenTopic, transliterateName } from "../src/core/text.js";
 import { forgetUser, getPerson, resolveUser, setOptOut, type User } from "../src/core/users.js";
 import { EXTRACTABLE_KINDS, EXTRACTION_SYSTEM_PROMPT, runExtractionPass, type ExtractionResult } from "../src/worker/extract.js";
+import { NOTES_SYSTEM_PROMPT } from "../src/worker/notes-extract.js";
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
 const TOKEN = "123456:TEST-TOKEN";
@@ -63,11 +64,15 @@ describe("names in messages", () => {
     expect(groups).toEqual([{ names: ["Митя", "Mitya"], ids: [1, 2] }]);
   });
 
-  it("tell a request to referee and a question about the rating", () => {
-    for (const text of ["рассуди нас", "кто из них прав?", "кто из нас круче", "о чём спор?", "что за спор тут", "разреши спор", "кто выиграл?", "who is right?", "settle this", "what are they arguing about"]) {
-      expect(asksToReferee(text), text).toBe(true);
+  it("tell a question about the conversation itself and a question about the rating", () => {
+    for (const text of [
+      "рассуди нас", "кто из них прав?", "кто из нас круче", "о чём спор?", "что за спор тут", "разреши спор", "кто выиграл?",
+      "запиши этот диалог как исторический", "о чем речь ведете", "что тут происходит", "о чём вы тут?", "мы тут обсуждаем Rust", "перепалка дня", "прочитай тред",
+      "who is right?", "settle this", "what are they arguing about", "what's going on here", "summarize this conversation", "these debates again",
+    ]) {
+      expect(refersToConversation(text), text).toBe(true);
     }
-    for (const text of ["потерял рассудок", "кто правда так думает"]) expect(asksToReferee(text), text).toBe(false);
+    for (const text of ["потерял рассудок", "кто правда так думает", "иду на спорт", "речка рядом", "что нового?"]) expect(refersToConversation(text), text).toBe(false);
     for (const text of ["почему такой рейтинг?", "сколько баллов у меня", "кто в топе", "what's my score", "how many votes"]) expect(asksAboutRating(text), text).toBe(true);
     for (const text of ["топить за Claude", "что нового?"]) expect(asksAboutRating(text), text).toBe(false);
   });
@@ -302,7 +307,7 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
       // The members list does not repeat a card the focus already shows.
       expect(block(context, "members")).toContain("- Kit (@kit_k) | card in in_focus");
       expect(block(context, "members")).toContain("- Dora (@dora_d) | interest: climbing");
-      for (const line of focus.split("\n- ")) expect(line.length).toBeLessThanOrEqual(1400 + 2);
+      for (const line of focus.split("\n- ")) expect(line.length).toBeLessThanOrEqual(1800 + 2);
     });
 
     it("explains a project's rating when the question names the project or asks about the asker's score", async () => {
@@ -616,20 +621,23 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
   });
 
   describe("the chronicler and the bot's lines", () => {
+    /** The first call answers with `result`; the second one, for the private notes, finds none and is not among the prompts. */
     function fakeModel(result: ExtractionResult) {
       const prompts: string[] = [];
       const client = {
         messages: {
-          stream(params: { messages: { content: string }[] }) {
-            prompts.push(params.messages[0]!.content);
-            const message = { stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify(result) }], usage: { input_tokens: 10_000, output_tokens: 1_000 } };
+          stream(params: { system: string; messages: { content: string }[] }) {
+            const notesCall = params.system === NOTES_SYSTEM_PROMPT;
+            if (!notesCall) prompts.push(params.messages[0]!.content);
+            const answer = notesCall ? { notes: [], aliases: [] } : result;
+            const message = { stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify(answer) }], usage: { input_tokens: 10_000, output_tokens: 1_000 } };
             return { currentMessage: message, finalMessage: async () => message };
           },
         },
       } as unknown as Anthropic;
       return { client, prompts };
     }
-    const EMPTY: ExtractionResult = { topics: [], facts_add: [], facts_update: [], projects: [], project_renames: [], project_signals: [], taglines: [] };
+    const EMPTY: ExtractionResult = { topics: [], facts_add: [], facts_update: [], projects: [], project_renames: [], project_signals: [] };
     const pass = (chatId: number, client: Anthropic) =>
       runExtractionPass({ sql, anthropic: client, chatId, chatBudgetUsd: 50, config: { EXTRACTION_MODEL: "claude-sonnet-5-5", MONTHLY_LLM_BUDGET_USD: 500 } });
 
@@ -683,12 +691,19 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
 
   it("applies the memory migration on a fresh database", async () => {
     expect((await sql<{ name: string }[]>`SELECT name FROM schema_migrations ORDER BY name`).map((row) => row.name)).toEqual(["001_init.sql", "002_chronicle_pause.sql", "003_memory.sql"]);
-    const [debate] = await sql<{ kind: string; temperature: number }[]>`
-      INSERT INTO chronicle (chat_id, run_id, period_from, period_to, title, summary, kind, temperature)
-      VALUES (-1, 0, now(), now(), 'Tabs vs spaces', 'Nobody gave in.', 'debate', 4) RETURNING kind, temperature`;
-    expect(debate).toEqual({ kind: "debate", temperature: 4 });
-    await expect(sql`INSERT INTO chronicle (chat_id, run_id, period_from, period_to, title, summary, temperature) VALUES (-1, 0, now(), now(), 't', 's', 3)`).rejects.toThrow();
+    const [debate] = await sql<{ kind: string }[]>`
+      INSERT INTO chronicle (chat_id, run_id, period_from, period_to, title, summary, kind)
+      VALUES (-1, 0, now(), now(), 'Tabs vs spaces', 'Nobody gave in.', 'debate') RETURNING kind`;
+    expect(debate).toEqual({ kind: "debate" });
+    expect(await sql`SELECT 1 FROM information_schema.columns WHERE table_name = 'chronicle' AND column_name = 'temperature'`).toHaveLength(0);
     await expect(sql`INSERT INTO aliases (chat_id, alias, alias_norm, source) VALUES (-1, 'x', 'x', 'owner')`).rejects.toThrow();
+    const [note] = await sql<{ kind: string; status: string; due_at: Date }[]>`
+      INSERT INTO notes (chat_id, kind, value, value_norm, status, due_at, confidence)
+      VALUES (-1, 'prediction', 'chats will be gone', 'chats will be gone', 'wrong', '2027-05-01', 0.9) RETURNING kind, status, due_at`;
+    expect(note).toEqual({ kind: "prediction", status: "wrong", due_at: new Date("2027-05-01T00:00:00Z") });
+    for (const kind of ["bout", "bait", "about_bot"]) await sql`INSERT INTO notes (chat_id, kind, value, value_norm, confidence) VALUES (-1, ${kind}, ${kind}, ${kind}, 0.9)`;
+    await expect(sql`INSERT INTO notes (chat_id, kind, value, value_norm, confidence) VALUES (-1, 'rumour', 'x', 'x', 0.9)`).rejects.toThrow();
+    await expect(sql`INSERT INTO notes (chat_id, kind, value, value_norm, status, confidence) VALUES (-1, 'claim', 'y', 'y', 'maybe', 0.9)`).rejects.toThrow();
     expect((await sql<{ interjections: boolean }[]>`SELECT interjections FROM chats LIMIT 1`)[0]!.interjections).toBe(true);
   });
 });

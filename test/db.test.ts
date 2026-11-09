@@ -14,6 +14,7 @@ import { resolveUser, type Person } from "../src/core/users.js";
 import { importSeed, parseSeed } from "../src/scripts/seed.js";
 import { applyConsolidation, loadConsolidationInput } from "../src/worker/consolidate.js";
 import { applyExtraction, buildExtractionPrompt, runExtractionPass, type ExtractionResult } from "../src/worker/extract.js";
+import { NOTES_SYSTEM_PROMPT } from "../src/worker/notes-extract.js";
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
 const CHAT_ID = -1001234567890;
@@ -135,18 +136,19 @@ describe.skipIf(!DATABASE_URL)("with postgres", () => {
         { project: "atlas", person: `u${author.id}`, kind: "praise", impact: 5, note: "автор хвалит сам себя", source_msg_ids: [9002] },
         { project: "atlas", person: `u${author.id}`, kind: "milestone", impact: 3, note: "Вышел Atlas 0.2 с виджетами", source_msg_ids: [9002] },
       ],
-      taglines: [],
     };
     let prompt = "";
     const fakeAnthropic = {
       messages: {
-        stream: (params: { messages: { content: string }[] }) => {
-          prompt = params.messages[0]!.content;
+        // The chronicle and the cards come from the first call; the second one, for the private notes, finds none.
+        stream: (params: { system: string; messages: { content: string }[] }) => {
+          const notesCall = params.system === NOTES_SYSTEM_PROMPT;
+          if (!notesCall) prompt = params.messages[0]!.content;
           return {
             finalMessage: async () => ({
               stop_reason: "end_turn",
               stop_details: null,
-              content: [{ type: "text", text: JSON.stringify(fakeResult) }],
+              content: [{ type: "text", text: JSON.stringify(notesCall ? { notes: [], aliases: [] } : fakeResult) }],
               usage: { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
             }),
           };
@@ -157,6 +159,8 @@ describe.skipIf(!DATABASE_URL)("with postgres", () => {
     const deps = { sql, anthropic: fakeAnthropic, chatId: CHAT_ID, chatBudgetUsd: 2, config: { EXTRACTION_MODEL: "claude-haiku-5-5", MONTHLY_LLM_BUDGET_USD: 5 } };
     const stats = await runExtractionPass(deps);
     expect(stats.calls).toBe(1);
+    expect(stats.notesCalls).toBe(1);
+    expect(stats.notesFailures).toEqual([]);
     expect(stats.topics).toBe(1);
     expect(stats.signals).toBe(2);
     expect(stats.factsAdded).toBe(1);

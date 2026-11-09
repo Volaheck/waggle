@@ -69,6 +69,12 @@ export async function chatAliases(sql: Sql, chatId: number, options: { alias?: s
     ORDER BY a.user_id IS NULL, coalesce(u.display_name, p.name), a.id`;
 }
 
+/** The names a member goes by in the chat, oldest first: shown on their card, so anyone can see and correct them. */
+export async function memberAliases(sql: Sql, chatId: number, userId: number): Promise<string[]> {
+  const rows = await sql<{ alias: string }[]>`SELECT alias FROM aliases WHERE chat_id = ${chatId} AND user_id = ${userId} ORDER BY id`;
+  return rows.map((row) => row.alias);
+}
+
 /**
  * Moves a chat's aliases to another chat id (a supergroup upgrade, attaching imported history): one the target
  * already has is not repeated, and none stays about a member who opted out on either side.

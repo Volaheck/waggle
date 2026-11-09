@@ -8,20 +8,22 @@ import { dropFact, mergeFacts, normalizeStacks, proposeFact, rejectFact, rewrite
 import { detectLanguage } from "../src/core/language.js";
 import { assertBudget, BudgetExceededError, canonicalModelId, chatEndUserId, estimateCostUsd, isPricedModel, monthSpendUsd, structuredOutputFormat } from "../src/core/llm.js";
 import { clearExpiredTexts, saveMessage, type StoredMessage } from "../src/core/messages.js";
+import { NOTE_KINDS, NOTE_STATUSES } from "../src/core/notes.js";
 import { mergeProjects, PROJECT_STATUSES, upsertProject } from "../src/core/projects.js";
 import { getPerson, peopleOfChat, resolveUser, setOptOut } from "../src/core/users.js";
 import { applyConsolidation, CONSOLIDATION_SYSTEM_PROMPT, ConsolidationSchema, consolidationRetryDelayMs, loadConsolidationInput } from "../src/worker/consolidate.js";
 import {
   applyExtraction,
   buildExtractionPrompt,
-  EXTRACTABLE_KINDS,
   ExtractionSchema,
+  FACT_ADD_KINDS,
   INTERRUPTED_PASS_ERROR,
   runExtractionPass,
   TOPIC_KINDS,
   type BatchData,
   type ExtractionResult,
 } from "../src/worker/extract.js";
+import { NOTES_SYSTEM_PROMPT, NotesSchema } from "../src/worker/notes-extract.js";
 import { chatBudgetUsd, createChatProcessor, extractionRetryDelayMs, nextExtractionRetryAt, startExtractionScheduler, startMessageRetention } from "../src/worker/scheduler.js";
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -74,19 +76,26 @@ describe("structured output format", () => {
     expect("parse" in format).toBe(false);
     const properties = (format.schema as { properties: Record<string, { items: { properties: Record<string, unknown> } }> }).properties;
     expect(enumsUnder(properties.topics!.items.properties.kind)).toEqual([[...TOPIC_KINDS]]);
-    expect(enumsUnder(properties.facts_add!.items.properties.kind)).toEqual([[...EXTRACTABLE_KINDS]]);
+    expect(enumsUnder(properties.facts_add!.items.properties.kind)).toEqual([[...FACT_ADD_KINDS]]);
+    const notes = (structuredOutputFormat(NotesSchema).schema as { properties: Record<string, { items: { properties: Record<string, unknown> } }> }).properties;
+    expect(enumsUnder(notes.notes!.items.properties.kind)).toEqual([[...NOTE_KINDS]]);
+    expect(enumsUnder(notes.notes!.items.properties.status)).toEqual([[...NOTE_STATUSES]]);
+    expect(objectsWithoutStrictness(structuredOutputFormat(NotesSchema).schema)).toBe(0);
     expect(enumsUnder(properties.projects!.items.properties.status)).toEqual([[...PROJECT_STATUSES]]);
     expect(JSON.stringify(format.schema)).not.toMatch(/"(minimum|maximum|\$schema)"/);
     expect(objectsWithoutStrictness(format.schema)).toBe(0);
     expect(enumsUnder(structuredOutputFormat(ConsolidationSchema).schema)).toEqual([[...PROJECT_STATUSES]]);
   });
 
-  it("keeps the extraction schema small enough for the API to compile", () => {
-    // Measured on 2026-11-09 with claude-sonnet-5-5: these seven arrays of objects are accepted, and an eighth one makes
-    // the API refuse every call ("The compiled grammar is too large"), which tests with a fake client never notice.
-    // Before adding a field or an array, try a real call with the new schema.
+  it("keeps both extraction schemas small enough for the API to compile", () => {
+    // Measured on 2026-11-09 with claude-sonnet-5-5: six of these arrays of objects with a small seventh are accepted, while
+    // a seventh array of notes made the API refuse every call ("The compiled grammar is too large"), which tests with a
+    // fake client never notice. So the notes have a call of their own. Before adding a field or an array to either,
+    // try a real call with the new schema (scripts/print-extraction-formats.ts prints both as they are sent).
     const properties = (structuredOutputFormat(ExtractionSchema).schema as { properties: Record<string, unknown> }).properties;
-    expect(Object.keys(properties)).toEqual(["topics", "facts_add", "facts_update", "projects", "project_renames", "project_signals", "taglines"]);
+    expect(Object.keys(properties)).toEqual(["topics", "facts_add", "facts_update", "projects", "project_renames", "project_signals"]);
+    const notes = (structuredOutputFormat(NotesSchema).schema as { properties: Record<string, unknown> }).properties;
+    expect(Object.keys(notes)).toEqual(["notes", "aliases"]);
   });
 });
 
@@ -144,14 +153,17 @@ interface FakeAnswer {
   breaks?: boolean;
 }
 
-function fakeAnthropic(answer: (request: { system: string; prompt: string }) => FakeAnswer) {
+const EMPTY_NOTES = JSON.stringify({ notes: [], aliases: [] });
+
+/** Each pass makes a second call for the private notes after a batch is applied; unless `notes` says otherwise, it finds none. */
+function fakeAnthropic(answer: (request: { system: string; prompt: string }) => FakeAnswer, notes: (request: { system: string; prompt: string }) => FakeAnswer = () => ({ text: EMPTY_NOTES })) {
   const requests: { system: string; prompt: string; userId?: string }[] = [];
   const client = {
     messages: {
       stream(params: { system: string; messages: { content: string }[]; metadata?: { user_id?: string } }) {
         const request = { system: params.system, prompt: params.messages[0]!.content, userId: params.metadata?.user_id };
         requests.push(request);
-        const reply = answer(request);
+        const reply = request.system === NOTES_SYSTEM_PROMPT ? notes(request) : answer(request);
         const message = {
           stop_reason: reply.stopReason ?? "end_turn",
           stop_details: reply.stopReason === "refusal" ? { type: "refusal", category: "cyber", explanation: null } : null,
@@ -171,7 +183,10 @@ function fakeAnthropic(answer: (request: { system: string; prompt: string }) => 
   return { client, requests };
 }
 
-const EMPTY_EXTRACTION: ExtractionResult = { topics: [], facts_add: [], facts_update: [], projects: [], project_renames: [], project_signals: [], taglines: [] };
+/** The line that opens a day among the messages the chronicler is sent (UTC when no time zone is set). */
+const dayLine = (at: Date) => `--- ${at.toLocaleDateString("en-CA", { timeZone: "UTC" })}, ${at.toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" })} ---`;
+
+const EMPTY_EXTRACTION: ExtractionResult = { topics: [], facts_add: [], facts_update: [], projects: [], project_renames: [], project_signals: [] };
 const EMPTY_CLEANUP = JSON.stringify({ fact_merges: [], fact_drops: [], project_merges: [], project_updates: [] });
 const MODEL = "claude-sonnet-5-5";
 /** 10K input and 1K output tokens at Sonnet 5.5 prices. */
@@ -375,7 +390,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     const { client, requests } = fakeAnthropic(() => ({ text: JSON.stringify(EMPTY_EXTRACTION) }));
     await runExtractionPass(deps(chat.id, client));
     const context = /<context>\n([\s\S]*?)\n<\/context>/.exec(requests[0]!.prompt)![1]!.split("\n");
-    expect(context).toEqual([`[1] Anna (u${anna.id}): Anyone up for a board game tonight?`, `[3] Bob (u${bob.id}) ↩1 [sticker]`, `[4] Bob (u${bob.id}) ↩1: Count me in`]);
+    expect(context).toEqual([dayLine(new Date(Date.now() - 2 * HOUR)), `[1] Anna (u${anna.id}): Anyone up for a board game tonight?`, `[3] Bob (u${bob.id}) ↩1 [sticker]`, `[4] Bob (u${bob.id}) ↩1: Count me in`]);
 
     const catchup = await catchupFor(sql, chat.id, (await getPerson(sql, chat.id, anna.id))!, 24);
     expect(catchup.mentions.map((mention) => mention.msg_id)).toEqual([4, 3]);
@@ -395,6 +410,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     await runExtractionPass(deps(chat.id, client));
     const batch = /<new_messages>\n([\s\S]*?)\n<\/new_messages>/.exec(requests[0]!.prompt)![1]!.split("\n");
     expect(batch).toEqual([
+      dayLine(sentAt),
       `[1] Anna (u${anna.id}): Who wants to try my new app?`,
       `[3] Anna (u${anna.id}) ↩bot: The most honest description of all`,
       `[4] Anna (u${anna.id}) ↩3: I mean the card above`,
@@ -432,10 +448,14 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     const { client, requests } = fakeAnthropic(() => ({ text: JSON.stringify(EMPTY_EXTRACTION) }));
     const endUserId = chatEndUserId("test-secret", chat.id);
     await runExtractionPass({ ...deps(chat.id, client), endUserId });
-    expect(requests[0]!.prompt).toContain("Мой номер [phone], почта [email], репо https://github.com/acme/atlas");
-    expect(requests[0]!.prompt).toContain("А рабочий [phone]");
-    expect(requests[0]!.prompt).not.toMatch(/912|ivan\.petrov|900/);
-    expect(requests[0]!.userId).toBe(endUserId);
+    // The notes call that follows is sent the same masked messages, for the same end user.
+    expect(requests.map((request) => request.system === NOTES_SYSTEM_PROMPT)).toEqual([false, true]);
+    for (const request of requests) {
+      expect(request.prompt).toContain("Мой номер [phone], почта [email], репо https://github.com/acme/atlas");
+      expect(request.prompt).toContain("А рабочий [phone]");
+      expect(request.prompt).not.toMatch(/912|ivan\.petrov|900/);
+      expect(request.userId).toBe(endUserId);
+    }
     expect(endUserId).toMatch(/^[0-9a-f]{32}$/);
     expect(endUserId).not.toContain(String(Math.abs(chat.id)));
     expect(chatEndUserId("test-secret", chat.id - 1)).not.toBe(endUserId);
@@ -454,13 +474,17 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     const result = await runExtractionPass(deps(chat.id, client));
 
     // Refused, the 40 messages are cut into slices of 10, so the refused message is sent twice rather than three times.
+    // Each of the three slices applied gets its notes call, which never sees the refused message either.
     expect(result.calls).toBe(5);
     expect(result.failedCalls).toBe(2);
     expect(result.refusals).toBe(2);
+    expect(result.notesCalls).toBe(3);
+    expect(result.notesFailures).toEqual([]);
     expect(result.skipped).toEqual([{ firstMsgId: 1021, lastMsgId: 1030, messages: 10, reason: "the model refused (cyber)", refusal: true }]);
     expect(await pendingCount(chat.id)).toBe(0);
-    expect(await usageRows(chat.id)).toBe(5);
-    expect(await monthSpendUsd(sql, chat.id)).toBeCloseTo(5 * CALL_COST, 5);
+    expect(await usageRows(chat.id)).toBe(8);
+    expect(await monthSpendUsd(sql, chat.id)).toBeCloseTo(8 * CALL_COST, 5);
+    expect(requests.filter((request) => request.system === NOTES_SYSTEM_PROMPT && request.prompt.includes("FORBIDDEN-MARKER"))).toEqual([]);
     const [run] = await sql<{ status: string; stats: { skipped: unknown[] } }[]>`SELECT status, stats FROM extraction_runs WHERE chat_id = ${chat.id}`;
     expect(run!.status).toBe("done");
     expect(run!.stats.skipped).toHaveLength(1);
@@ -873,7 +897,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
       ...EMPTY_EXTRACTION,
       projects: [{ slug: "pulse", name: "Pulse", tagline: null, status: null, stack: [], repo: null, site: null, authors: [`u${author.id}`, `u${quiet.id}`], confidence: 0.9, source_msg_ids: [2] }],
       project_signals: [{ project: "habit", person: `u${quiet.id}`, kind: "usage", impact: 4, note: "Quiet fan uses Habit every day", source_msg_ids: [1] }],
-      taglines: [{ person: `u${quiet.id}`, tagline: "Habit power user" }],
+      facts_add: [{ person: `u${quiet.id}`, kind: "tagline", value: "Habit power user", confidence: 0.9, source_msg_ids: [1] }],
     });
     expect(stats.signals).toBe(0);
     expect(stats.taglines).toBe(0);

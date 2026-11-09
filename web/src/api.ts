@@ -208,7 +208,7 @@ export interface ChronicleEntry {
   id: number;
   title: string;
   summary: string;
-  kind: "discussion" | "project" | "link" | "news";
+  kind: "discussion" | "project" | "link" | "news" | "debate";
   importance: number;
   period_to: string;
   url: string | null;

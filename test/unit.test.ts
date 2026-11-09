@@ -6,6 +6,7 @@ import { rankCards } from "../src/core/merge.js";
 import { assistantNote, replyEffort, replySystemPrompt } from "../src/bot/assistant.js";
 import { buildExtractionPrompt, EXTRACTION_SYSTEM_PROMPT, isPassDue } from "../src/worker/extract.js";
 import { CONSOLIDATION_SYSTEM_PROMPT } from "../src/worker/consolidate.js";
+import { NOTES_SYSTEM_PROMPT } from "../src/worker/notes-extract.js";
 import { factCore, isNearDuplicate, isSameFact } from "../src/core/facts.js";
 import { detectLanguage } from "../src/core/language.js";
 import { maskPersonalData } from "../src/core/privacy.js";
@@ -226,6 +227,7 @@ describe("chronicler prompts", () => {
       for (const code of PROJECT_STATUSES) expect(prompt).toContain(`"${code}"`);
       expect(prompt).not.toMatch(cyrillic);
     }
+    expect(NOTES_SYSTEM_PROMPT).not.toMatch(cyrillic);
   });
 
   it("tell the model the chat's language when it can be measured", () => {
@@ -315,8 +317,8 @@ describe("masking personal data before a prompt", () => {
   it("leaves dates, times, versions, prices, years, short numbers, usernames and links alone", () => {
     for (const text of [
       "Встреча 09.11.2026 в 10:30, версия 1.2.3, цена 1 500 ₽, $2,000,000, 3,14",
-      "Годы 2019-2024 и 2023 2024 2025, 1500 подписчиков, id 262479306",
-      "Пиши @flyheck, репо https://github.com/Volaheck/waggle и https://t.me/c/1581413930/168194",
+      "Годы 2019-2024 и 2023 2024 2025, 1500 подписчиков, id 123456789",
+      "Пиши @maestro_dev, репо https://github.com/example/atlas и https://t.me/c/1234567890/4321",
       "Наша группа https://t.me/+5bX9kLmN2pQrStUv и чат по номеру не публикуем",
       "Релиз 2026-11-20 18:00, лог 2026-11-09 10:36:05, считаем 1 2 3 4 5 6 7 8 9 10, бюджет 15 000 000 000",
       "Главный ключ: JavaScript и TypeScript, token: Ethereum, хэштег 3dprintingenthusiastsforever",
