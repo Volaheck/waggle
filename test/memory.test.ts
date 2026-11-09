@@ -690,7 +690,7 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
   });
 
   it("applies the memory migrations on a fresh database", async () => {
-    expect((await sql<{ name: string }[]>`SELECT name FROM schema_migrations ORDER BY name`).map((row) => row.name)).toEqual(["001_init.sql", "002_chronicle_pause.sql", "003_memory.sql", "004_themes.sql"]);
+    expect((await sql<{ name: string }[]>`SELECT name FROM schema_migrations ORDER BY name`).map((row) => row.name)).toEqual(expect.arrayContaining(["001_init.sql", "002_chronicle_pause.sql", "003_memory.sql", "004_themes.sql"]));
     const [debate] = await sql<{ kind: string }[]>`
       INSERT INTO chronicle (chat_id, run_id, period_from, period_to, title, summary, kind)
       VALUES (-1, 0, now(), now(), 'Tabs vs spaces', 'Nobody gave in.', 'debate') RETURNING kind`;

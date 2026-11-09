@@ -30,6 +30,7 @@ import { chatBudgetUsd, nextExtractionRetryAt } from "../worker/scheduler.js";
 import { registerCatalog } from "./catalog.js";
 import { catchupHtml, clampTelegram, countOf, formatDate, userHeader } from "./format.js";
 import { registerAliases } from "./aliases.js";
+import { BUSINESS_UPDATES, registerBusiness } from "./business.js";
 import { createAssistant, isAddressedToBot, PREMIUM_REPLY_PURPOSE, repliesSpendUsd, type Assistant, type AssistantDeps } from "./assistant.js";
 import { createInterjector, type Interjector } from "./interjector.js";
 import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
@@ -354,6 +355,9 @@ export function createBot(deps: BotDeps): {
     await setChatStatus(sql, chatId, "approved", ownerId);
     await greetApproved(chatId);
   }
+
+  // Owners' own private chats, through Telegram Business: handled apart from everything below.
+  registerBusiness(bot, { sql, config });
 
   bot.on("my_chat_member", async (ctx) => {
     if (!isGroup(ctx)) return;
@@ -870,4 +874,4 @@ export async function notifyAdmins(bot: Bot<BotContext>, _sql: Sql, adminTgIds: 
   }
 }
 
-export const ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "chat_member", "my_chat_member"] as const;
+export const ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "chat_member", "my_chat_member", ...BUSINESS_UPDATES] as const;

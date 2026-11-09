@@ -44,6 +44,8 @@ const EnvSchema = z.object({
   INTERJECTIONS_PER_CHAT_PER_DAY: z.coerce.number().int().min(0).default(3),
   /** Hours between two such interjections in one chat. */
   INTERJECTION_MIN_GAP_HOURS: z.coerce.number().min(0).default(3),
+  /** An owner who connects the bot to their own account gets deleted and edited messages from it; the other side's messages are kept this long. */
+  BUSINESS_MESSAGE_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
   WEB_DIST_DIR: z.string().default("web/dist"),
   /** Local development only: open the Mini App in a plain browser via a secret link printed at startup. */
   DEV_BROWSER_LOGIN: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),

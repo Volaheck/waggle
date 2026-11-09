@@ -3,6 +3,7 @@ import { serve } from "@hono/node-server";
 import { AvatarCache } from "./api/avatars.js";
 import { createApi } from "./api/server.js";
 import { ALLOWED_UPDATES, createBot, notifyAdmins, registerCommands } from "./bot/bot.js";
+import { startBusinessRetention } from "./bot/business.js";
 import { startNameSync } from "./bot/names.js";
 import { telegramWebhook } from "./bot/webhook.js";
 import { relinkForeignTopics } from "./core/chronicle.js";
@@ -109,6 +110,7 @@ const stopScheduler = anthropic
     async (_graceMs?: number) => {});
 
 const stopRetention = startMessageRetention(sql, config.MESSAGE_RETENTION_DAYS);
+const stopBusinessRetention = startBusinessRetention(sql, config.BUSINESS_MESSAGE_RETENTION_DAYS);
 const stopNameSync = startNameSync(bot.api, sql, config.ADMIN_TG_IDS);
 if (config.ADMIN_TG_IDS.length === 0) {
   console.warn("[bot] ADMIN_TG_IDS is empty — nobody can approve new chats. Get your Telegram ID from a bot like @userinfobot and add it to ADMIN_TG_IDS.");
@@ -118,6 +120,7 @@ const shutdown = async (signal: string) => {
   console.log(`[main] ${signal}, shutting down`);
   stopNameSync();
   stopRetention();
+  stopBusinessRetention();
   // The bot does not start speaking up uninvited any more; a check under way finishes with the answers below.
   interjector?.stop();
   // The bot keeps serving while the chronicler call under way finishes; no new call starts. A call that takes longer

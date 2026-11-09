@@ -116,3 +116,11 @@ What the chat calls a member or a project (`aliases`, with who gave the name: an
 ## Mini App auth
 
 Requests carry Telegram `initData`; the API verifies its HMAC with the bot token. The chat comes in the `x-chat-id` header (or the one picked last); the API serves it only if the person is a member, checked with `getChatMember` (cached for 10 minutes).
+
+## Owners' own DMs (Telegram Business)
+
+An owner can connect the bot to their own account (Telegram Business → Chat Automation; the bot needs Business Mode on in BotFather). `src/bot/business.ts` handles the four business updates before any other handler, so they never reach the group logic, and keeps state apart from it in `business_connections` and `business_messages` (migration 005).
+
+- **Who**: a connection is recorded for anyone, but messages are kept only while it is enabled and its account is in `ADMIN_TG_IDS`; anyone else is told once that the bot keeps nothing for them. A connection made before the bot listened to these updates is looked up with `getBusinessConnection` the first time one of its messages comes.
+- **What is kept**: the other side's messages only (text or caption, a poll's question, the largest photo's or the file's `file_id`), never the owner's own. Kept rows are deleted after `BUSINESS_MESSAGE_RETENTION_DAYS` (hourly check), when they are reported as deleted, and all of a connection's rows when it is disabled. None of it goes to the LLM.
+- **Reports** go to the owner's DM with the bot: a deletion lists what each kept message said (the report stays under Telegram's limit, the rest counted) and sends up to 10 of the deleted files back by `file_id`; an edit shows both versions, and the file from before when it was replaced. An edit that changed nothing kept, or of a message the bot never saw, is not reported.

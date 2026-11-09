@@ -71,6 +71,8 @@ In DM the bot works with one chat at a time; if you are in several, it asks whic
 
 **Mini App:** create it with `/newapp` in BotFather pointing to `https://<your-domain>/app/`, then set `PUBLIC_URL` and `BOT_APP_SHORT_NAME`.
 
+**Deleted and edited messages in your own DMs (owners, Telegram Premium):** turn on Business Mode for the bot in BotFather (Bot Settings → Business Mode), then in Telegram open Settings → Telegram Business → Chat Automation, pick the bot and the chats it may read; it needs no right to reply. From then on the bot keeps the other side's messages in those chats for `BUSINESS_MESSAGE_RETENTION_DAYS` (30 by default) and, in your DM with it, shows what a message said once it is deleted (photos, videos, voice and files are sent back) or what it said before an edit. Your own messages are never kept; disconnecting deletes everything it kept. Only accounts in `ADMIN_TG_IDS` get this: for anyone else who connects the bot, it keeps nothing. Telegram does not say who deleted a message, and the bot sees only messages that arrived after it was connected.
+
 Deploying to your own server with GitHub Actions is described in [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Development
