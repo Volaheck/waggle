@@ -69,13 +69,76 @@ export function normalizeUrl(raw: string): { norm: string; domain: string } | nu
   }
 }
 
+/** Safe for Telegram HTML text and for attribute values such as href="…". */
 export function escapeHtml(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-export function messageLink(chatId: number, msgId: number): string {
+const LINK_EDGES = /^[\s"'`«»“”‘’<>()[\]{}]+|[\s"'`«»“”‘’<>()[\]{}.,!?;:]+$/g;
+
+/**
+ * A link as it may be stored and shown: http(s) only, quotes and brackets around it dropped,
+ * anything unsafe inside percent-encoded. Null when the text is not a usable web link.
+ */
+export function safeHttpUrl(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const trimmed = raw.replace(LINK_EDGES, "");
+  if (!/^https?:\/\/[^/]/i.test(trimmed)) return null;
+  try {
+    const url = new URL(trimmed);
+    if ((url.protocol !== "http:" && url.protocol !== "https:") || !url.hostname.includes(".")) return null;
+    const bareOrigin = url.pathname === "/" && !url.search && !url.hash && !trimmed.endsWith("/");
+    return bareOrigin ? url.href.slice(0, -1) : url.href;
+  } catch {
+    return null;
+  }
+}
+
+/** Null for messages kept from before a group became a supergroup: they carry negative ids and have no t.me address. */
+export function messageLink(chatId: number, msgId: number): string | null {
+  if (msgId <= 0) return null;
   const internalId = String(chatId).replace(/^-100/, "").replace(/^-/, "");
   return `https://t.me/c/${internalId}/${msgId}`;
+}
+
+const REPO_HOSTS = new Set(["github.com", "gitlab.com", "codeberg.org"]);
+
+export function isRepoHost(domain: string): boolean {
+  return REPO_HOSTS.has(domain.toLowerCase().replace(/^www\./, ""));
+}
+
+/** Where a project's own name sits in links to stores and registries; elsewhere the domain names it. */
+const NAME_IN_PATH: { host: RegExp; name: (parts: string[], url: URL) => string | undefined }[] = [
+  { host: /^apps\.apple\.com$/, name: (parts) => (parts.includes("app") ? parts[parts.indexOf("app") + 1] : undefined) },
+  { host: /^play\.google\.com$/, name: (_parts, url) => url.searchParams.get("id")?.split(".").pop() },
+  { host: /^(t|telegram)\.me$/, name: (parts) => parts[0] },
+  { host: /^npmjs\.com$/, name: (parts) => (parts[0] === "package" ? parts.slice(1).join("/") : undefined) },
+  { host: /^pypi\.org$/, name: (parts) => (parts[0] === "project" ? parts[1] : undefined) },
+  { host: /^crates\.io$/, name: (parts) => (parts[0] === "crates" ? parts[1] : undefined) },
+  { host: /^(chromewebstore|chrome)\.google\.com$/, name: (parts) => (parts.includes("detail") ? parts[parts.indexOf("detail") + 1] : undefined) },
+  { host: /^marketplace\.visualstudio\.com$/, name: (_parts, url) => url.searchParams.get("itemName")?.split(".").pop() },
+  { host: /\.itch\.io$/, name: (parts) => parts[0] },
+];
+
+/** A project name guessed from its link: the repository, the app in a store, or the site's own name. */
+export function projectNameFromUrl(raw: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  const domain = url.hostname.toLowerCase().replace(/^www\./, "");
+  const parts = url.pathname.split("/").filter(Boolean).map((part) => {
+    try {
+      return decodeURIComponent(part);
+    } catch {
+      return part;
+    }
+  });
+  const fromPath = isRepoHost(domain) ? parts[1] : NAME_IN_PATH.find((rule) => rule.host.test(domain))?.name(parts, url);
+  const name = fromPath?.trim() || domain.split(".")[0] || domain;
+  return name.slice(0, 80) || null;
 }
 
 export function slugify(name: string): string {

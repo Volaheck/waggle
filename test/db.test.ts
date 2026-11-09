@@ -11,7 +11,7 @@ import { listProjects, setVote, upsertProject } from "../src/core/projects.js";
 import { catchupFor } from "../src/core/chronicle.js";
 import { attachLegacyData, chatsOfUser, LEGACY_CHAT_ID, registerChat, setChatStatus } from "../src/core/chats.js";
 import { resolveUser, type Person } from "../src/core/users.js";
-import { importSeed } from "../src/scripts/seed.js";
+import { importSeed, parseSeed } from "../src/scripts/seed.js";
 import { applyConsolidation, loadConsolidationInput } from "../src/worker/consolidate.js";
 import { applyExtraction, buildExtractionPrompt, runExtractionPass, type ExtractionResult } from "../src/worker/extract.js";
 
@@ -50,6 +50,19 @@ describe.skipIf(!DATABASE_URL)("with postgres", () => {
     expect(after[0]).toEqual(before[0]);
     expect(before[0]!.projects).toBe(4);
     expect(before[0]!.users).toBe(5);
+  });
+
+  it("reads the Russian statuses of older seed files as today's codes", async () => {
+    const SEED_CHAT_ID = -1005550000001;
+    const legacy = ["идея", "в работе", "запущен", "на паузе", "заброшен"].map((status, index) => ({
+      slug: `legacy-${index}`, name: `Legacy ${index}`, status, links: {}, authors: [],
+    }));
+    const { people, projects } = parseSeed([], legacy);
+    expect(projects.map((project) => project.status)).toEqual(["idea", "in_progress", "launched", "paused", "abandoned"]);
+    await importSeed(sql, SEED_CHAT_ID, people, projects);
+    const stored = await sql<{ status: string }[]>`SELECT status FROM projects WHERE chat_id = ${SEED_CHAT_ID} ORDER BY slug`;
+    expect(stored.map((row) => row.status)).toEqual(["idea", "in_progress", "launched", "paused", "abandoned"]);
+    expect(() => parseSeed([], [{ ...legacy[0], status: "done" }])).toThrow();
   });
 
   it("links a seeded card when the real account shows up", async () => {
@@ -107,6 +120,7 @@ describe.skipIf(!DATABASE_URL)("with postgres", () => {
       facts_update: [],
       facts_outdated: [],
       projects: [],
+      project_renames: [],
       project_signals: [
         { project: "atlas", person: `u${fan.id}`, kind: "usage", impact: 4, note: "Фанат трекает в Atlas все привычки", source_msg_ids: [9001] },
         { project: "atlas", person: `u${fan.id}`, kind: "usage", impact: 5, note: "дубль", source_msg_ids: [9003] },
@@ -229,15 +243,35 @@ describe.skipIf(!DATABASE_URL)("with postgres", () => {
     expect((await app.request("/api/people", { headers })).status).toBe(200);
   });
 
-  it("attaches imported history to a chat once an owner approves it", async () => {
+  it("attaches imported history to a chat once an owner approves it, merging what collides", async () => {
     const legacyUser = await resolveUser(sql, { id: 5050, first_name: "Импорт" }, [], LEGACY_CHAT_ID);
     await proposeFact(sql, { chatId: LEGACY_CHAT_ID, userId: legacyUser.id, kind: "stack", value: "Elixir", confidence: 0.9, sourceMsgIds: [1], source: "seed" });
-    await saveMessage(sql, { chatId: LEGACY_CHAT_ID, msgId: 77, userId: legacyUser.id, sentAt: new Date(), text: "старое сообщение", replyToMsgId: null, isForward: false, forwardSource: null, mediaType: null });
+    await sql`INSERT INTO rejected_facts (chat_id, user_id, kind, value_norm) VALUES (${LEGACY_CHAT_ID}, ${legacyUser.id}, 'stack', 'cobol')`;
+    await saveMessage(sql, { chatId: LEGACY_CHAT_ID, msgId: 77, userId: legacyUser.id, sentAt: new Date(), text: "старое сообщение https://pulse.example.com", replyToMsgId: null, isForward: false, forwardSource: null, mediaType: null });
+    // The chat already has the imported slug, as the chronicler or /addproject can create between approval and attach.
+    const [own] = await sql<{ id: number }[]>`INSERT INTO projects (chat_id, slug, name) VALUES (${OTHER_CHAT_ID}, 'pulse', 'Pulse') RETURNING id`;
+    const [imported] = await sql<{ id: number }[]>`INSERT INTO projects (chat_id, slug, name) VALUES (${LEGACY_CHAT_ID}, 'pulse', 'Pulse') RETURNING id`;
+    await sql`INSERT INTO project_members (project_id, user_id) VALUES (${imported!.id}, ${legacyUser.id})`;
+    await sql`INSERT INTO project_signals (project_id, user_id, kind, impact, note, happened_at) VALUES (${imported!.id}, ${legacyUser.id}, 'milestone', 5, 'Pulse launched', now())`;
+    const [topic] = await sql<{ id: number }[]>`
+      INSERT INTO chronicle (chat_id, run_id, period_from, period_to, title, summary, project_id, msg_ids)
+      VALUES (${LEGACY_CHAT_ID}, 0, now(), now(), 'Pulse launched', 'Импорт запустил Pulse.', ${imported!.id}, '{77}') RETURNING id`;
+
     const moved = await attachLegacyData(sql, OTHER_CHAT_ID);
-    expect(moved.messages).toBe(1);
+    expect(moved).toMatchObject({ messages: 1, projects: 1, projectsMerged: 1, topics: 1 });
+    expect((await sql`SELECT 1 FROM messages WHERE chat_id = ${OTHER_CHAT_ID} AND msg_id = 77`).length).toBe(1);
     expect((await visibleFacts(sql, OTHER_CHAT_ID, legacyUser.id)).map((fact) => fact.value)).toEqual(["Elixir"]);
-    const [left] = await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM facts WHERE chat_id = ${LEGACY_CHAT_ID}`;
-    expect(left!.count).toBe(0);
+    expect(await proposeFact(sql, { chatId: OTHER_CHAT_ID, userId: legacyUser.id, kind: "stack", value: "COBOL", confidence: 0.9, sourceMsgIds: [1], source: "llm" })).toBe("skipped_rejected");
+    const [pulse] = await sql<{ authors: number; signals: number }[]>`
+      SELECT (SELECT count(*)::int FROM project_members WHERE project_id = ${own!.id}) AS authors,
+             (SELECT count(*)::int FROM project_signals WHERE project_id = ${own!.id}) AS signals`;
+    expect(pulse).toEqual({ authors: 1, signals: 1 });
+    expect((await sql<{ chat_id: number; project_id: number }[]>`SELECT chat_id, project_id FROM chronicle WHERE id = ${topic!.id}`)[0]).toEqual({ chat_id: OTHER_CHAT_ID, project_id: own!.id });
+    const [left] = await sql<{ count: string }[]>`
+      SELECT (SELECT count(*) FROM messages WHERE chat_id = ${LEGACY_CHAT_ID}) + (SELECT count(*) FROM facts WHERE chat_id = ${LEGACY_CHAT_ID})
+           + (SELECT count(*) FROM rejected_facts WHERE chat_id = ${LEGACY_CHAT_ID}) + (SELECT count(*) FROM projects WHERE chat_id = ${LEGACY_CHAT_ID})
+           + (SELECT count(*) FROM chronicle WHERE chat_id = ${LEGACY_CHAT_ID}) + (SELECT count(*) FROM members WHERE chat_id = ${LEGACY_CHAT_ID}) AS count`;
+    expect(Number(left!.count)).toBe(0);
   });
 });
 

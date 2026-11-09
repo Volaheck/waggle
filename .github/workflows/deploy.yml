@@ -8,10 +8,8 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Never run two deploys at once; let an in-flight one finish.
-concurrency:
-  group: deploy-prod
-  cancel-in-progress: false
+permissions:
+  contents: read
 
 jobs:
   gate:
@@ -24,20 +22,50 @@ jobs:
 
   deploy:
     needs: gate
+    # Automatically only the newest commit of main is deployed: when CI runs finish out of order or an old one
+    # is re-run, main has already moved on, and shipping the older commit would roll production back.
+    # By hand (Run workflow) any branch or tag can be deployed, e.g. to go back to an earlier release on purpose.
     if: >-
       needs.gate.outputs.enabled == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
-       (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'))
+       (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_sha == github.sha))
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Never two deploys at once, and one that started always finishes. The group is on this job rather than on the
+    # workflow, so runs that are not going to deploy (failed CI, an older commit) never join it: GitHub keeps one
+    # pending job per group and cancels the older one, and such a run must not take the place of a waiting deploy.
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
     env:
       DEPLOY_DIR: ${{ vars.DEPLOY_DIR || 'waggle' }}
       TARGET: ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ env.SHA }}
+
+      # Checked again right before shipping: this job may have waited behind another deploy, or be a re-run of an old one.
+      - name: Check that main has not moved on
+        id: fresh
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            echo "ship=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tip=$(git ls-remote origin refs/heads/main | cut -f1)
+          [ -n "$tip" ] || { echo "::error::Could not read where main is."; exit 1; }
+          if [ "$tip" = "$SHA" ]; then
+            echo "ship=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ship=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Not deploying ${SHA:0:7}: main is at ${tip:0:7} now, which ships with its own run."
+          fi
 
       - name: Configure SSH
+        if: steps.fresh.outputs.ship == 'true'
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
@@ -47,6 +75,7 @@ jobs:
       # The server owns .env (database password, public URL), docker-compose.override.yml (how the
       # server's reverse proxy reaches the bot), backups and private data — never overwrite them.
       - name: Sync code to server
+        if: steps.fresh.outputs.ship == 'true'
         run: |
           rsync -az --delete \
             --exclude '.git' --exclude 'node_modules' --exclude 'web/node_modules' \
@@ -57,6 +86,7 @@ jobs:
       # Secrets live in GitHub and are written into the server's .env on every deploy,
       # so rotating one in GitHub takes effect with the next deploy. Other keys stay as they are.
       - name: Write secrets into the server .env
+        if: steps.fresh.outputs.ship == 'true'
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -82,14 +112,72 @@ jobs:
           put ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY" required
           put ADMIN_TG_IDS "$ADMIN_TG_IDS" optional
 
+      # Migrations run when the new bot starts. Before that, the image of the running release gets a tag of its own
+      # and the database is dumped; if the new release does not become healthy, the previous one is put back.
+      # Container logs stay on the server: this repository is public, and so are its Actions logs.
       - name: Build and restart
+        if: steps.fresh.outputs.ship == 'true'
         run: |
-          ssh "$TARGET" "
+          ssh "$TARGET" bash -s -- "$DEPLOY_DIR" "${SHA:0:12}" <<'REMOTE'
+          # The script arrives on stdin, and a command that reads stdin (docker compose run/exec do) would swallow
+          # the rest of it: bash would then stop early and still report success. So the whole script is one function,
+          # read completely before it runs, and what it starts gets /dev/null as stdin.
+          deploy() {
             set -euo pipefail
-            cd $DEPLOY_DIR
-            grep -q '^POSTGRES_PASSWORD=.' .env || { echo 'POSTGRES_PASSWORD is missing in the server .env'; exit 1; }
+            cd "$1"
+            release="$2"
+            grep -q '^POSTGRES_PASSWORD=.' .env || { echo '::error::POSTGRES_PASSWORD is missing in the server .env'; exit 1; }
             # docker compose picks up docker-compose.override.yml by itself when it exists.
-            docker compose up -d --build --wait --remove-orphans
+
+            running=$(docker compose ps -a -q bot | sed -n 1p)
+            previous_image=""
+            bot_image=""
+            if [ -n "$running" ]; then
+              previous_image=$(docker inspect --format '{{.Image}}' "$running")
+              bot_image=$(docker inspect --format '{{.Config.Image}}' "$running")
+              docker tag "$previous_image" "${bot_image%:*}:previous"
+            fi
+
+            docker compose build bot
+
+            restore_point=""
+            if [ -n "$(docker compose ps -q db)" ]; then
+              restore_point="pre-deploy-$(date -u +%Y%m%d-%H%M%S)-$release.dump"
+              # Written by the backup container, which can write to backups/ whoever owns that folder on the host. The last 10 are kept.
+              docker compose run --rm --no-deps -T backup \
+                "umask 077 && pg_dump -h waggle-db -U waggle -Fc -f /backups/$restore_point waggle && ls -1t /backups/pre-deploy-*.dump | tail -n +11 | xargs -r rm -f --"
+              echo "Restore point: backups/$restore_point"
+            fi
+            migrations() { docker compose exec -T db psql -U waggle -d waggle -tAc 'SELECT name FROM schema_migrations ORDER BY name' 2>/dev/null || true; }
+            bot_health() { docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$(docker compose ps -a -q bot | sed -n 1p)" 2>/dev/null || true; }
+            migrated_before=$(migrations)
+
+            if ! timeout 300 docker compose up -d --no-build --wait --remove-orphans; then
+              docker compose ps
+              # Another service may have failed while the bot was still starting: let the bot's own health settle first.
+              for _ in $(seq 24); do [ "$(bot_health)" = starting ] || break; sleep 5; done
+              if [ "$(bot_health)" = healthy ]; then
+                echo "::error::The new bot is up, but another service did not start; nothing was rolled back. On the server: docker compose ps"
+                exit 1
+              fi
+              echo "::error::The new release did not become healthy. On the server: docker compose logs bot"
+              if [ -n "$previous_image" ]; then
+                if [ "$(migrations)" != "$migrated_before" ]; then
+                  echo "::warning::The new release migrated the database before failing. If the previous release misbehaves on it, restore backups/$restore_point (docs/DEPLOY.md)."
+                fi
+                docker tag "$previous_image" "$bot_image"
+                if timeout 300 docker compose up -d --no-build --no-deps --force-recreate --wait bot; then
+                  echo "::warning::Rolled back: the previous release is running again."
+                else
+                  echo "::error::The previous release did not come back either."
+                fi
+                docker compose ps
+              fi
+              exit 1
+            fi
             docker compose ps
             docker image prune -f >/dev/null
-          "
+          }
+          deploy "$@" </dev/null
+          echo "Deploy finished: the release is up."
+          REMOTE

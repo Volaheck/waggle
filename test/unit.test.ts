@@ -6,7 +6,7 @@ import { buildExtractionPrompt, EXTRACTION_SYSTEM_PROMPT, isPassDue } from "../s
 import { CONSOLIDATION_SYSTEM_PROMPT } from "../src/worker/consolidate.js";
 import { factCore, isNearDuplicate, isSameFact } from "../src/core/facts.js";
 import { detectLanguage } from "../src/core/language.js";
-import { PROJECT_STATUSES, STATUS_CODE_LIST, statusCode, statusFromCode } from "../src/core/projects.js";
+import { PROJECT_STATUSES } from "../src/core/projects.js";
 import { canonicalStackValue, splitStackValue, stackFamily } from "../src/core/stack.js";
 import { topLimitFor } from "../src/core/chronicle.js";
 import type { StoredMessage } from "../src/core/messages.js";
@@ -63,7 +63,7 @@ describe("text helpers", () => {
   });
 
   it("lets a project's money-making through, but never amounts of money", () => {
-    for (const value of ["Merlin зарабатывает на приложениях в RuStore", "приложение уже приносит доход", "the app brings some income", "first paying users"]) {
+    for (const value of ["Анна зарабатывает на своих приложениях в сторе", "приложение уже приносит доход", "the app brings some income", "first paying users"]) {
       expect(hasForbiddenTopic(value), value).toBe(false);
     }
     for (const value of ["потратил 500 долларов", "доход 50к рублей", "заработал $300", "€20 в месяц", "3 млн ₽", "spent 500 dollars", "made 200 USD"]) {
@@ -193,15 +193,9 @@ describe("chronicler prompts", () => {
 
   it("are written in English and list the exact status codes the schemas accept", () => {
     for (const prompt of [EXTRACTION_SYSTEM_PROMPT, CONSOLIDATION_SYSTEM_PROMPT]) {
-      for (const code of STATUS_CODE_LIST) expect(prompt).toContain(`"${code}"`);
+      for (const code of PROJECT_STATUSES) expect(prompt).toContain(`"${code}"`);
       expect(prompt).not.toMatch(cyrillic);
     }
-  });
-
-  it("map the chronicler's status codes to stored statuses and back", () => {
-    for (const status of PROJECT_STATUSES) expect(statusFromCode(statusCode(status))).toBe(status);
-    expect(statusCode("whatever")).toBeNull();
-    expect(statusFromCode(null)).toBeNull();
   });
 
   it("tell the model the chat's language when it can be measured", () => {
@@ -234,6 +228,14 @@ describe("chronicler prompts", () => {
     expect(prompt).toContain("[2] Mike (u7) ↩1 [forwarded from Tech News] [photo]: Look at this");
     expect(prompt).toContain("[3] unknown: Look at this");
     expect(prompt).not.toMatch(cyrillic);
+  });
+
+  it("show a message without text by what it was, with no empty text after it", () => {
+    const mike: Person = { id: 7, tg_id: 7, username: "mike", display_name: "Mike", is_admin: false, dm_started: false, current_chat_id: null, chat_id: -1, user_id: 7, tagline: null, tagline_manual: false, opted_out: false, first_seen_at: null, last_message_at: null, left_at: null };
+    const photo: StoredMessage = { chat_id: -1, msg_id: 4, user_id: 7, sent_at: new Date(), text: "", reply_to_msg_id: null, is_forward: false, forward_source: null, media_type: "photo" };
+    const prompt = buildExtractionPrompt({ chatId: -1, batch: [photo, { ...photo, msg_id: 5, text: "Nice shot", media_type: null, reply_to_msg_id: 4 }], context: [], users: [mike], facts: [], projects: [] });
+    expect(prompt).toContain("[4] Mike (u7) [photo]\n");
+    expect(prompt).toContain("[5] Mike (u7) ↩4: Nice shot");
   });
 });
 

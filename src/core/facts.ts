@@ -1,4 +1,4 @@
-import type { Sql } from "./db.js";
+import type { Queryable, Sql } from "./db.js";
 import { canonicalStackValue, splitStackValue, stackFamily } from "./stack.js";
 import { hasForbiddenTopic, normalizeUrl, normalizeValue } from "./text.js";
 
@@ -89,7 +89,26 @@ export function isSameFact(kind: string, a: string, b: string): boolean {
 
 const RESULT_PRIORITY: ProposeResult[] = ["added", "reinforced", "skipped_existing", "skipped_rejected", "skipped_forbidden", "skipped_opted_out"];
 
-export async function proposeFact(sql: Sql, fact: ProposedFact): Promise<ProposeResult> {
+type StoredFact = Fact & { value_norm: string };
+
+interface FactOwner {
+  chatId: number;
+  userId: number;
+  kind: string;
+}
+
+/** The person removed this fact as wrong («❌ Remove wrong»): nothing but the person may write it back, reworded or not. */
+async function isRejected(sql: Queryable, owner: FactOwner, value: string): Promise<boolean> {
+  const rejected = await sql<{ value_norm: string }[]>`
+    SELECT value_norm FROM rejected_facts WHERE chat_id = ${owner.chatId} AND user_id = ${owner.userId} AND kind = ${owner.kind}`;
+  return rejected.some((row) => isSameFact(owner.kind, row.value_norm, value));
+}
+
+function unionSources(...lists: number[][]): number[] {
+  return [...new Set(lists.flat())].slice(-10);
+}
+
+export async function proposeFact(sql: Queryable, fact: ProposedFact): Promise<ProposeResult> {
   if (fact.kind === "stack") {
     const parts = splitStackValue(fact.value);
     if (parts.length > 1) {
@@ -108,11 +127,7 @@ export async function proposeFact(sql: Sql, fact: ProposedFact): Promise<Propose
       SELECT opted_out FROM members WHERE chat_id = ${fact.chatId} AND user_id = ${fact.userId} FOR UPDATE`;
     if (!owner || owner.opted_out) return "skipped_opted_out";
 
-    if (fact.source !== "user") {
-      const rejected = await tx<{ value_norm: string }[]>`
-        SELECT value_norm FROM rejected_facts WHERE chat_id = ${fact.chatId} AND user_id = ${fact.userId} AND kind = ${fact.kind}`;
-      if (rejected.some((row) => isSameFact(fact.kind, row.value_norm, value))) return "skipped_rejected";
-    }
+    if (fact.source !== "user" && (await isRejected(tx, fact, value))) return "skipped_rejected";
 
     if (fact.kind === "link") {
       const url = normalizeUrl(value)?.norm;
@@ -133,7 +148,7 @@ export async function proposeFact(sql: Sql, fact: ProposedFact): Promise<Propose
 
     if (existing) {
       if (existing.status === "hidden" && fact.source !== "user") return "skipped_existing";
-      const mergedSources = [...new Set([...existing.source_msg_ids, ...fact.sourceMsgIds])].slice(-10);
+      const mergedSources = unionSources(existing.source_msg_ids, fact.sourceMsgIds);
       const nextConfidence = Math.min(1, Math.max(existing.confidence, confidence) + (fact.source === "llm" ? CONFIDENCE_BOOST : 0));
       const nextStatus = fact.source === "user" ? "manual" : existing.status === "deprecated" ? "auto" : existing.status;
       // A person's own wording replaces the chronicler's; otherwise the existing wording stays.
@@ -193,19 +208,44 @@ export async function rejectFact(sql: Sql, factId: number, actorUserId: number, 
   });
 }
 
-export async function setFactHidden(sql: Sql, factId: number, hidden: boolean, actorUserId: number, source: FactSource): Promise<boolean> {
-  const rows = await sql`
-    UPDATE facts SET status = ${hidden ? "hidden" : "auto"}, updated_at = now()
-    WHERE id = ${factId} AND status IN ${hidden ? sql(["auto", "manual"]) : sql(["hidden"])}
-    RETURNING id`;
-  if (rows.length === 0) return false;
-  await sql`
-    INSERT INTO change_log (entity, entity_id, op, source, actor_user_id)
-    VALUES ('fact', ${factId}, ${hidden ? "hide" : "restore"}, ${source}, ${actorUserId})`;
-  return true;
+/**
+ * Hiding is about visibility, not authorship: the status a fact had before it was hidden is kept
+ * in the change log and comes back on restore, so the person's own fact stays protected as theirs.
+ */
+export async function setFactHidden(sql: Queryable, factId: number, hidden: boolean, actorUserId: number, source: FactSource): Promise<boolean> {
+  return sql.begin(async (tx) => {
+    const [fact] = await tx<{ status: Fact["status"] }[]>`SELECT status FROM facts WHERE id = ${factId} FOR UPDATE`;
+    if (!fact) return false;
+    if (hidden) {
+      if (fact.status !== "auto" && fact.status !== "manual") return false;
+      await tx`UPDATE facts SET status = 'hidden', updated_at = now() WHERE id = ${factId}`;
+      await tx`
+        INSERT INTO change_log (entity, entity_id, op, before, source, actor_user_id)
+        VALUES ('fact', ${factId}, 'hide', ${tx.json({ status: fact.status })}, ${source}, ${actorUserId})`;
+      return true;
+    }
+    if (fact.status !== "hidden") return false;
+    const restored = await statusBeforeHide(tx, factId);
+    await tx`UPDATE facts SET status = ${restored}, updated_at = now() WHERE id = ${factId}`;
+    await tx`
+      INSERT INTO change_log (entity, entity_id, op, after, source, actor_user_id)
+      VALUES ('fact', ${factId}, 'restore', ${tx.json({ status: restored })}, ${source}, ${actorUserId})`;
+    return true;
+  });
 }
 
-export async function deprecateFact(sql: Sql, factId: number, sourceMsgIds: number[]): Promise<boolean> {
+async function statusBeforeHide(sql: Queryable, factId: number): Promise<"auto" | "manual"> {
+  const [hide] = await sql<{ status: string | null }[]>`
+    SELECT before->>'status' AS status FROM change_log
+    WHERE entity = 'fact' AND entity_id = ${factId} AND op = 'hide'
+    ORDER BY id DESC LIMIT 1`;
+  if (hide?.status === "auto" || hide?.status === "manual") return hide.status;
+  // Hidden before the status was recorded: a fact the person added themselves is still theirs.
+  const [own] = await sql`SELECT 1 FROM change_log WHERE entity = 'fact' AND entity_id = ${factId} AND op = 'add' AND source = 'user' LIMIT 1`;
+  return own ? "manual" : "auto";
+}
+
+export async function deprecateFact(sql: Queryable, factId: number, sourceMsgIds: number[]): Promise<boolean> {
   const rows = await sql`
     UPDATE facts SET status = 'deprecated', updated_at = now()
     WHERE id = ${factId} AND status = 'auto'
@@ -245,25 +285,36 @@ export async function whoKnows(sql: Sql, chatId: number, topic: string, limit = 
     LIMIT ${limit}`;
 }
 
-/** The chronicler rephrases a fact instead of adding a near-copy. Manual facts are the person's own words and stay. */
-export async function rewriteFact(sql: Sql, factId: number, value: string, sourceMsgIds: number[], source: FactSource): Promise<boolean> {
-  const [{ kind } = { kind: "" }] = await sql<{ kind: string }[]>`SELECT kind FROM facts WHERE id = ${factId}`;
-  const next = (kind === "stack" ? canonicalStackValue(value) : value.trim()).slice(0, 160);
-  const nextNorm = normalizeValue(next);
-  if (!nextNorm || hasForbiddenTopic(next)) return false;
+/**
+ * The chronicler rephrases a fact instead of adding a near-copy. Manual facts are the person's own words and stay.
+ * Another row with the new wording decides by its status: a hidden one keeps the person's hide (nothing changes),
+ * an outdated one gives way, a live one absorbs this fact.
+ */
+export async function rewriteFact(sql: Queryable, factId: number, value: string, sourceMsgIds: number[], source: FactSource): Promise<boolean> {
   return sql.begin(async (tx) => {
-    const [fact] = await tx<(Fact & { value_norm: string })[]>`SELECT * FROM facts WHERE id = ${factId} FOR UPDATE`;
-    if (!fact || fact.status !== "auto" || fact.value_norm === nextNorm) return false;
-    const [clash] = await tx<{ id: number }[]>`
-      SELECT id FROM facts WHERE chat_id = ${fact.chat_id} AND user_id = ${fact.user_id} AND kind = ${fact.kind} AND value_norm = ${nextNorm} AND id <> ${factId}`;
-    if (clash) {
+    const [fact] = await tx<StoredFact[]>`SELECT * FROM facts WHERE id = ${factId} FOR UPDATE`;
+    if (!fact || fact.status !== "auto") return false;
+    const next = (fact.kind === "stack" ? canonicalStackValue(value) : value.trim()).slice(0, 160);
+    const nextNorm = normalizeValue(next);
+    if (!nextNorm || nextNorm === fact.value_norm || hasForbiddenTopic(next)) return false;
+    if (source !== "user" && (await isRejected(tx, { chatId: fact.chat_id, userId: fact.user_id, kind: fact.kind }, next))) return false;
+    const [twin] = await tx<StoredFact[]>`
+      SELECT * FROM facts
+      WHERE chat_id = ${fact.chat_id} AND user_id = ${fact.user_id} AND kind = ${fact.kind} AND value_norm = ${nextNorm} AND id <> ${factId}
+      FOR UPDATE`;
+    if (twin?.status === "hidden") return false;
+    if (twin && twin.status !== "deprecated") {
       await tx`DELETE FROM facts WHERE id = ${factId}`;
+      if (twin.status === "auto") {
+        await tx`
+          UPDATE facts SET source_msg_ids = ${unionSources(twin.source_msg_ids, fact.source_msg_ids, sourceMsgIds)},
+                 confidence = greatest(confidence, ${fact.confidence}), updated_at = now()
+          WHERE id = ${twin.id}`;
+      }
     } else {
+      if (twin) await tx`DELETE FROM facts WHERE id = ${twin.id}`;
       await tx`
-        UPDATE facts
-        SET value = ${next}, value_norm = ${nextNorm},
-            source_msg_ids = (SELECT coalesce(array_agg(DISTINCT x), '{}') FROM unnest(source_msg_ids || ${sourceMsgIds}::bigint[]) AS x),
-            updated_at = now()
+        UPDATE facts SET value = ${next}, value_norm = ${nextNorm}, source_msg_ids = ${unionSources(fact.source_msg_ids, sourceMsgIds)}, updated_at = now()
         WHERE id = ${factId}`;
     }
     await tx`
@@ -274,26 +325,43 @@ export async function rewriteFact(sql: Sql, factId: number, value: string, sourc
 }
 
 /**
- * Folds several facts of one person into one (keeps the first id). Manual facts are never
- * dropped or reworded; if one is in the group it becomes the keeper as is.
+ * Folds several facts of one person and one kind into one (keeps the first id). Manual facts are never
+ * dropped or reworded; if one is in the group it becomes the keeper as is. Hidden and outdated facts
+ * never take part, and a merge into a wording the person hid or removed as wrong does not happen.
  */
-export async function mergeFacts(sql: Sql, factIds: number[], value: string, source: FactSource): Promise<boolean> {
+export async function mergeFacts(sql: Queryable, factIds: number[], value: string, source: FactSource): Promise<boolean> {
   if (factIds.length === 0) return false;
   return sql.begin(async (tx) => {
-    const facts = await tx<(Fact & { value_norm: string })[]>`SELECT * FROM facts WHERE id = ANY(${factIds}) FOR UPDATE`;
-    if (facts.length === 0 || new Set(facts.map((fact) => `${fact.chat_id}:${fact.user_id}`)).size > 1) return false;
+    const facts = await tx<StoredFact[]>`SELECT * FROM facts WHERE id = ANY(${factIds}) AND status IN ('auto', 'manual') ORDER BY id FOR UPDATE`;
+    if (facts.length === 0 || new Set(facts.map((fact) => `${fact.chat_id}:${fact.user_id}:${fact.kind}`)).size > 1) return false;
     const manual = facts.find((fact) => fact.status === "manual");
     const keeper = manual ?? facts.find((fact) => fact.id === factIds[0]) ?? facts[0]!;
-    const others = facts.filter((fact) => fact.id !== keeper.id && fact.status !== "manual");
-    const sources = [...new Set(facts.flatMap((fact) => fact.source_msg_ids))].slice(-10);
-    const confidence = Math.max(...facts.map((fact) => fact.confidence));
-    if (others.length) await tx`DELETE FROM facts WHERE id = ANY(${others.map((fact) => fact.id)})`;
     const next = manual ? manual.value : (keeper.kind === "stack" ? canonicalStackValue(value) : value.trim()).slice(0, 160);
     const nextNorm = normalizeValue(next);
-    const [clash] = await tx<{ id: number }[]>`
-      SELECT id FROM facts WHERE chat_id = ${keeper.chat_id} AND user_id = ${keeper.user_id} AND kind = ${keeper.kind} AND value_norm = ${nextNorm} AND id <> ${keeper.id}`;
-    if (clash) {
-      await tx`DELETE FROM facts WHERE id = ${keeper.id} AND status <> 'manual'`;
+    if (!nextNorm) return false;
+    const owner = { chatId: keeper.chat_id, userId: keeper.user_id, kind: keeper.kind };
+    if (!manual && source !== "user" && (await isRejected(tx, owner, next))) return false;
+    const [twin] = await tx<StoredFact[]>`
+      SELECT * FROM facts
+      WHERE chat_id = ${owner.chatId} AND user_id = ${owner.userId} AND kind = ${owner.kind} AND value_norm = ${nextNorm}
+        AND id <> ALL(${facts.map((fact) => fact.id)})
+      FOR UPDATE`;
+    if (twin?.status === "hidden") return false;
+
+    const others = facts.filter((fact) => fact.id !== keeper.id && fact.status !== "manual");
+    const sources = unionSources(...facts.map((fact) => fact.source_msg_ids));
+    const confidence = Math.max(...facts.map((fact) => fact.confidence));
+    if (others.length) await tx`DELETE FROM facts WHERE id = ANY(${others.map((fact) => fact.id)})`;
+    if (twin?.status === "deprecated") await tx`DELETE FROM facts WHERE id = ${twin.id}`;
+    const absorbing = twin && twin.status !== "deprecated" ? twin : undefined;
+    if (absorbing) {
+      // A live fact outside the group already says it: the group folds into that fact.
+      if (keeper.status !== "manual") await tx`DELETE FROM facts WHERE id = ${keeper.id}`;
+      if (absorbing.status === "auto") {
+        await tx`
+          UPDATE facts SET source_msg_ids = ${unionSources(absorbing.source_msg_ids, sources)}, confidence = greatest(confidence, ${confidence}), updated_at = now()
+          WHERE id = ${absorbing.id}`;
+      }
     } else {
       await tx`
         UPDATE facts SET value = ${next}, value_norm = ${nextNorm}, source_msg_ids = ${sources}, confidence = ${confidence}, updated_at = now()
@@ -301,14 +369,14 @@ export async function mergeFacts(sql: Sql, factIds: number[], value: string, sou
     }
     await tx`
       INSERT INTO change_log (entity, entity_id, op, before, after, source)
-      VALUES ('fact', ${keeper.id}, 'merge', ${tx.json(facts.map((fact) => fact.value))}, ${tx.json({ value: next })}, ${source})`;
+      VALUES ('fact', ${absorbing?.id ?? keeper.id}, 'merge', ${tx.json(facts.map((fact) => fact.value))}, ${tx.json({ value: next })}, ${source})`;
     return true;
   });
 }
 
-/** Removes a fact as redundant (not as wrong): no stop-list entry, unlike rejectFact. */
-export async function dropFact(sql: Sql, factId: number, source: FactSource): Promise<boolean> {
-  const rows = await sql<{ value: string }[]>`DELETE FROM facts WHERE id = ${factId} AND status <> 'manual' RETURNING value`;
+/** Removes a fact as redundant (not as wrong): no stop-list entry, unlike rejectFact. The person's own and hidden facts stay. */
+export async function dropFact(sql: Queryable, factId: number, source: FactSource): Promise<boolean> {
+  const rows = await sql<{ value: string }[]>`DELETE FROM facts WHERE id = ${factId} AND status IN ('auto', 'deprecated') RETURNING value`;
   if (rows.length === 0) return false;
   await sql`INSERT INTO change_log (entity, entity_id, op, before, source) VALUES ('fact', ${factId}, 'drop', ${sql.json({ value: rows[0]!.value })}, ${source})`;
   return true;
@@ -317,12 +385,13 @@ export async function dropFact(sql: Sql, factId: number, source: FactSource): Pr
 /**
  * Deterministic clean-up of stacks: splits «A, B» facts and folds tools of one family
  * («GPT-6», «ChatGPT», «Codex») into a single fact. Runs before every LLM clean-up.
+ * Hidden facts are left exactly as the person hid them.
  */
 export async function normalizeStacks(sql: Sql, chatId?: number): Promise<{ split: number; merged: number }> {
   const scope = chatId ?? null;
   let split = 0;
   let merged = 0;
-  const combined = await sql<Fact[]>`SELECT * FROM facts WHERE kind = 'stack' AND status IN ('auto', 'manual', 'hidden') AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
+  const combined = await sql<Fact[]>`SELECT * FROM facts WHERE kind = 'stack' AND status IN ('auto', 'manual') AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
   for (const fact of combined) {
     const parts = splitStackValue(fact.value);
     if (parts.length < 2) continue;
@@ -333,7 +402,7 @@ export async function normalizeStacks(sql: Sql, chatId?: number): Promise<{ spli
     }
     split += 1;
   }
-  const facts = await sql<Fact[]>`SELECT * FROM facts WHERE kind = 'stack' AND status IN ('auto', 'manual', 'hidden') AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint) ORDER BY chat_id, user_id, status = 'manual' DESC, confidence DESC, id`;
+  const facts = await sql<Fact[]>`SELECT * FROM facts WHERE kind = 'stack' AND status IN ('auto', 'manual') AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint) ORDER BY chat_id, user_id, status = 'manual' DESC, confidence DESC, id`;
   const groups = new Map<string, Fact[]>();
   for (const fact of facts) {
     const family = stackFamily(fact.value);

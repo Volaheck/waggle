@@ -35,6 +35,8 @@ export class ApiError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
+    /** The rest of the error body, e.g. the slug of the project a 409 "exists" points at. */
+    readonly details: Record<string, unknown> = {},
   ) {
     super(code);
   }
@@ -99,8 +101,8 @@ export async function api<T>(path: string, init: { method?: string; body?: unkno
       headers,
       body: init.body === undefined ? undefined : JSON.stringify(init.body),
     });
-    const payload = (await response.json().catch(() => ({}))) as { error?: string };
-    if (!response.ok) throw new ApiError(response.status, payload.error ?? "unknown");
+    const payload = (await response.json().catch(() => ({}))) as { error?: string } & Record<string, unknown>;
+    if (!response.ok) throw new ApiError(response.status, payload.error ?? "unknown", payload);
     return payload as T;
   } finally {
     track(-1);
@@ -173,6 +175,8 @@ export interface PersonSummary {
   tagline: string | null;
   opted_out: boolean;
   linked: boolean;
+  /** The person's Telegram photo; it answers 404 when they have none or hide it. */
+  avatar_url?: string | null;
   top_facts: string[];
   project_count: number;
 }
@@ -191,7 +195,7 @@ export interface Project {
   status: string;
   stack: string[];
   links: { repo?: string | null; site?: string | null; other?: string[] };
-  authors: { id: number; display_name: string; username: string | null; role: string | null }[];
+  authors: { id: number; display_name: string; username: string | null; role: string | null; avatar_url?: string | null }[];
   votes: number;
   score: number;
   voted_by_me: boolean;
@@ -222,4 +226,5 @@ export const FACT_LABELS: Record<string, string> = {
   can_help: "Can help with",
 };
 
-export const STATUSES = ["идея", "в работе", "запущен", "на паузе", "заброшен"] as const;
+/** Project status codes, exactly as the API stores and validates them. */
+export const STATUSES = ["idea", "in_progress", "launched", "paused", "abandoned"] as const;

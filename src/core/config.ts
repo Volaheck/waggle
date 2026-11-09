@@ -24,6 +24,8 @@ const EnvSchema = z.object({
   PORT: z.coerce.number().int().default(8787),
   EXTRACTION_MODEL: z.string().default("claude-sonnet-5-5"),
   EXTRACTION_INTERVAL_HOURS: z.coerce.number().positive().default(6),
+  /** Message texts older than this are cleared once the chronicler has processed them; the rows stay. */
+  MESSAGE_RETENTION_DAYS: z.coerce.number().int().positive().default(7),
   DISPLAY_TIMEZONE: z.string().default("UTC"),
   /** Cap for the whole bot, across all chats. */
   MONTHLY_LLM_BUDGET_USD: z.coerce.number().default(60),
@@ -40,9 +42,14 @@ export type Config = z.infer<typeof EnvSchema>;
 
 let cached: Config | undefined;
 
+/** `KEY=` with nothing after it, as .env.example ships the optional keys, means the key is not set. */
+function withoutBlankValues(env: NodeJS.ProcessEnv): Record<string, string> {
+  return Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined && entry[1].trim() !== ""));
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (cached) return cached;
-  const parsed = EnvSchema.safeParse(env);
+  const parsed = EnvSchema.safeParse(withoutBlankValues(env));
   if (!parsed.success) {
     const problems = parsed.error.issues.map((issue) => `  ${issue.path.join(".")}: ${issue.message}`);
     throw new Error(`Invalid environment variables:\n${problems.join("\n")}`);

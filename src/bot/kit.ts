@@ -1,9 +1,9 @@
 import { InlineKeyboard, type Bot, type Context } from "grammy";
-import type { InlineKeyboardButton, User as TelegramUser } from "grammy/types";
-import { approvedChats, chatsOfUser, setCurrentChat, type Chat } from "../core/chats.js";
+import type { InlineKeyboardButton, Message, User as TelegramUser } from "grammy/types";
+import { approvedChats, chatsOfUser, isApproved, setCurrentChat, type Chat } from "../core/chats.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
-import { ensureMember, getPerson, resolveUser, type Person, type User } from "../core/users.js";
+import { ensureMember, getPerson, markLeft, resolveUser, type Person, type User } from "../core/users.js";
 import { clampTelegram } from "./format.js";
 import type { MembershipCache } from "./membership.js";
 
@@ -48,6 +48,22 @@ export function decodeStartParam(param: string): { chatId: number | null; rest: 
   return { chatId: -Number(match[1]), rest: match[2] ?? "" };
 }
 
+/** The «c100123» part of callback data back to a chat id. */
+export function decodeChat(encoded: string | undefined): number {
+  return -Number(encoded);
+}
+
+/**
+ * The message this one really replies to. Inside a forum topic every message carries the topic's first
+ * message as reply_to_message, which is not a reply to its author.
+ */
+export function realReply(message: Message | undefined): Message["reply_to_message"] {
+  const replied = message?.reply_to_message;
+  if (!message || !replied) return undefined;
+  if (message.is_topic_message && (replied.forum_topic_created || replied.message_id === message.message_thread_id)) return undefined;
+  return replied;
+}
+
 /** Who is acting and in which chat: the group itself, or the chat picked in DM. */
 export interface Scope {
   user: User;
@@ -63,12 +79,23 @@ export interface BotKit {
   membership: MembershipCache;
   identity: (from: TelegramUser, chatId?: number) => Promise<User>;
   isPrivate: (ctx: BotContext) => boolean;
+  /** Owners are exactly the configured ADMIN_TG_IDS: removing an id revokes everything at the next start. */
   isOwner: (user: User) => boolean;
   /**
    * Resolves the chat a command is about. In DM with several chats and no choice yet,
    * shows a picker and returns undefined — the caller simply stops.
    */
   scope: (ctx: BotContext) => Promise<Scope | undefined>;
+  /**
+   * A DM button made for one chat acts on that chat, never on whichever chat is current when it is tapped.
+   * Says so and returns undefined when the person is no longer in it.
+   */
+  scopeForChat: (ctx: BotContext, chatId: number) => Promise<Scope | undefined>;
+  /**
+   * The person's card in an approved chat they are in right now. Telegram's word decides: a missed leave is
+   * recorded, a missed join is filled in; when Telegram can't be asked, the stored membership stands.
+   */
+  currentMember: (chatId: number, from: TelegramUser) => Promise<Person | undefined>;
   chatPicker: (ctx: BotContext, user: User, chats: Chat[], edit?: boolean) => Promise<unknown>;
   usersById: () => Promise<Map<number, User>>;
   appButton: (ctx: BotContext, chatId: number, label: string, path: string, startParam: string) => InlineKeyboardButton | undefined;
@@ -103,6 +130,22 @@ export function createKit(bot: Bot<BotContext>, sql: Sql, config: Config, member
     return show(ctx, "🐝 <b>Which chat should I open?</b>\nYou're in several chats with Waggle — each has its own cards and chronicle.", keyboard, { edit });
   };
 
+  const memberOf = async (chatId: number, from: TelegramUser): Promise<{ user: User; person: Person } | undefined> => {
+    const user = await resolveUser(sql, from, config.ADMIN_TG_IDS);
+    if (!(await isApproved(sql, chatId))) return undefined;
+    const state = await membership.status(chatId, from.id);
+    if (state === "left") {
+      await markLeft(sql, chatId, from.id);
+      return undefined;
+    }
+    let person = await getPerson(sql, chatId, user.id);
+    if (state === "member" && (!person || person.left_at)) {
+      await ensureMember(sql, chatId, user.id);
+      person = await getPerson(sql, chatId, user.id);
+    }
+    return person && !person.left_at ? { user, person } : undefined;
+  };
+
   return {
     bot,
     sql,
@@ -111,7 +154,7 @@ export function createKit(bot: Bot<BotContext>, sql: Sql, config: Config, member
     membership,
     identity: (from, chatId) => resolveUser(sql, from, config.ADMIN_TG_IDS, chatId),
     isPrivate,
-    isOwner: (user) => user.is_admin || (user.tg_id !== null && config.ADMIN_TG_IDS.includes(user.tg_id)),
+    isOwner: (user) => user.tg_id !== null && config.ADMIN_TG_IDS.includes(user.tg_id),
     scope: async (ctx) => {
       if (!ctx.from || !ctx.chat) return undefined;
       if (!isPrivate(ctx)) {
@@ -128,25 +171,42 @@ export function createKit(bot: Bot<BotContext>, sql: Sql, config: Config, member
         }
         chats = await chatsOfUser(sql, user.id);
       }
-      if (chats.length === 0) {
-        await show(
-          ctx,
-          "🐝 You're not in any chat with Waggle yet.\n\nAdd the bot to your group — once it's approved, it starts keeping the chronicle and cards there.",
-        );
-        return undefined;
+      for (;;) {
+        if (chats.length === 0) {
+          await show(
+            ctx,
+            "🐝 You're not in any chat with Waggle yet.\n\nAdd the bot to your group — once it's approved, it starts keeping the chronicle and cards there.",
+          );
+          return undefined;
+        }
+        const chat = chats.find((candidate) => candidate.id === user.current_chat_id) ?? (chats.length === 1 ? chats[0] : undefined);
+        if (!chat) {
+          await chatPicker(ctx, user, chats, Boolean(ctx.callbackQuery));
+          return undefined;
+        }
+        // The stored membership may miss a leave; Telegram has the last word on the chat about to be opened.
+        if ((await membership.status(chat.id, ctx.from.id)) === "left") {
+          await markLeft(sql, chat.id, ctx.from.id);
+          chats = chats.filter((candidate) => candidate.id !== chat.id);
+          continue;
+        }
+        if (chat.id !== user.current_chat_id) await setCurrentChat(sql, user.id, chat.id);
+        const person = await getPerson(sql, chat.id, user.id);
+        return person ? { user, chatId: chat.id, person } : undefined;
       }
-      let chat = chats.find((candidate) => candidate.id === user.current_chat_id);
-      if (!chat && chats.length === 1) {
-        chat = chats[0]!;
-        await setCurrentChat(sql, user.id, chat.id);
-      }
-      if (!chat) {
-        await chatPicker(ctx, user, chats, Boolean(ctx.callbackQuery));
-        return undefined;
-      }
-      const person = await getPerson(sql, chat.id, user.id);
-      return person ? { user, chatId: chat.id, person } : undefined;
     },
+    scopeForChat: async (ctx, chatId) => {
+      if (!ctx.from) return undefined;
+      const found = await memberOf(chatId, ctx.from);
+      if (found) {
+        // Plain navigation buttons (projects, people, chronicle) follow the chat the person is working with.
+        if (found.user.current_chat_id !== chatId) await setCurrentChat(sql, found.user.id, chatId);
+        return { user: found.user, chatId, person: found.person };
+      }
+      await show(ctx, "🐝 You're not in that chat anymore, so I can't open it. Your chats — /start", undefined, { edit: Boolean(ctx.callbackQuery?.message) });
+      return undefined;
+    },
+    currentMember: async (chatId, from) => (await memberOf(chatId, from))?.person,
     chatPicker,
     usersById: async () => new Map((await sql<User[]>`SELECT * FROM users`).map((user) => [user.id, user])),
     appButton: (ctx, chatId, label, path, startParam) => {

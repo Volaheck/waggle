@@ -1,20 +1,26 @@
 import { FACT_KIND_LABELS, type Fact, type FactKind } from "../core/facts.js";
-import { STATUS_LABELS, type Project, type ProjectListItem } from "../core/projects.js";
+import { STATUS_LABELS, type Project, type ProjectListItem, type ProjectStatus } from "../core/projects.js";
 import type { CatchupData, ChronicleEntry } from "../core/chronicle.js";
-import { escapeHtml, messageLink, truncate } from "../core/text.js";
+import { escapeHtml, messageLink, safeHttpUrl, truncate } from "../core/text.js";
 import type { Person, User } from "../core/users.js";
 
-export const STATUS_EMOJI: Record<string, string> = {
-  идея: "💡",
-  "в работе": "🛠",
-  запущен: "🚀",
-  "на паузе": "⏸",
-  заброшен: "🪦",
+export const STATUS_EMOJI: Record<ProjectStatus, string> = {
+  idea: "💡",
+  in_progress: "🛠",
+  launched: "🚀",
+  paused: "⏸",
+  abandoned: "🪦",
 };
 
 const TOPIC_EMOJI: Record<ChronicleEntry["kind"], string> = { discussion: "💬", project: "🛠", link: "🔗", news: "📰" };
 
 const SIGNAL_EMOJI: Record<string, string> = { praise: "❤️", critique: "🧐", usage: "✅", contribution: "🤝", interest: "👀", milestone: "🚀" };
+
+/** A link to a chat message, or nothing when the message has no t.me address (see messageLink). */
+function linkTo(chatId: number, msgId: number, label: string): string {
+  const url = messageLink(chatId, msgId);
+  return url ? `<a href="${url}">${label}</a>` : "";
+}
 
 /** «3 messages», «1 card». */
 export function countOf(count: number, singular: string, plural = `${singular}s`): string {
@@ -75,17 +81,21 @@ export function projectCard(project: ProjectListItem, chatId: number): string {
     lines.push(`Authors: ${project.authors.map((author) => `${escapeHtml(author.display_name)}${author.role ? ` <i>(${escapeHtml(author.role)})</i>` : ""}`).join(", ")}`);
   }
   if (project.stack.length) lines.push(`Stack: ${project.stack.map(escapeHtml).join(", ")}`);
-  const links = [project.links.repo, project.links.site, ...(project.links.other ?? [])].filter((link): link is string => Boolean(link));
+  // Stored links may predate validation: only a clean http(s) URL becomes a link, always escaped for the attribute.
+  const links = [project.links.repo, project.links.site, ...(project.links.other ?? [])]
+    .map((link) => safeHttpUrl(link))
+    .filter((link): link is string => link !== null);
   if (links.length) lines.push(links.map((link) => `<a href="${escapeHtml(link)}">${escapeHtml(link.replace(/^https?:\/\//, ""))}</a>`).join(" · "));
   lines.push(`🏆 Rating ${project.score} · 👍 ${project.votes}`);
   if (project.recent_signals.length) {
     lines.push("", "<b>What people say</b>");
     for (const signal of project.recent_signals.slice(0, 4)) {
-      const link = signal.msg_id ? ` <a href="${messageLink(chatId, signal.msg_id)}">→</a>` : "";
-      lines.push(`${SIGNAL_EMOJI[signal.kind] ?? "•"} ${escapeHtml(signal.note)}${link}`);
+      const link = signal.msg_id ? linkTo(chatId, signal.msg_id, "→") : "";
+      lines.push(`${SIGNAL_EMOJI[signal.kind] ?? "•"} ${escapeHtml(signal.note)}${link ? ` ${link}` : ""}`);
     }
   }
-  if (project.first_seen_msg_id) lines.push("", `<a href="${messageLink(chatId, project.first_seen_msg_id)}">First mention in the chat</a>`);
+  const firstMention = project.first_seen_msg_id ? linkTo(chatId, project.first_seen_msg_id, "First mention in the chat") : "";
+  if (firstMention) lines.push("", firstMention);
   return lines.join("\n");
 }
 
@@ -93,7 +103,11 @@ export function factsWithSources(facts: Fact[], chatId: number): string {
   if (facts.length === 0) return "<i>Nothing.</i>";
   return facts
     .map((fact, index) => {
-      const sources = fact.source_msg_ids.slice(0, 3).map((id, n) => `<a href="${messageLink(chatId, id)}">${n + 1}</a>`).join(" ");
+      const sources = fact.source_msg_ids
+        .slice(0, 3)
+        .map((id, n) => linkTo(chatId, id, String(n + 1)))
+        .filter(Boolean)
+        .join(" ");
       const flag = fact.status === "hidden" ? " 🙈" : fact.status === "manual" ? " ✍️" : "";
       return `${index + 1}. ${FACT_KIND_LABELS[fact.kind]}: ${escapeHtml(fact.value)}${flag}${sources ? ` <i>[${sources}]</i>` : ""}`;
     })
@@ -101,8 +115,8 @@ export function factsWithSources(facts: Fact[], chatId: number): string {
 }
 
 export function chronicleLine(entry: ChronicleEntry, chatId: number): string {
-  const link = entry.msg_ids[0] ? ` <a href="${messageLink(chatId, entry.msg_ids[0])}">→</a>` : "";
-  return `${TOPIC_EMOJI[entry.kind]} <b>${escapeHtml(entry.title)}</b>${link}\n${escapeHtml(entry.summary)}`;
+  const link = entry.msg_ids[0] ? linkTo(chatId, entry.msg_ids[0], "→") : "";
+  return `${TOPIC_EMOJI[entry.kind]} <b>${escapeHtml(entry.title)}</b>${link ? ` ${link}` : ""}\n${escapeHtml(entry.summary)}`;
 }
 
 export function catchupHtml(data: CatchupData, users: Map<number, User>, chatId: number, intervalHours: number, timeZone: string): string {
@@ -115,8 +129,9 @@ export function catchupHtml(data: CatchupData, users: Map<number, User>, chatId:
     lines.push("<i>The chronicle for this period isn't ready yet.</i>", "");
   }
   if (data.unprocessed.count > 0 && data.unprocessed.firstMsgId) {
+    const readFrom = linkTo(chatId, data.unprocessed.firstMsgId, "read from here");
     lines.push(
-      `⏳ ${countOf(data.unprocessed.count, "more message", "more messages")} not chronicled yet (the chronicler goes through new ones every ${intervalHours} h) — <a href="${messageLink(chatId, data.unprocessed.firstMsgId)}">read from here</a>.`,
+      `⏳ ${countOf(data.unprocessed.count, "more message", "more messages")} not chronicled yet (the chronicler goes through new ones every ${intervalHours} h)${readFrom ? ` — ${readFrom}` : ""}.`,
     );
   }
   if (data.mentions.length) {
@@ -124,7 +139,8 @@ export function catchupHtml(data: CatchupData, users: Map<number, User>, chatId:
       .slice(0, 6)
       .map((message, index) => {
         const author = message.user_id ? users.get(message.user_id)?.display_name ?? "?" : "?";
-        return `<a href="${messageLink(chatId, message.msg_id)}">${index + 1}. ${escapeHtml(author)}</a>`;
+        const label = `${index + 1}. ${escapeHtml(author)}`;
+        return linkTo(chatId, message.msg_id, label) || label;
       })
       .join(" · ");
     lines.push(`💬 You were mentioned: ${links}`);

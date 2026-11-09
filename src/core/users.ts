@@ -1,4 +1,7 @@
-import type { Sql } from "./db.js";
+import type { Queryable, Sql } from "./db.js";
+
+/** Telegram's own accounts that post for linked channels, anonymous admins and channel identities: never people. */
+export const SERVICE_TG_IDS = [777000, 1087968824, 136817688];
 
 /** A Telegram account. What the bot knows about the person lives per chat (see Member). */
 export interface User {
@@ -41,8 +44,34 @@ const PERSON_COLUMNS = `u.id, u.tg_id, u.username, u.display_name, u.is_admin, u
   m.chat_id, m.user_id, m.tagline, m.tagline_manual, m.opted_out, m.first_seen_at, m.last_message_at, m.left_at`;
 
 /**
- * Finds the user for a Telegram account. A seeded card (no account yet) is linked by
- * @username, or by exact name among the members of the chat the person showed up in.
+ * A seeded card (no account yet) the account may take over. By @username anywhere. By name only when the
+ * match is unambiguous and the card holds nothing a look-alike account could misuse: the card has no
+ * @username of its own, it is the only unlinked card with that name in the chat, it belongs to no other
+ * chat and authors no project. Everything else waits for an owner's /link.
+ */
+async function claimableSeed(sql: Sql, username: string | null, name: string, chatId: number | undefined): Promise<User | undefined> {
+  if (username) {
+    const [byUsername] = await sql<User[]>`
+      SELECT * FROM users WHERE tg_id IS NULL AND username IS NOT NULL AND lower(username) = lower(${username})`;
+    if (byUsername) return byUsername;
+  }
+  if (chatId === undefined) return undefined;
+  const byName = await sql<(User & { claimable: boolean })[]>`
+    SELECT u.*,
+           (u.username IS NULL
+            AND NOT EXISTS (SELECT 1 FROM members other WHERE other.user_id = u.id AND other.chat_id <> ${chatId})
+            AND NOT EXISTS (SELECT 1 FROM project_members pm WHERE pm.user_id = u.id)) AS claimable
+    FROM users u
+    WHERE u.tg_id IS NULL AND lower(u.display_name) = lower(${name})
+      AND EXISTS (SELECT 1 FROM members m WHERE m.user_id = u.id AND m.chat_id = ${chatId})
+    LIMIT 2`;
+  const [only] = byName;
+  return byName.length === 1 && only?.claimable ? only : undefined;
+}
+
+/**
+ * Finds the user for a Telegram account; a seeded card is linked when claimableSeed allows it.
+ * Owner rights follow the configured owner list on every call, so removing an owner revokes them.
  * With a chat id the person also becomes (again) a member of that chat.
  */
 export async function resolveUser(sql: Sql, identity: TelegramIdentity, adminTgIds: number[], chatId?: number): Promise<User> {
@@ -57,22 +86,15 @@ export async function resolveUser(sql: Sql, identity: TelegramIdentity, adminTgI
       await sql`UPDATE users SET username = NULL WHERE lower(username) = lower(${username}) AND id <> ${existing.id}`;
     }
     [user] = await sql<User[]>`
-      UPDATE users SET username = ${username}, display_name = ${name}, is_admin = is_admin OR ${isAdmin}
+      UPDATE users SET username = ${username}, display_name = ${name}, is_admin = ${isAdmin}
       WHERE id = ${existing.id}
       RETURNING *`;
   } else {
-    const [seeded] = await sql<User[]>`
-      SELECT u.* FROM users u
-      WHERE u.tg_id IS NULL
-        AND ((${username}::text IS NOT NULL AND lower(u.username) = lower(${username}::text))
-             OR (${chatId ?? null}::bigint IS NOT NULL AND lower(u.display_name) = lower(${name})
-                 AND EXISTS (SELECT 1 FROM members m WHERE m.user_id = u.id AND m.chat_id = ${chatId ?? null}::bigint)))
-      ORDER BY (lower(u.username) = lower(${username}::text)) DESC NULLS LAST
-      LIMIT 1`;
+    const seeded = await claimableSeed(sql, username, name, chatId);
     if (seeded) {
       // Seed names come from someone's contact list; from now on the person's own Telegram name wins.
       [user] = await sql<User[]>`
-        UPDATE users SET tg_id = ${identity.id}, username = coalesce(${username}, username), display_name = ${name}, is_admin = is_admin OR ${isAdmin}
+        UPDATE users SET tg_id = ${identity.id}, username = coalesce(${username}, username), display_name = ${name}, is_admin = ${isAdmin}
         WHERE id = ${seeded.id}
         RETURNING *`;
     } else {
@@ -106,6 +128,7 @@ export async function peopleOfChat(sql: Sql, chatId: number, options: { includeL
   return sql<Person[]>`
     SELECT ${sql.unsafe(PERSON_COLUMNS)} FROM users u JOIN members m ON m.user_id = u.id
     WHERE m.chat_id = ${chatId} AND (${options.includeLeft ?? false} OR m.left_at IS NULL)
+      AND (u.tg_id IS NULL OR u.tg_id <> ALL(${SERVICE_TG_IDS}::bigint[]))
     ORDER BY m.last_message_at DESC NULLS LAST, u.display_name`;
 }
 
@@ -114,7 +137,7 @@ export async function findPersonByRef(sql: Sql, chatId: number, ref: string): Pr
   if (!cleaned) return undefined;
   const [person] = await sql<Person[]>`
     SELECT ${sql.unsafe(PERSON_COLUMNS)} FROM users u JOIN members m ON m.user_id = u.id
-    WHERE m.chat_id = ${chatId}
+    WHERE m.chat_id = ${chatId} AND (u.tg_id IS NULL OR u.tg_id <> ALL(${SERVICE_TG_IDS}::bigint[]))
       AND (lower(u.username) = lower(${cleaned}) OR lower(u.display_name) = lower(${cleaned}) OR lower(u.display_name) LIKE lower(${cleaned}) || ' %')
     ORDER BY lower(u.username) = lower(${cleaned}) DESC NULLS LAST, m.last_message_at DESC NULLS LAST
     LIMIT 1`;
@@ -131,21 +154,41 @@ export async function getUserByTgId(sql: Sql, tgId: number): Promise<User | unde
   return user;
 }
 
+async function applyOptOut(tx: Queryable, userId: number, optedOut: boolean, scope: number | null): Promise<void> {
+  await tx`
+    UPDATE members SET opted_out = ${optedOut}, tagline = CASE WHEN ${optedOut} THEN NULL ELSE tagline END,
+           tagline_manual = CASE WHEN ${optedOut} THEN false ELSE tagline_manual END
+    WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
+  if (optedOut) {
+    await tx`DELETE FROM facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
+    await tx`DELETE FROM rejected_facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
+    // Notes on how the person uses others' projects are shown on those project cards, so they go as well.
+    await tx`
+      DELETE FROM project_signals s USING projects p
+      WHERE s.project_id = p.id AND s.user_id = ${userId} AND (${scope}::bigint IS NULL OR p.chat_id = ${scope}::bigint)`;
+  }
+  await tx`
+    INSERT INTO change_log (entity, entity_id, op, after, source, actor_user_id)
+    VALUES ('user', ${userId}, ${optedOut ? "opt_out" : "opt_in"}, ${tx.json({ opted_out: optedOut, chat_id: scope })}, 'user', ${userId})`;
+}
+
 /** Opting out removes the person's card in one chat — or, without a chat id, in every chat. */
 export async function setOptOut(sql: Sql, userId: number, optedOut: boolean, chatId?: number): Promise<void> {
-  const scope = chatId ?? null;
+  await sql.begin((tx) => applyOptOut(tx, userId, optedOut, chatId ?? null));
+}
+
+/**
+ * /forgetme and "stop collecting" in one chat (or, without a chat id, everywhere). With `messages` the text of
+ * the person's messages is blanked too.
+ */
+export async function forgetUser(sql: Sql, userId: number, options: { chatId?: number; messages: boolean }): Promise<void> {
+  const scope = options.chatId ?? null;
   await sql.begin(async (tx) => {
+    await applyOptOut(tx, userId, true, scope);
+    if (!options.messages) return;
     await tx`
-      UPDATE members SET opted_out = ${optedOut}, tagline = CASE WHEN ${optedOut} THEN NULL ELSE tagline END,
-             tagline_manual = CASE WHEN ${optedOut} THEN false ELSE tagline_manual END
+      UPDATE messages SET text = '', extracted_at = now()
       WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
-    if (optedOut) {
-      await tx`DELETE FROM facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
-      await tx`DELETE FROM rejected_facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
-    }
-    await tx`
-      INSERT INTO change_log (entity, entity_id, op, after, source, actor_user_id)
-      VALUES ('user', ${userId}, ${optedOut ? "opt_out" : "opt_in"}, ${tx.json({ opted_out: optedOut, chat_id: scope })}, 'user', ${userId})`;
   });
 }
 

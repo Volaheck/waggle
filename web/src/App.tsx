@@ -58,7 +58,8 @@ type IconName =
   | "code"
   | "telegram"
   | "hex"
-  | "retry";
+  | "retry"
+  | "back";
 
 const PATHS: Record<IconName, ReactNode> = {
   eyeOff: (
@@ -121,6 +122,7 @@ const PATHS: Record<IconName, ReactNode> = {
   telegram: <path d="M21.5 4.5 2.9 11.7c-.8.3-.8 1.4.05 1.7l4.7 1.6 1.8 5.5c.25.8 1.3.95 1.8.3l2.6-3.4 4.8 3.5c.7.5 1.7.1 1.85-.75l2.6-14.1c.15-.9-.7-1.6-1.6-1.25Z" />,
   hex: <path d="M12 3l7.5 4.3v9.4L12 21l-7.5-4.3V7.3z" />,
   retry: <path d="M21 12a9 9 0 1 1-2.6-6.3M21 4v5h-5" />,
+  back: <path d="M19 12H5M11 18l-6-6 6-6" />,
 };
 
 function Icon({ name, className }: { name: IconName; className?: string }) {
@@ -146,6 +148,13 @@ function plural(count: number, one: string, many: string): string {
 
 const prettyUrl = (url: string) => url.replace(/^https?:\/\/(www\.)?/, "").replace(/\/$/, "");
 const linkIcon = (url: string): IconName => (url.startsWith("https://t.me/") ? "telegram" : /github\.com|gitlab\.com|codeberg\.org/.test(url) ? "code" : "globe");
+/** People type links without a scheme ("github.com/…"); the API and the browser need a full URL. */
+const withScheme = (url: string) => (!url || /^([a-z][a-z\d+.-]*:\/\/|mailto:)/i.test(url) ? url : `https://${url}`);
+/** A link fact as something to open: the server stores whatever a member typed, so only http(s) becomes a link. */
+const openableUrl = (value: string): string | null => {
+  const url = withScheme(value.trim());
+  return /^https?:\/\//i.test(url) ? url : null;
+};
 
 const URL_INPUT = { type: "url", inputMode: "url", autoCapitalize: "none", autoCorrect: "off", spellCheck: false, enterKeyHint: "done" } as const;
 
@@ -185,11 +194,30 @@ function readRoute(): string {
   return hash.startsWith("/") ? hash : "/people";
 }
 
+/**
+ * A launch link (startapp=c…_p_slug) opens its screen in place of Telegram's launch entry, unstamped like a DM link,
+ * so Back goes up to the screen's section instead of to a People list nobody saw.
+ */
+function launchRoute(): string {
+  const start = routeFromStartParam(screenFromLaunch());
+  if (start && !window.location.hash.startsWith("#/")) window.history.replaceState(window.history.state, "", `#${start}`);
+  return readRoute();
+}
+
 /** Scroll is remembered per screen; a one-shot flag like ?add must not split it. */
 const screenOf = (route: string) => route.split("?")[0] ?? route;
 
+/** Screens the app opened itself are stamped in history; a deep link from a DM starts on an unstamped entry. */
+const openedInApp = () => (window.history.state as { inApp?: boolean } | null)?.inApp === true;
+
+/** Back to the previous screen, or, when the app has none behind (a deep link), up to the section this screen belongs to. */
+function goUp(): void {
+  if (openedInApp()) window.history.back();
+  else window.location.replace(`#${readRoute().startsWith("/p/") ? "/projects" : "/people"}`);
+}
+
 function useRoute(): { route: string; kind: NavKind; go: Go } {
-  const [state, setState] = useState<{ route: string; kind: NavKind }>(() => ({ route: readRoute(), kind: "forward" }));
+  const [state, setState] = useState<{ route: string; kind: NavKind }>(() => ({ route: launchRoute(), kind: "forward" }));
   const forward = useRef(false);
   const current = useRef(state.route);
   const positions = useRef(new Map<string, number>());
@@ -198,6 +226,7 @@ function useRoute(): { route: string; kind: NavKind; go: Go } {
     window.history.scrollRestoration = "manual";
     const onChange = () => {
       positions.current.set(screenOf(current.current), window.scrollY);
+      if (forward.current) window.history.replaceState({ ...window.history.state, inApp: true }, "");
       const route = readRoute();
       current.current = route;
       setState({ route, kind: forward.current ? "forward" : "back" });
@@ -227,14 +256,15 @@ function useRoute(): { route: string; kind: NavKind; go: Go } {
 
 const cache = new Map<string, unknown>();
 
-function useLoad<T>(path: string | null) {
+/** `once`: a cached answer is good enough, don't ask again (who the viewer is doesn't change mid-session). */
+function useLoad<T>(path: string | null, { once = false }: { once?: boolean } = {}) {
   const key = path === null ? null : path === "/chats" ? path : `${getCurrentChat() ?? "-"} ${path}`;
   const [state, setState] = useState<{ key: string | null; data: T | null }>(() => ({ key, data: key ? ((cache.get(key) as T | undefined) ?? null) : null }));
   const [error, setError] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
 
   useEffect(() => {
-    if (!path || !key) return;
+    if (!path || !key || (once && cache.has(key))) return;
     let cancelled = false;
     setError(null);
     api<T>(path)
@@ -252,10 +282,26 @@ function useLoad<T>(path: string | null) {
 
   const cached = key ? (cache.get(key) as T | undefined) : undefined;
   const fresh = state.key === key;
-  const data = fresh ? state.data : (cached ?? state.data);
+  // The cache can fill between the first render and the effect (another screen's request landing); a `once` load then never sets state.
+  const data = fresh ? (state.data ?? cached ?? null) : (cached ?? state.data);
   const dataKey = fresh || cached !== undefined ? key : state.key;
   const reload = useCallback(() => setTick((value) => value + 1), []);
   return { data, error, reload, pending: data !== null && dataKey !== key, dataPath: dataKey?.split(" ").pop() ?? null };
+}
+
+const remembered = new Map<string, unknown>();
+
+/** View state (sort, period, an open explainer) that outlives the screen: every route remounts it, and Back must land in the same list. */
+function useRemembered<T>(name: string, initial: T): [T, (value: T) => void] {
+  const [value, setValue] = useState<T>(() => (remembered.has(name) ? (remembered.get(name) as T) : initial));
+  const set = useCallback(
+    (next: T) => {
+      remembered.set(name, next);
+      setValue(next);
+    },
+    [name],
+  );
+  return [value, set];
 }
 
 // ---------- theme ----------
@@ -311,10 +357,17 @@ function useTyped(text: string, instant: boolean): string {
 
 // ---------- the landing's grammar: [ eyebrow ] → title with one accent word → > terminal ----------
 
+/** The terminal's punctuation ("> ", "// ") is decoration; screen readers skip it. */
+function Glyph({ children }: { children: string }) {
+  return <span aria-hidden>{children} </span>;
+}
+
 function Eyebrow({ text }: { text: string }) {
   return (
     <div className="eyebrow" style={{ ["--n" as string]: text.length + 4 }}>
-      [ {text} ]
+      <span aria-hidden>[ </span>
+      {text}
+      <span aria-hidden> ]</span>
     </div>
   );
 }
@@ -352,48 +405,52 @@ function Title({ eyebrow, children, terminal, pending = false, action }: { eyebr
   );
 }
 
-/** A labelled block; labels number themselves "// 01 — label" through a CSS counter. */
+/** A labelled block; labels number themselves "// 01 — label" through a CSS counter, kept out of the heading's spoken name. */
 function Section({ label, index = 0, children }: { label: string; index?: number; children: ReactNode }) {
   return (
     <section className="sec" style={{ ["--i" as string]: Math.min(index, 8) }}>
-      <h2 className="section-title">{label}</h2>
+      <h2 className="section-title">
+        <span className="sec-no" aria-hidden />
+        {label}
+      </h2>
       {children}
     </section>
   );
 }
 
-function Card({ children, onClick, className, index = 0 }: { children: ReactNode; onClick?: () => void; className?: string; index?: number }) {
+/** `tap`: the card is one big tap target (a stretched link inside it), so it presses and catches the glare. */
+function Card({ children, tap = false, className, index = 0 }: { children: ReactNode; tap?: boolean; className?: string; index?: number }) {
   const glare = (event: ReactPointerEvent<HTMLDivElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
     event.currentTarget.style.setProperty("--mx", `${event.clientX - rect.left}px`);
     event.currentTarget.style.setProperty("--my", `${event.clientY - rect.top}px`);
   };
   return (
-    <div
-      className={cx("card", onClick && "tap", className)}
-      style={{ ["--i" as string]: Math.min(index, 8) }}
-      {...(onClick ? { ...pressable(onClick), onPointerDown: glare, onPointerMove: glare } : {})}
-    >
+    <div className={cx("card", tap && "tap", className)} style={{ ["--i" as string]: Math.min(index, 8) }} {...(tap ? { onPointerDown: glare, onPointerMove: glare } : {})}>
       {children}
     </div>
   );
 }
 
-function Avatar({ name, size = "md" }: { name: string; size?: "sm" | "md" | "big" }) {
+/** The initial stays underneath: it shows while the photo loads and whenever there is none. */
+function Avatar({ name, src, size = "md" }: { name: string; src?: string | null; size?: "sm" | "md" | "big" }) {
+  const [failed, setFailed] = useState<string | null>(null);
+  const photo = src && src !== failed ? src : null;
   return (
     <div className={cx("avatar", size !== "md" && size)} aria-hidden>
       {Array.from(name.trim())[0]?.toUpperCase() ?? "?"}
+      {photo && <img src={photo} alt="" loading="lazy" decoding="async" onError={() => setFailed(photo)} />}
     </div>
   );
 }
 
-/** Statuses are stored as the chronicler writes them; the UI names them in English. */
+/** Status codes from the API, with the words and tones people see. */
 const STATUS_META: Record<string, { label: string; tone: string; key: string }> = {
-  идея: { label: "idea", tone: "var(--tg)", key: "idea" },
-  "в работе": { label: "in progress", tone: "var(--neon-ink)", key: "progress" },
-  запущен: { label: "launched", tone: "var(--green)", key: "launched" },
-  "на паузе": { label: "paused", tone: "var(--muted)", key: "paused" },
-  заброшен: { label: "abandoned", tone: "var(--meta)", key: "abandoned" },
+  idea: { label: "idea", tone: "var(--tg)", key: "idea" },
+  in_progress: { label: "in progress", tone: "var(--neon-ink)", key: "progress" },
+  launched: { label: "launched", tone: "var(--green)", key: "launched" },
+  paused: { label: "paused", tone: "var(--muted)", key: "paused" },
+  abandoned: { label: "abandoned", tone: "var(--meta)", key: "abandoned" },
 };
 
 function StatusBadge({ status }: { status: string }) {
@@ -407,7 +464,8 @@ function StatusBadge({ status }: { status: string }) {
 
 /** The score in a honeycomb cell that fills with honey relative to the leader. */
 function HexScore({ score, max, big = false, lead = false }: { score: number; max: number; big?: boolean; lead?: boolean }) {
-  const percent = max > 0 ? Math.max(8, Math.round((score / max) * 100)) : 8;
+  // Any score shows at least a drop of honey; nothing at all stays an empty cell.
+  const percent = score > 0 && max > 0 ? Math.max(8, Math.round((score / max) * 100)) : 0;
   return (
     <div className={cx("hex-score", big && "big", lead && "lead")} style={{ ["--p" as string]: percent }} role="img" aria-label={`Score ${score}`}>
       <b aria-hidden>{score}</b>
@@ -600,7 +658,7 @@ const STATES: Record<string, StateCopy> = {
   },
 };
 
-type SkeletonKind = "rows" | "board" | "cards" | "hero";
+type SkeletonKind = "rows" | "board" | "cards" | "person" | "project";
 
 function Skeleton({ kind }: { kind: SkeletonKind }) {
   if (kind === "rows" || kind === "board") {
@@ -627,17 +685,28 @@ function Skeleton({ kind }: { kind: SkeletonKind }) {
       <span className="sk sk-line w60" />
     </>
   );
-  if (kind === "hero") {
+  if (kind === "person" || kind === "project") {
+    // Each hero keeps its own silhouette: a person leads with the avatar, a project with its name and score cell.
     return (
       <div role="status" aria-label="Loading">
         <div className="card hero">
-          <div className="row">
-            <span className="sk sk-big" />
-            <div className="grow">
-              <span className="sk sk-line w60" />
-              <span className="sk sk-line w40" />
+          {kind === "person" ? (
+            <div className="row">
+              <span className="sk sk-big" />
+              <div className="grow">
+                <span className="sk sk-line w60" />
+                <span className="sk sk-line w40" />
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="hero-top">
+              <div className="grow">
+                <span className="sk sk-line sk-name w60" />
+                <span className="sk sk-badge" />
+              </div>
+              <span className="sk sk-hex big" />
+            </div>
+          )}
           <div className="chips">
             <span className="sk sk-chip" />
             <span className="sk sk-chip" />
@@ -674,7 +743,9 @@ function LoadState({ error, retry, skeleton, hasData = false }: { error: string 
   if (error && hasData) {
     return (
       <div className="inline-error" role="alert">
-        <span>&gt; signal lost</span>
+        <span>
+          <Glyph>&gt;</Glyph>signal lost
+        </span>
         {retryButton}
       </div>
     );
@@ -685,7 +756,8 @@ function LoadState({ error, retry, skeleton, hasData = false }: { error: string 
     copy.action === "retry" ? (
       retryButton
     ) : copy.action === "back" ? (
-      <button className="chip-btn" onClick={() => window.history.back()}>
+      <button className="chip-btn" onClick={goUp}>
+        <Icon name="back" />
         Go back
       </button>
     ) : undefined;
@@ -698,7 +770,7 @@ function PersonRow({ person, onOpen }: { person: PersonSummary; onOpen: () => vo
   const solo = !person.tagline && person.top_facts.length === 0;
   return (
     <div className={cx("board-row", solo && "solo")} {...pressable(onOpen)}>
-      <Avatar name={person.display_name} />
+      <Avatar name={person.display_name} src={person.avatar_url} />
       <div className="board-meta">
         <div className="person-top">
           <span className="name ellipsis" lang={langOf(person.display_name)}>
@@ -717,12 +789,17 @@ function PersonRow({ person, onOpen }: { person: PersonSummary; onOpen: () => vo
           </div>
         )}
         {person.top_facts.length > 0 && (
+          // The chronicler's three most certain facts, shortest first: the one line keeps whole chips, and a long one
+          // (usually the role, which the tagline above already says) must not push the short ones off the line.
           <div className="chips one-line">
-            {person.top_facts.slice(0, 3).map((fact, index) => (
-              <span key={`${index}:${fact}`} className={cx("chip", fact.length <= 16 && "short")} lang={langOf(fact)}>
-                {fact}
-              </span>
-            ))}
+            {person.top_facts
+              .slice(0, 3)
+              .sort((a, b) => a.length - b.length)
+              .map((fact, index) => (
+                <span key={`${index}:${fact}`} className="chip" lang={langOf(fact)}>
+                  {fact}
+                </span>
+              ))}
           </div>
         )}
       </div>
@@ -774,7 +851,11 @@ function PeopleScreen({ go }: { go: Go }) {
           ))}
         </Card>
       )}
-      {data && people.length <= 2 && <div className="footnote">&gt; cards fill in as people talk in the chat</div>}
+      {data && people.length <= 2 && (
+        <div className="footnote">
+          <Glyph>&gt;</Glyph>cards fill in as people talk in the chat
+        </div>
+      )}
     </>
   );
 }
@@ -798,19 +879,40 @@ interface PersonResponse {
   facts: Fact[];
   projects: Project[];
   messages_30d: number;
+  is_me?: boolean;
+  /** The viewer's own card, or a bot owner looking after someone else's. */
   can_edit: boolean;
 }
 
 function PersonScreen({ id, go }: { id: string; go: Go }) {
   const { data, error, reload } = useLoad<PersonResponse>(`/people/${id}`);
-  if (!data) return <LoadState error={error} retry={reload} skeleton="hero" />;
+  const [moderating, setModerating] = useState(false);
+  const [busy, setBusy] = useState<number | null>(null);
+  const [toast, setToast] = useState<ToastState | null>(null);
+  const closeToast = useCallback(() => setToast(null), []);
+  if (!data) return <LoadState error={error} retry={reload} skeleton="person" />;
   const { person, facts, projects } = data;
+  // A bot owner hides a wrong fact on someone else's card the way people hide their own: reversibly.
+  const factAction = async (fact: Fact, action: "hide" | "restore") => {
+    setBusy(fact.id);
+    try {
+      await api(`/facts/${fact.id}/${action}`, { method: "POST", body: {} });
+      haptic("success");
+      reload();
+      if (action === "hide") setToast({ id: Date.now(), text: "Hidden", undo: () => void factAction(fact, "restore") });
+    } catch {
+      haptic("error");
+      setToast({ id: Date.now(), text: "Couldn’t update — try again" });
+    } finally {
+      setBusy(null);
+    }
+  };
   return (
     <>
-      {error && <LoadState error={error} retry={reload} skeleton="hero" hasData />}
+      {error && <LoadState error={error} retry={reload} skeleton="person" hasData />}
       <Card className="hero">
         <div className="row">
-          <Avatar name={person.display_name} size="big" />
+          <Avatar name={person.display_name} src={person.avatar_url} size="big" />
           <div className="grow">
             <h1 className="hero-name" lang={langOf(person.display_name)}>
               {person.display_name}
@@ -832,16 +934,32 @@ function PersonScreen({ id, go }: { id: string; go: Go }) {
           <Stat value={projects.length} label={projects.length === 1 ? "project" : "projects"} />
           <Stat value={facts.length} label={facts.length === 1 ? "fact" : "facts"} />
         </div>
-        {data.can_edit && (
+        {data.is_me ? (
           <button className="btn outline small hero-edit" onClick={() => go("/me")}>
             <Icon name="pen" />
             Edit my card
           </button>
+        ) : (
+          data.can_edit && (
+            <button className="btn outline small hero-edit" aria-expanded={moderating} onClick={() => setModerating(!moderating)}>
+              <Icon name={moderating ? "check" : "pen"} />
+              {moderating ? "Done" : "Edit card"}
+            </button>
+          )
         )}
       </Card>
       <Section label="facts" index={1}>
         <Card className="dossier">
-          {person.opted_out ? (
+          {moderating && !data.is_me && facts.length > 0 ? (
+            <FactGroups
+              facts={facts}
+              actions={(fact) => (
+                <button className="icon-btn" aria-label={`Hide “${fact.value}”`} disabled={busy === fact.id} onClick={() => void factAction(fact, "hide")}>
+                  <Icon name="eyeOff" />
+                </button>
+              )}
+            />
+          ) : person.opted_out ? (
             <div className="hint">Asked not to collect anything about them.</div>
           ) : facts.length === 0 ? (
             <div className="hint">The chronicler hasn’t noted anything about {person.display_name} yet.</div>
@@ -861,20 +979,23 @@ function PersonScreen({ id, go }: { id: string; go: Go }) {
                       ))}
                     </div>
                   )}
-                  {rows.map((fact) => (
-                    <div key={fact.id} className="fact-line">
-                      <div className="grow" lang={langOf(fact.value)}>
-                        {kind === "link" ? (
-                          <ExternalLink href={fact.value} icon={linkIcon(fact.value)}>
-                            {prettyUrl(fact.value)}
-                          </ExternalLink>
-                        ) : (
-                          fact.value
-                        )}
+                  {rows.map((fact) => {
+                    const href = kind === "link" ? openableUrl(fact.value) : null;
+                    return (
+                      <div key={fact.id} className="fact-line">
+                        <div className="grow" lang={langOf(fact.value)}>
+                          {href ? (
+                            <ExternalLink href={href} icon={linkIcon(href)}>
+                              {prettyUrl(fact.value)}
+                            </ExternalLink>
+                          ) : (
+                            fact.value
+                          )}
+                        </div>
+                        {fact.sources[0] && <SourceLink url={fact.sources[0].url} />}
                       </div>
-                      {fact.sources[0] && <SourceLink url={fact.sources[0].url} />}
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               );
             })
@@ -890,6 +1011,7 @@ function PersonScreen({ id, go }: { id: string; go: Go }) {
           </Card>
         </Section>
       )}
+      {toast && <Toast key={toast.id} text={toast.text} undo={toast.undo} onClose={closeToast} />}
     </>
   );
 }
@@ -907,15 +1029,15 @@ const EXPLAINER: [string, string][] = [
 ];
 
 function ProjectsScreen({ go, startAdding }: { go: Go; startAdding: boolean }) {
-  const [sort, setSort] = useState<Sort>("top");
+  const [sort, setSort] = useRemembered<Sort>("rating.sort", "top");
   const { data, error, reload, pending, dataPath } = useLoad<{ projects: Project[] }>(`/projects?sort=${sort}`);
   const [adding, setAdding] = useState(startAdding);
-  const [showHelp, setShowHelp] = useState(false);
+  const [showHelp, setShowHelp] = useRemembered("rating.help", false);
   const nameRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    // The ?add flag only opens the form once; Back must not reopen it.
-    if (startAdding) window.history.replaceState(null, "", "#/projects");
+    // The ?add flag only opens the form once; Back must not reopen it. The entry keeps its in-app stamp.
+    if (startAdding) window.history.replaceState(window.history.state, "", "#/projects");
   }, [startAdding]);
 
   useEffect(() => {
@@ -929,17 +1051,20 @@ function ProjectsScreen({ go, startAdding }: { go: Go; startAdding: boolean }) {
   const projects = data?.projects ?? [];
   const maxScore = Math.max(1, ...projects.map((project) => project.score));
   const count = plural(projects.length, "project", "projects");
+  // A failed re-sort keeps the old list usable (not dimmed): the line above it says the signal was lost.
   const ranking = pending && !error;
+  const empty = data !== null && projects.length === 0;
   const terminal = !data
     ? "counting honey"
     : ranking
       ? "re-ranking…"
-      : dataSort === "top"
-        ? `the chronicler ranked ${count}`
-        : dataSort === "alive"
-          ? `${count} · most active first`
-          : `${count} · newest first`;
-  const empty = data !== null && projects.length === 0;
+      : empty
+        ? "nothing to rank yet"
+        : dataSort === "top"
+          ? `the chronicler ranked ${count}`
+          : dataSort === "alive"
+            ? `${count} · most active first`
+            : `${count} · newest first`;
 
   return (
     <>
@@ -967,7 +1092,7 @@ function ProjectsScreen({ go, startAdding }: { go: Go; startAdding: boolean }) {
         <ProjectForm
           nameRef={nameRef}
           onCancel={() => setAdding(false)}
-          onDone={(slug) => {
+          onOpen={(slug) => {
             setAdding(false);
             reload();
             go(`/p/${slug}`);
@@ -981,10 +1106,11 @@ function ProjectsScreen({ go, startAdding }: { go: Go; startAdding: boolean }) {
           aria-expanded={showHelp}
           onClick={() => {
             haptic("select");
-            setShowHelp((value) => !value);
+            setShowHelp(!showHelp);
           }}
         >
-          &gt; how the score works
+          <Glyph>&gt;</Glyph>
+          how the score works
           <Icon name="chevron" />
         </button>
       )}
@@ -1023,7 +1149,7 @@ function ProjectsScreen({ go, startAdding }: { go: Go; startAdding: boolean }) {
         />
       )}
       {projects.length > 0 && (
-        <div className={cx(pending && "stale")}>
+        <div className={cx(ranking && "stale")}>
           <Card className="board" key={dataPath ?? undefined} index={5}>
             {projects.map((project, index) => (
               <ProjectRow
@@ -1042,38 +1168,44 @@ function ProjectsScreen({ go, startAdding }: { go: Go; startAdding: boolean }) {
   );
 }
 
-function ProjectForm({ nameRef, onDone, onCancel }: { nameRef: RefObject<HTMLInputElement | null>; onDone: (slug: string) => void; onCancel: () => void }) {
+function ProjectForm({ nameRef, onOpen, onCancel }: { nameRef: RefObject<HTMLInputElement | null>; onOpen: (slug: string) => void; onCancel: () => void }) {
   const [name, setName] = useState("");
   const [tagline, setTagline] = useState("");
   const [link, setLink] = useState("");
   const [busy, setBusy] = useState(false);
-  const [failed, setFailed] = useState(false);
+  // `slug`: the form clashed with a project already in the catalog, which can be opened instead.
+  const [failure, setFailure] = useState<{ text: string; slug?: string } | null>(null);
   const submit = async () => {
     setBusy(true);
-    setFailed(false);
+    setFailure(null);
+    const url = withScheme(link.trim());
+    const isRepo = /github\.com|gitlab\.com|codeberg\.org/.test(url);
     try {
-      const isRepo = /github\.com|gitlab\.com|codeberg\.org/.test(link);
       const result = await api<{ slug: string }>("/projects", {
         method: "POST",
-        body: { name, tagline: tagline || null, repo: isRepo ? link : null, site: !isRepo && link ? link : null },
+        body: { name: name.trim(), tagline: tagline.trim() || null, repo: isRepo ? url : null, site: !isRepo && url ? url : null },
       });
       haptic("success");
-      onDone(result.slug);
-    } catch {
+      onOpen(result.slug);
+    } catch (err) {
       haptic("error");
       setBusy(false);
-      setFailed(true);
+      const clash = err instanceof ApiError && err.code === "exists" && typeof err.details.slug === "string" ? err.details.slug : undefined;
+      // Name and one-liner are capped to the server's limits, so a rejected form means the link didn't parse.
+      if (clash) setFailure({ text: "it’s already in the catalog", slug: clash });
+      else setFailure({ text: err instanceof ApiError && err.code === "bad_request" && url ? "couldn’t add it — check the link (https://…)" : "couldn’t add it — try again" });
     }
   };
+  const existing = failure?.slug;
   return (
     <Card className="form">
       <label className="field">
         <span className="field-label">Name</span>
-        <input ref={nameRef} className="input" placeholder="e.g. Waggle" value={name} onChange={(event) => setName(event.target.value)} />
+        <input ref={nameRef} className="input" placeholder="e.g. Waggle" maxLength={80} value={name} onChange={(event) => setName(event.target.value)} />
       </label>
       <label className="field">
         <span className="field-label">One-liner</span>
-        <input className="input" placeholder="What it is, in one line" value={tagline} onChange={(event) => setTagline(event.target.value)} />
+        <input className="input" placeholder="What it is, in one line" maxLength={200} value={tagline} onChange={(event) => setTagline(event.target.value)} />
       </label>
       <label className="field">
         <span className="field-label">Link</span>
@@ -1087,9 +1219,18 @@ function ProjectForm({ nameRef, onDone, onCancel }: { nameRef: RefObject<HTMLInp
           Cancel
         </button>
       </div>
-      {failed && (
-        <div className="form-error" role="alert">
-          &gt; couldn’t add it — check the link (https://…)
+      {failure && (
+        <div className={cx("form-error", existing && "with-action")} role="alert">
+          <span>
+            <Glyph>&gt;</Glyph>
+            {failure.text}
+          </span>
+          {existing && (
+            <button className="chip-btn" onClick={() => onOpen(existing)}>
+              <Icon name="arrowUpRight" />
+              Open it
+            </button>
+          )}
         </div>
       )}
     </Card>
@@ -1106,6 +1247,14 @@ const SIGNAL_META: Record<string, { label: string; icon: IconName; tone: string;
   interest: { label: "interest", icon: "eye", tone: "var(--tg)", soft: "var(--tg-soft)" },
   critique: { label: "critique", icon: "message", tone: "var(--tg)", soft: "var(--tg-soft)" },
 };
+
+type EditFace = "edit" | "done" | "cancel";
+
+const EDIT_TOGGLE: { face: EditFace; icon: IconName; label: string }[] = [
+  { face: "edit", icon: "pen", label: "Edit" },
+  { face: "done", icon: "check", label: "Done" },
+  { face: "cancel", icon: "close", label: "Cancel" },
+];
 
 /** Honey hexes spark just off the button's edge and fly outward. */
 function burstFrom(element: HTMLElement) {
@@ -1143,18 +1292,24 @@ interface ProjectResponse {
 
 function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
   const { data, error, reload } = useLoad<ProjectResponse>(`/projects/${slug}`);
+  // Whether this is the viewer's own project (authors can't vote for it) comes from their card, asked once.
+  const viewer = useLoad<MeResponse>("/me", { once: true });
   const [editing, setEditing] = useState(false);
+  const [dirty, setDirty] = useState(false);
   const [result, setResult] = useState<{ voted: boolean; votes: number } | null>(null);
-  const [own, setOwn] = useState(false);
+  const [refused, setRefused] = useState(false);
   const [pop, setPop] = useState(false);
   const [allHistory, setAllHistory] = useState(false);
   useEffect(() => setResult(null), [data]);
-  if (!data) return <LoadState error={error} retry={reload} skeleton="hero" />;
+  // The viewer is awaited too, so an author never meets a Vote button that can only fail.
+  if (!data || (!viewer.data && !viewer.error)) return <LoadState error={error} retry={reload} skeleton="project" />;
 
   const { project, history, discussions } = data;
-  const links = [project.links.repo, project.links.site, ...(project.links.other ?? [])].filter((link): link is string => Boolean(link));
+  const own = refused || project.authors.some((author) => author.id === viewer.data?.user.id);
+  const links = [...new Set([project.links.repo, project.links.site, ...(project.links.other ?? [])].filter((link): link is string => Boolean(link)).map(withScheme))];
   const voted = result?.voted ?? project.voted_by_me;
   const votes = result?.votes ?? project.votes;
+  const toggleFace: EditFace = !editing ? "edit" : dirty ? "cancel" : "done";
   const vote = async (event: MouseEvent<HTMLButtonElement>) => {
     const button = event.currentTarget;
     const next = !voted;
@@ -1169,7 +1324,7 @@ function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
     } catch (err) {
       haptic("error");
       if (err instanceof ApiError && err.code === "own_project") {
-        setOwn(true);
+        setRefused(true);
         tgAlert("Authors can’t vote for their own project.");
       }
     }
@@ -1198,7 +1353,7 @@ function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
 
   return (
     <>
-      {error && <LoadState error={error} retry={reload} skeleton="hero" hasData />}
+      {error && <LoadState error={error} retry={reload} skeleton="project" hasData />}
       <Card className="hero">
         <div className="hero-top">
           <div className="grow">
@@ -1219,8 +1374,8 @@ function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
         )}
         {project.stack.length > 0 && (
           <div className="chips">
-            {project.stack.map((item) => (
-              <span key={item} className="chip code">
+            {project.stack.map((item, index) => (
+              <span key={`${index}:${item}`} className="chip code">
                 {item}
               </span>
             ))}
@@ -1243,20 +1398,47 @@ function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
         <div className="hero-actions">
           {voteButton}
           {data.can_edit && (
-            <button className="btn outline" aria-expanded={editing} onClick={() => setEditing((value) => !value)}>
-              <Icon name={editing ? "check" : "pen"} />
-              {editing ? "Done" : "Edit"}
+            // With unsaved changes the toggle says what it does: Cancel drops them, Done only closes.
+            // All three faces share one grid cell, so the button keeps the width of the widest and the row never reflows.
+            <button className="btn outline swap" aria-expanded={editing} onClick={() => setEditing(!editing)}>
+              {EDIT_TOGGLE.map(({ face, icon, label }) => (
+                <span key={face} className={cx(face !== toggleFace && "off")}>
+                  <Icon name={icon} />
+                  {label}
+                </span>
+              ))}
             </button>
           )}
         </div>
       </Card>
-      {editing && <ProjectEditor project={project} onSaved={reload} onDeleted={() => go("/projects")} />}
+      {editing && (
+        <ProjectEditor
+          project={project}
+          viewer={viewer.data ? { id: viewer.data.user.id, isOwner: viewer.data.user.is_admin === true } : null}
+          onDirty={setDirty}
+          onSaved={() => {
+            // A new name shows up in every list, so none is reused from the cache.
+            cache.clear();
+            reload();
+          }}
+          onDeleted={() => {
+            // Every cached list may still carry the project; screens reload instead of flashing it.
+            cache.clear();
+            goUp();
+          }}
+          onMerged={(slug) => {
+            // The duplicate is gone: its screen gives way to the project it joined.
+            cache.clear();
+            window.location.replace(`#/p/${slug}`);
+          }}
+        />
+      )}
       {project.authors.length > 0 && (
         <Section label="authors" index={1}>
           <Card className="board">
             {project.authors.map((author) => (
               <div key={author.id} className="board-row author-row" {...pressable(() => go(`/u/${author.id}`))}>
-                <Avatar name={author.display_name} size="sm" />
+                <Avatar name={author.display_name} src={author.avatar_url} size="sm" />
                 <div className="board-meta">
                   <span className="name ellipsis" lang={langOf(author.display_name)}>
                     {author.display_name}
@@ -1336,7 +1518,17 @@ function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
   );
 }
 
-function ProjectEditor({ project, onSaved, onDeleted }: { project: Project; onSaved: () => void; onDeleted: () => void }) {
+interface ProjectEditorProps {
+  project: Project;
+  viewer: { id: number; isOwner: boolean } | null;
+  onDirty: (dirty: boolean) => void;
+  onSaved: () => void;
+  onDeleted: () => void;
+  onMerged: (slug: string) => void;
+}
+
+function ProjectEditor({ project, viewer, onDirty, onSaved, onDeleted, onMerged }: ProjectEditorProps) {
+  const [name, setName] = useState(project.name);
   const [tagline, setTagline] = useState(project.tagline ?? "");
   const [status, setStatus] = useState(project.status);
   const [stack, setStack] = useState(project.stack.join(", "));
@@ -1345,6 +1537,27 @@ function ProjectEditor({ project, onSaved, onDeleted }: { project: Project; onSa
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
+  // A duplicate can be folded only into a project the viewer also authors; a bot owner may fold any.
+  const catalog = useLoad<{ projects: Project[] }>("/projects?sort=new", { once: true });
+  const [mergeInto, setMergeInto] = useState("");
+  const [merging, setMerging] = useState(false);
+  const mergeTargets = (catalog.data?.projects ?? [])
+    .filter((other) => other.id !== project.id && (viewer?.isOwner || other.authors.some((author) => author.id === viewer?.id)))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  const stackItems = stack
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const changes = { name: name.trim(), tagline: tagline.trim() || null, status, stack: stackItems, repo: withScheme(repo.trim()) || null, site: withScheme(site.trim()) || null };
+  // Dirty means "differs from what was last saved", compared in the form it is sent.
+  const snapshot = JSON.stringify(changes);
+  const [clean, setClean] = useState(snapshot);
+  const dirty = snapshot !== clean;
+  useEffect(() => {
+    onDirty(dirty);
+    return () => onDirty(false);
+  }, [dirty, onDirty]);
 
   useEffect(() => {
     if (!saved) return;
@@ -1355,28 +1568,48 @@ function ProjectEditor({ project, onSaved, onDeleted }: { project: Project; onSa
   const save = async () => {
     setBusy(true);
     setFailure(null);
+    // The name goes along only when it changed: a rename is recorded in the project's history.
+    const { name: newName, ...fields } = changes;
     try {
-      await api(`/projects/${project.id}`, {
-        method: "PATCH",
-        body: {
-          tagline: tagline || null,
-          status,
-          stack: stack
-            .split(",")
-            .map((part) => part.trim())
-            .filter(Boolean),
-          repo: repo || null,
-          site: site || null,
-        },
-      });
+      await api(`/projects/${project.id}`, { method: "PATCH", body: newName === project.name ? fields : changes });
       haptic("success");
+      setClean(snapshot);
       setSaved(true);
       onSaved();
-    } catch {
+    } catch (err) {
       haptic("error");
-      setFailure("not saved — links need https://");
+      // Name and description are capped by maxLength and the status comes from the chips: a rejection is the stack or a link.
+      const rejected = err instanceof ApiError && err.code === "bad_request";
+      const stackTooBig = stackItems.length > 20 || stackItems.some((item) => item.length > 40);
+      setFailure(
+        err instanceof ApiError && err.code === "name_taken"
+          ? `not saved — another project is already called “${newName}”; if it is the same one, pick it under “A duplicate of”`
+          : !rejected
+            ? "not saved — try again"
+            : stackTooBig
+              ? "not saved — up to 20 stack items, 40 characters each"
+              : "not saved — check the links (https://…)",
+      );
     } finally {
       setBusy(false);
+    }
+  };
+  const merge = async () => {
+    const target = mergeTargets.find((other) => other.slug === mergeInto);
+    if (!target || merging) return;
+    const sure = await tgConfirm(`Merge “${project.name}” into “${target.name}”? Its authors, votes, signals and history move to “${target.name}”, and “${project.name}” leaves the catalog.`);
+    if (!sure) return;
+    setMerging(true);
+    setFailure(null);
+    try {
+      const { slug } = await api<{ ok: boolean; slug: string }>(`/projects/${project.id}/merge`, { method: "POST", body: { into: target.slug } });
+      haptic("success");
+      onMerged(slug);
+    } catch (err) {
+      haptic("error");
+      setFailure(err instanceof ApiError && err.code === "forbidden" ? "not merged — only the bot owner or an author of both projects can merge them" : "not merged — try again");
+    } finally {
+      setMerging(false);
     }
   };
   const remove = async () => {
@@ -1393,6 +1626,10 @@ function ProjectEditor({ project, onSaved, onDeleted }: { project: Project; onSa
 
   return (
     <Card className="form">
+      <label className="field">
+        <span className="field-label">Name</span>
+        <input className="input" maxLength={80} autoComplete="off" value={name} onChange={(event) => setName(event.target.value)} />
+      </label>
       <div className="field">
         <span className="field-label">Status</span>
         <div className="status-picker" role="group" aria-label="Status">
@@ -1407,6 +1644,7 @@ function ProjectEditor({ project, onSaved, onDeleted }: { project: Project; onSa
                 setStatus(value);
               }}
             >
+              {status === value && <Icon name="check" />}
               {STATUS_META[value]?.label ?? value}
             </button>
           ))}
@@ -1414,7 +1652,7 @@ function ProjectEditor({ project, onSaved, onDeleted }: { project: Project; onSa
       </div>
       <label className="field">
         <span className="field-label">Description</span>
-        <AutoTextarea rows={3} placeholder="One or two lines about the project" value={tagline} onChange={(event) => setTagline(event.target.value)} />
+        <AutoTextarea rows={3} maxLength={200} placeholder="One or two lines about the project" value={tagline} onChange={(event) => setTagline(event.target.value)} />
       </label>
       <label className="field">
         <span className="field-label">Stack · comma-separated</span>
@@ -1428,8 +1666,28 @@ function ProjectEditor({ project, onSaved, onDeleted }: { project: Project; onSa
         <span className="field-label">Website</span>
         <input className="input" placeholder="https://…" {...URL_INPUT} value={site} onChange={(event) => setSite(event.target.value)} />
       </label>
+      {mergeTargets.length > 0 && (
+        <div className="field">
+          <span className="field-label" id={`merge-${project.id}`}>
+            A duplicate of
+          </span>
+          <div className="merge-row">
+            <select className="input" aria-labelledby={`merge-${project.id}`} value={mergeInto} onChange={(event) => setMergeInto(event.target.value)}>
+              <option value="">Pick a project…</option>
+              {mergeTargets.map((other) => (
+                <option key={other.slug} value={other.slug}>
+                  {other.name}
+                </option>
+              ))}
+            </select>
+            <button className="btn outline" disabled={!mergeInto || merging} onClick={() => void merge()}>
+              {merging ? "Merging…" : "Merge"}
+            </button>
+          </div>
+        </div>
+      )}
       <div className="form-actions">
-        <button className="btn" disabled={busy} onClick={() => void save()}>
+        <button className="btn" disabled={busy || !dirty || !changes.name} onClick={() => void save()}>
           {busy ? "Saving…" : "Save"}
         </button>
         {saved && (
@@ -1445,7 +1703,8 @@ function ProjectEditor({ project, onSaved, onDeleted }: { project: Project; onSa
       </div>
       {failure && (
         <div className="form-error" role="alert">
-          &gt; {failure}
+          <Glyph>&gt;</Glyph>
+          {failure}
         </div>
       )}
     </Card>
@@ -1464,10 +1723,24 @@ function ChronicleCard({ entry, index, compact }: { entry: ChronicleEntry; index
     ? when.toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })
     : when.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
   return (
-    <Card index={index} onClick={url ? () => openTelegram(url) : undefined}>
+    <Card index={index} tap={url !== null} className="entry">
       <div className="entry-head">
         <h3 className="entry-title" lang={langOf(entry.title)}>
-          {entry.title}
+          {url ? (
+            <a
+              className="entry-link"
+              href={url}
+              onClick={(event) => {
+                event.preventDefault();
+                haptic();
+                openTelegram(url);
+              }}
+            >
+              {entry.title}
+            </a>
+          ) : (
+            entry.title
+          )}
         </h3>
         <span className="importance" role="img" aria-label={`Importance ${entry.importance} of 5`}>
           {[1, 2, 3, 4, 5].map((level) => (
@@ -1530,7 +1803,7 @@ function groupByDay(entries: ChronicleEntry[]): { key: string; label: string; en
 }
 
 function ChronicleScreen() {
-  const [days, setDays] = useState<Days>("3");
+  const [days, setDays] = useRemembered<Days>("chronicle.days", "3");
   const { data, error, reload, pending, dataPath } = useLoad<{ entries: ChronicleEntry[] }>(`/chronicle?days=${days}`);
   if (!data && error) return <LoadState error={error} retry={reload} skeleton="cards" />;
   const dataDays = DAYS.find((candidate) => dataPath?.endsWith(`days=${candidate}`)) ?? days;
@@ -1546,7 +1819,7 @@ function ChronicleScreen() {
       <Segmented label="Period" value={days} options={[["1", "Day"], ["3", "3 days"], ["7", "Week"], ["30", "Month"]]} onChange={setDays} />
       {(!data || error) && <LoadState error={error} retry={reload} skeleton="cards" hasData={data !== null} />}
       {data && (
-        <div className={cx(pending && "stale")} key={dataPath ?? undefined}>
+        <div className={cx(reading && "stale")} key={dataPath ?? undefined}>
           {entries.length === 0 ? (
             <HiveState
               compact
@@ -1576,7 +1849,10 @@ function ChronicleScreen() {
               shown += group.entries.length;
               return (
                 <section key={group.key} className="day">
-                  <h2 className="day-label">// {group.label}</h2>
+                  <h2 className="day-label">
+                    <Glyph>//</Glyph>
+                    {group.label}
+                  </h2>
                   <ChronicleList entries={group.entries} offset={offset + 4} />
                 </section>
               );
@@ -1591,7 +1867,7 @@ function ChronicleScreen() {
 // ---------- me ----------
 
 interface MeResponse {
-  user: { id: number; display_name: string; username: string | null; tagline: string | null; tagline_manual: boolean; opted_out: boolean };
+  user: { id: number; display_name: string; username: string | null; tagline: string | null; tagline_manual: boolean; opted_out: boolean; is_admin?: boolean };
   facts: Fact[];
   projects: Project[];
 }
@@ -1689,7 +1965,7 @@ function MeScreen({ go }: { go: Go }) {
     setBusy("add");
     setAddFailed(false);
     try {
-      await api("/me/facts", { method: "POST", body: { kind, value: text } });
+      await api("/me/facts", { method: "POST", body: { kind, value: kind === "link" ? withScheme(text) : text } });
       haptic("success");
       setValue("");
       reload();
@@ -1829,6 +2105,7 @@ function MeScreen({ go }: { go: Go }) {
                 <input
                   className="input"
                   placeholder={PLACEHOLDER[kind]}
+                  maxLength={160}
                   enterKeyHint="done"
                   {...(kind === "link" ? URL_INPUT : {})}
                   value={value}
@@ -1844,7 +2121,7 @@ function MeScreen({ go }: { go: Go }) {
               </button>
               {addFailed && (
                 <div className="form-error" role="alert">
-                  &gt; couldn’t add it — try again
+                  <Glyph>&gt;</Glyph>couldn’t add it — try again
                 </div>
               )}
             </Card>
@@ -1953,7 +2230,6 @@ function ChatSwitcher({ chats, current, onPick }: { chats: ChatInfo[]; current: 
     <div className="chat-switcher" ref={ref}>
       <button
         className="chat-current"
-        aria-haspopup="listbox"
         aria-expanded={open}
         onClick={() => {
           haptic("select");
@@ -1966,13 +2242,14 @@ function ChatSwitcher({ chats, current, onPick }: { chats: ChatInfo[]; current: 
         <Icon name="chevron" className="chev" />
       </button>
       {open && (
-        <div className="chat-list" role="listbox">
-          <div className="chat-list-head">// your chats</div>
+        <div className="chat-list" role="group" aria-label="Your chats">
+          <div className="chat-list-head" aria-hidden>
+            {"// your chats"}
+          </div>
           {chats.map((chat) => (
             <button
               key={chat.key}
-              role="option"
-              aria-selected={chat.key === current}
+              aria-current={chat.key === current ? "true" : undefined}
               onClick={() => {
                 haptic("select");
                 setOpen(false);
@@ -1998,10 +2275,7 @@ export function App() {
   useEffect(() => {
     tg?.ready();
     tg?.expand();
-    if (tg) document.documentElement.dataset.tg = "1";
-    const start = routeFromStartParam(screenFromLaunch());
-    if (start && !window.location.hash.startsWith("#/")) go(start);
-  }, [go]);
+  }, []);
 
   // A chat from the launch link wins if the person is in it; else the one picked last time.
   useEffect(() => {
@@ -2016,12 +2290,11 @@ export function App() {
   const depth = path.split("/").filter(Boolean).length;
   useEffect(() => {
     if (!tg) return;
-    const back = () => window.history.back();
     if (depth > 1) {
       tg.BackButton.show();
-      tg.BackButton.onClick(back);
+      tg.BackButton.onClick(goUp);
     } else tg.BackButton.hide();
-    return () => tg?.BackButton.offClick(back);
+    return () => tg?.BackButton.offClick(goUp);
   }, [depth]);
 
   const [, section, param] = path.split("/");

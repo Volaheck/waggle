@@ -38,7 +38,6 @@ export async function mergeSeedUser(sql: Sql, seedUserId: number, intoUserId: nu
       SELECT project_id, ${intoUserId}, created_at FROM votes WHERE user_id = ${seedUserId}
       ON CONFLICT DO NOTHING`;
     await tx`UPDATE messages SET user_id = ${intoUserId} WHERE user_id = ${seedUserId}`;
-    await tx`UPDATE links SET first_user_id = ${intoUserId} WHERE first_user_id = ${seedUserId}`;
     await tx`UPDATE project_signals SET user_id = ${intoUserId} WHERE user_id = ${seedUserId}`;
     await tx`DELETE FROM users WHERE id = ${seedUserId}`;
     if (seed.username) {

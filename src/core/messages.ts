@@ -1,5 +1,4 @@
-import type { Sql } from "./db.js";
-import { extractUrls, normalizeUrl, truncate } from "./text.js";
+import type { Queryable, Sql } from "./db.js";
 
 export interface IncomingMessage {
   chatId: number;
@@ -8,6 +7,8 @@ export interface IncomingMessage {
   sentAt: Date;
   text: string;
   replyToMsgId: number | null;
+  /** The message answers one the bot itself posted (a card, the top, the chronicle); the bot never sees its own messages. */
+  replyToBot?: boolean;
   isForward: boolean;
   forwardSource: string | null;
   mediaType: string | null;
@@ -20,6 +21,7 @@ export interface StoredMessage {
   sent_at: Date;
   text: string;
   reply_to_msg_id: number | null;
+  reply_to_bot?: boolean;
   is_forward: boolean;
   forward_source: string | null;
   media_type: string | null;
@@ -27,9 +29,9 @@ export interface StoredMessage {
 
 export async function saveMessage(sql: Sql, message: IncomingMessage): Promise<void> {
   await sql`
-    INSERT INTO messages (chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, is_forward, forward_source, media_type)
+    INSERT INTO messages (chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, reply_to_bot, is_forward, forward_source, media_type)
     VALUES (${message.chatId}, ${message.msgId}, ${message.userId}, ${message.sentAt}, ${message.text},
-            ${message.replyToMsgId}, ${message.isForward}, ${message.forwardSource}, ${message.mediaType})
+            ${message.replyToMsgId}, ${message.replyToBot ?? false}, ${message.isForward}, ${message.forwardSource}, ${message.mediaType})
     ON CONFLICT (chat_id, msg_id) DO NOTHING`;
   if (message.userId !== null) {
     await sql`
@@ -40,7 +42,6 @@ export async function saveMessage(sql: Sql, message: IncomingMessage): Promise<v
           first_seen_at = least(coalesce(members.first_seen_at, excluded.first_seen_at), excluded.first_seen_at),
           left_at = NULL`;
   }
-  await recordLinks(sql, message);
 }
 
 export async function updateEditedMessage(sql: Sql, chatId: number, msgId: number, text: string, editedAt: Date): Promise<void> {
@@ -49,20 +50,18 @@ export async function updateEditedMessage(sql: Sql, chatId: number, msgId: numbe
     WHERE chat_id = ${chatId} AND msg_id = ${msgId}`;
 }
 
-async function recordLinks(sql: Sql, message: IncomingMessage): Promise<void> {
-  for (const url of extractUrls(message.text)) {
-    const normalized = normalizeUrl(url);
-    if (!normalized || normalized.domain === "t.me") continue;
-    const context = truncate(message.text.replace(url, " ").replace(/\s+/g, " ").trim(), 280) || null;
-    await sql`
-      INSERT INTO links (chat_id, url_norm, url, domain, first_user_id, first_msg_id, last_msg_id, from_forward, context, first_seen_at)
-      VALUES (${message.chatId}, ${normalized.norm}, ${url}, ${normalized.domain}, ${message.userId}, ${message.msgId}, ${message.msgId},
-              ${message.isForward}, ${context}, ${message.sentAt})
-      ON CONFLICT (chat_id, url_norm) DO UPDATE
-      SET share_count = links.share_count + 1,
-          last_msg_id = greatest(links.last_msg_id, excluded.last_msg_id),
-          context = coalesce(links.context, excluded.context)`;
-  }
+/**
+ * Message texts are kept no longer than they are needed: a message older than `retentionDays` that the chronicler
+ * has processed loses its text and the name of the source it was forwarded from. The row stays (author, time, ids),
+ * so links to the message and activity counts keep working. A message still waiting for the chronicler (a paused
+ * chronicler, a used-up budget) keeps its text until it is processed. Returns how many messages were cleared.
+ */
+export async function clearExpiredTexts(sql: Queryable, retentionDays: number): Promise<number> {
+  const cleared = await sql`
+    UPDATE messages SET text = '', forward_source = NULL
+    WHERE extracted_at IS NOT NULL AND sent_at < now() - ${`${retentionDays} days`}::interval
+      AND (text <> '' OR forward_source IS NOT NULL)`;
+  return cleared.count;
 }
 
 export async function messagesAround(sql: Sql, chatId: number, msgIds: number[], radius: number): Promise<StoredMessage[]> {

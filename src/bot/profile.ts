@@ -1,5 +1,5 @@
 import { InlineKeyboard } from "grammy";
-import { chatsOfUser } from "../core/chats.js";
+import { chatsOfUser, getChat } from "../core/chats.js";
 import {
   FACT_KIND_LABELS,
   getFact,
@@ -10,11 +10,12 @@ import {
   visibleFacts,
   type FactKind,
 } from "../core/facts.js";
-import { projectsOfUser, upsertProject } from "../core/projects.js";
-import { escapeHtml } from "../core/text.js";
-import { getPerson, setOptOut, setTagline } from "../core/users.js";
-import { factsWithSources, personCard, userHeader } from "./format.js";
+import { addUserProject, canEditProject, projectsOfUser, updateProject, type ProjectFields } from "../core/projects.js";
+import { escapeHtml, extractUrls, isRepoHost, safeHttpUrl } from "../core/text.js";
+import { forgetUser, getPerson, setOptOut, setTagline } from "../core/users.js";
+import { countOf, factsWithSources, personCard, userHeader } from "./format.js";
 import {
+  decodeChat,
   encodeChat,
   grid,
   type BotContext,
@@ -50,7 +51,9 @@ const KIND_PROMPTS: Record<FactKind, string> = {
   project: "Describe the project in a few words",
 };
 
-const cancelKeyboard = () => new InlineKeyboard().text("Cancel", "me:cancel");
+/** Buttons are made for one chat and carry it («me:c100123:privacy»), so a tap acts there whatever chat is current. */
+const meButton = (chatId: number, action: string) => `me:${encodeChat(chatId)}:${action}`;
+const cancelKeyboard = (chatId: number) => new InlineKeyboard().text("Cancel", meButton(chatId, "cancel"));
 
 export interface ProfileHandlers {
   handleInput: (
@@ -67,12 +70,16 @@ export interface ProfileHandlers {
 
 export function registerProfile(kit: BotKit): ProfileHandlers {
   const { bot, sql, pending } = kit;
+  const retention = countOf(kit.config.MESSAGE_RETENTION_DAYS, "day");
 
   /** Re-reads the person so screens show what was just saved. */
   const refreshed = async (scope: Scope): Promise<Scope> => ({
     ...scope,
     person: (await getPerson(sql, scope.chatId, scope.user.id)) ?? scope.person,
   });
+
+  const chatTitle = async (chatId: number) =>
+    escapeHtml((await getChat(sql, chatId))?.title ?? "this chat");
 
   async function profileScreen(ctx: BotContext, scope: Scope, edit = false) {
     const { person, chatId, user } = scope;
@@ -85,15 +92,15 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
       chatsOfUser(sql, user.id),
     ]);
     const hiddenCount = hidden[0]?.count ?? 0;
-    const chatTitle = chats.find((chat) => chat.id === chatId)?.title;
+    const chatName = chats.find((chat) => chat.id === chatId)?.title;
     const text = [
       personCard(person, facts, projects),
       "",
       person.opted_out
         ? "🚫 Data collection about you is off in this chat."
         : "Chat members can see this card. The chronicler fills it in as you chat, and you can fix anything.",
-      chats.length > 1 && chatTitle
-        ? `\n💬 Chat: <b>${escapeHtml(chatTitle)}</b>`
+      chats.length > 1 && chatName
+        ? `\n💬 Chat: <b>${escapeHtml(chatName)}</b>`
         : "",
     ]
       .join("\n")
@@ -101,18 +108,18 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     const keyboard = new InlineKeyboard();
     if (!person.opted_out) {
       keyboard
-        .text("✏️ One-liner", "me:tagline")
-        .text("➕ Add", "me:add")
+        .text("✏️ One-liner", meButton(chatId, "tagline"))
+        .text("➕ Add", meButton(chatId, "add"))
         .row();
       if (facts.length)
         keyboard
-          .text("❌ Remove wrong", "me:wrong")
-          .text("🙈 Hide", "me:hide")
+          .text("❌ Remove wrong", meButton(chatId, "wrong"))
+          .text("🙈 Hide", meButton(chatId, "hide"))
           .row();
-      if (hiddenCount) keyboard.text(`👁 Hidden (${hiddenCount})`, "me:hidden");
+      if (hiddenCount) keyboard.text(`👁 Hidden (${hiddenCount})`, meButton(chatId, "hidden"));
     }
-    keyboard.text("🛠 My projects", "me:projects").row();
-    keyboard.text("🔒 Privacy", "me:privacy");
+    keyboard.text("🛠 My projects", meButton(chatId, "projects")).row();
+    keyboard.text("🔒 Privacy", meButton(chatId, "privacy"));
     const app = kit.appButton(ctx, chatId, "📱 In the app", "/me", "me");
     if (app) keyboard.add(app);
     if (chats.length > 1) keyboard.row().text("🔁 Other chat", "chat:pick");
@@ -143,7 +150,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
       .map((fact, index) =>
         InlineKeyboard.text(`${icon} ${index + 1}`, `${action}:${fact.id}`),
       );
-    const keyboard = grid(buttons, 5).row().text("← Back", "me:home");
+    const keyboard = grid(buttons, 5).row().text("← Back", meButton(scope.chatId, "home"));
     await kit.show(
       ctx,
       `${title}\n\n${factsWithSources(facts, scope.chatId)}`,
@@ -153,20 +160,21 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
   }
 
   async function privacyScreen(ctx: BotContext, scope: Scope) {
+    const chat = await chatTitle(scope.chatId);
     const text = scope.person.opted_out
-      ? "🚫 <b>Collection is off.</b> The chronicler records nothing about you in this chat, and there's no card. Your messages stay in the chat's shared archive."
+      ? `🚫 <b>Collection is off in ${chat}.</b> The chronicler records nothing about you there, and there's no card. Your messages stay in the chat's shared archive; their texts are deleted after ${retention}, once the chronicler has gone through them.`
       : [
-          "🔒 <b>Privacy</b>",
+          `🔒 <b>Privacy</b> · ${chat}`,
           "Every few hours the chronicler goes through new messages and updates the cards. It never records politics, health, finances, personal life, addresses or secrets.",
           "Any fact can be removed with the “❌ Remove wrong” button.",
         ].join("\n\n");
     const keyboard = new InlineKeyboard()
-      .text("📋 What do you know about me", "me:know")
+      .text("📋 What do you know about me", meButton(scope.chatId, "know"))
       .row();
     if (scope.person.opted_out)
-      keyboard.text("✅ Keep my card again", "priv:on");
-    else keyboard.text("🚫 Stop collecting about me", "priv:off");
-    keyboard.row().text("← Back", "me:home");
+      keyboard.text("✅ Keep my card again", `priv:${encodeChat(scope.chatId)}:on`);
+    else keyboard.text("🚫 Stop collecting about me", `priv:${encodeChat(scope.chatId)}:off`);
+    keyboard.row().text("← Back", meButton(scope.chatId, "home"));
     await kit.show(ctx, text, keyboard, { edit: true });
   }
 
@@ -180,17 +188,17 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
       person.tagline
         ? `One-liner: ${escapeHtml(person.tagline)}${person.tagline_manual ? " ✍️" : ""}`
         : "No one-liner",
-      `Messages in this chat's archive: ${stats?.messages ?? 0}${stats?.first ? ` (since ${stats.first.toLocaleDateString("en-GB")})` : ""}`,
+      `Messages in the archive of ${await chatTitle(chatId)}: ${stats?.messages ?? 0}${stats?.first ? ` (since ${stats.first.toLocaleDateString("en-GB")})` : ""}`,
       "",
       "<b>Facts</b> (✍️ — added by you, 🙈 — hidden, numbers — source messages):",
       factsWithSources(facts, chatId),
       "",
-      "Messages are kept for the chronicle and /catchup. To delete everything about you in all chats — /forgetme.",
+      `Message texts are kept for ${retention} for the chronicle and /catchup, then deleted once the chronicler has gone through them. To delete everything about you in all chats — /forgetme.`,
     ].join("\n");
     await kit.show(
       ctx,
       text,
-      edit ? new InlineKeyboard().text("← Back", "me:privacy") : undefined,
+      edit ? new InlineKeyboard().text("← Back", meButton(chatId, "privacy")) : undefined,
       { edit },
     );
   }
@@ -202,53 +210,45 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     );
     const keyboard = grid(buttons, 2)
       .row()
-      .text("➕ New project", "np:start")
+      .text("➕ New project", `np:${encodeChat(scope.chatId)}:start`)
       .row()
-      .text("← Back", "me:home");
+      .text("← Back", meButton(scope.chatId, "home"));
     const text = projects.length
       ? "🛠 <b>Your projects</b>\nTap a project to edit its status, description, stack or links."
       : "🛠 You have no projects in the catalog yet. Add one — others will hear about it, and it gets into the rating.";
     await kit.show(ctx, text, keyboard, { edit: true });
   }
 
-  /** Editing happens in DM only, for the chat currently picked there. */
-  const dmScope = async (ctx: BotContext) =>
-    ctx.from && kit.isPrivate(ctx) ? kit.scope(ctx) : undefined;
+  const dmOnly = (ctx: BotContext) => {
+    if (kit.isPrivate(ctx)) return true;
+    void ctx.answerCallbackQuery({ text: "This works in a DM with the bot" }).catch(() => undefined);
+    return false;
+  };
 
   bot.callbackQuery(
-    /^me:(home|tagline|tagline_reset|add|wrong|hide|hidden|privacy|know|projects|cancel)$/,
+    /^me:c(\d+):(home|tagline|tagline_reset|add|wrong|hide|hidden|privacy|know|projects|cancel)$/,
     async (ctx) => {
-      if (!kit.isPrivate(ctx))
-        return ctx.answerCallbackQuery({
-          text: "This works in a DM with the bot",
-        });
+      if (!dmOnly(ctx)) return;
       await ctx.answerCallbackQuery();
-      const scope = await dmScope(ctx);
+      const scope = await kit.scopeForChat(ctx, decodeChat(ctx.match[1]));
       if (!scope) return;
-      switch (ctx.match[1]) {
+      const chatId = scope.chatId;
+      switch (ctx.match[2]) {
         case "home":
         case "cancel":
-          pending.clear(ctx.from.id);
           return profileScreen(ctx, scope, true);
         case "tagline":
-          pending.set(ctx.from.id, { kind: "tagline", chatId: scope.chatId });
+          pending.set(ctx.from.id, { kind: "tagline", chatId });
           return kit.show(
             ctx,
             `✏️ Write a one-liner about who you are — up to 90 characters.\nNow: ${scope.person.tagline ? `<i>${escapeHtml(scope.person.tagline)}</i>` : "none"}`,
             new InlineKeyboard()
-              .text("Reset", "me:tagline_reset")
-              .text("Cancel", "me:cancel"),
+              .text("Reset", meButton(chatId, "tagline_reset"))
+              .text("Cancel", meButton(chatId, "cancel")),
             { edit: true },
           );
         case "tagline_reset":
-          pending.clear(ctx.from.id);
-          await setTagline(
-            sql,
-            scope.chatId,
-            scope.user.id,
-            null,
-            scope.user.id,
-          );
+          await setTagline(sql, chatId, scope.user.id, null, scope.user.id);
           return profileScreen(ctx, await refreshed(scope), true);
         case "add":
           return kit.show(
@@ -256,18 +256,18 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
             "➕ <b>What should I add?</b>",
             grid(
               MANUAL_KINDS.map((kind) =>
-                InlineKeyboard.text(FACT_KIND_LABELS[kind], `addk:${kind}`),
+                InlineKeyboard.text(FACT_KIND_LABELS[kind], `addk:${encodeChat(chatId)}:${kind}`),
               ),
               2,
             )
               .row()
-              .text("← Back", "me:home"),
+              .text("← Back", meButton(chatId, "home")),
             { edit: true },
           );
         case "wrong":
         case "hide":
         case "hidden":
-          return factListScreen(ctx, scope, ctx.match[1]);
+          return factListScreen(ctx, scope, ctx.match[2]);
         case "privacy":
           return privacyScreen(ctx, scope);
         case "know":
@@ -278,12 +278,18 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     },
   );
 
-  bot.callbackQuery(/^addk:(\w+)$/, async (ctx) => {
-    const kind = ctx.match[1] as FactKind;
-    if (!kit.isPrivate(ctx) || !MANUAL_KINDS.includes(kind))
-      return ctx.answerCallbackQuery();
+  // Buttons from before chats were named in them: which chat they meant is unknown, so they do nothing.
+  bot.callbackQuery(
+    /^(?:me:[a-z_]+|addk:\w+|priv:(?:on|off)|forget:here:(?:facts|messages)|np:start)$/,
+    (ctx) => ctx.answerCallbackQuery({ text: "This button is outdated — open /me again" }),
+  );
+
+  bot.callbackQuery(/^addk:c(\d+):(\w+)$/, async (ctx) => {
+    const kind = ctx.match[2] as FactKind;
+    if (!dmOnly(ctx) || !MANUAL_KINDS.includes(kind))
+      return ctx.answerCallbackQuery().catch(() => undefined);
     await ctx.answerCallbackQuery();
-    const scope = await dmScope(ctx);
+    const scope = await kit.scopeForChat(ctx, decodeChat(ctx.match[1]));
     if (!scope) return;
     pending.set(ctx.from.id, {
       kind: "fact",
@@ -293,7 +299,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     await kit.show(
       ctx,
       `<b>${FACT_KIND_LABELS[kind]}</b>\n${escapeHtml(KIND_PROMPTS[kind])}`,
-      cancelKeyboard(),
+      cancelKeyboard(scope.chatId),
       { edit: true },
     );
   });
@@ -326,25 +332,27 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
       );
   });
 
-  bot.callbackQuery(/^priv:(on|off)$/, async (ctx) => {
-    if (!kit.isPrivate(ctx)) return ctx.answerCallbackQuery();
+  bot.callbackQuery(/^priv:c(\d+):(on|off)$/, async (ctx) => {
+    if (!dmOnly(ctx)) return;
     await ctx.answerCallbackQuery();
-    const scope = await dmScope(ctx);
-    if (!scope) return;
-    if (ctx.match[1] === "on") {
-      await setOptOut(sql, scope.user.id, false, scope.chatId);
+    const chatId = decodeChat(ctx.match[1]);
+    if (ctx.match[2] === "on") {
+      const scope = await kit.scopeForChat(ctx, chatId);
+      if (!scope) return;
+      await setOptOut(sql, scope.user.id, false, chatId);
       return privacyScreen(ctx, await refreshed(scope));
     }
-    await kit.show(ctx, forgetPrompt("here"), forgetKeyboard("here"), {
-      edit: true,
-    });
+    // Removing what the bot knows about you is never refused, even in a chat you have left since.
+    const user = await kit.identity(ctx.from);
+    if (!(await getPerson(sql, chatId, user.id))) return;
+    await kit.show(ctx, forgetPrompt(await chatTitle(chatId)), forgetKeyboard(encodeChat(chatId)), { edit: true });
   });
 
-  const forgetPrompt = (where: "here" | "all") =>
-    where === "here"
-      ? "Delete all facts about you in this chat and stop collecting anything here? You can also delete the text of your messages from this chat's archive."
+  const forgetPrompt = (chat: string | null) =>
+    chat
+      ? `Delete all facts about you in <b>${chat}</b> and stop collecting anything there? You can also delete the text of your messages from that chat's archive.`
       : "Delete all facts about you in all chats and stop collecting anything? You can also delete the text of your messages from the archives.";
-  const forgetKeyboard = (where: "here" | "all") =>
+  const forgetKeyboard = (where: string) =>
     new InlineKeyboard()
       .text("Yes, delete facts", `forget:${where}:facts`)
       .row()
@@ -355,33 +363,27 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
   bot.command("forgetme", async (ctx) => {
     if (!kit.isPrivate(ctx))
       return kit.show(ctx, "That one's for DMs: send me /forgetme");
-    await kit.show(ctx, forgetPrompt("all"), forgetKeyboard("all"));
+    await kit.show(ctx, forgetPrompt(null), forgetKeyboard("all"));
   });
 
   bot.callbackQuery(
-    /^forget:(?:(here|all):(facts|messages)|no)$/,
+    /^forget:(?:(all|c\d+):(facts|messages)|no)$/,
     async (ctx) => {
       await ctx.answerCallbackQuery();
       const [, where, what] = ctx.match;
-      if (!where) return ctx.editMessageText("Okay, leaving everything as is 🙂");
-      let chatId: number | undefined;
+      if (!where) return kit.show(ctx, "Okay, leaving everything as is 🙂", undefined, { edit: true });
       const user = await kit.identity(ctx.from);
-      if (where === "here") {
-        const scope = await dmScope(ctx);
-        if (!scope) return;
-        chatId = scope.chatId;
-      }
-      await setOptOut(sql, user.id, true, chatId);
-      if (what === "messages") {
-        await sql`
-        UPDATE messages SET text = '', extracted_at = now()
-        WHERE user_id = ${user.id} AND (${chatId ?? null}::bigint IS NULL OR chat_id = ${chatId ?? null}::bigint)`;
-      }
-      const scopeText = where === "here" ? " in this chat" : "";
-      await ctx.editMessageText(
+      const chatId = where === "all" ? undefined : decodeChat(where.slice(1));
+      if (chatId !== undefined && !(await getPerson(sql, chatId, user.id))) return;
+      await forgetUser(sql, user.id, { chatId, messages: what === "messages" });
+      const scopeText = chatId !== undefined ? ` in <b>${await chatTitle(chatId)}</b>` : "";
+      await kit.show(
+        ctx,
         what === "messages"
-          ? `Deleted the facts and the text of your messages${scopeText}. I'm no longer collecting anything about you. Changed your mind? /me → 🔒 Privacy.`
-          : `Deleted all facts${scopeText}. I'm no longer collecting anything about you. Changed your mind? /me → 🔒 Privacy.`,
+          ? `Deleted the facts and the text of your messages${scopeText}. I'm no longer collecting anything about you${chatId !== undefined ? " there" : ""}. Changed your mind? /me → 🔒 Privacy.`
+          : `Deleted all facts${scopeText}. I'm no longer collecting anything about you${chatId !== undefined ? " there" : ""}. Changed your mind? /me → 🔒 Privacy.`,
+        undefined,
+        { edit: true },
       );
     },
   );
@@ -413,13 +415,13 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     );
   });
 
-  bot.callbackQuery("np:start", async (ctx) => {
+  bot.callbackQuery(/^np:c(\d+):start$/, async (ctx) => {
     if (!kit.isPrivate(ctx))
       return ctx.answerCallbackQuery({
         text: "You can add a project in a DM with the bot",
       });
     await ctx.answerCallbackQuery();
-    const scope = await dmScope(ctx);
+    const scope = await kit.scopeForChat(ctx, decodeChat(ctx.match[1]));
     if (!scope) return;
     pending.set(ctx.from.id, {
       kind: "new_project_name",
@@ -428,35 +430,44 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
     await kit.show(
       ctx,
       "🛠 <b>New project.</b> What's it called?",
-      cancelKeyboard(),
+      cancelKeyboard(scope.chatId),
       { edit: true },
     );
   });
 
   bot.callbackQuery(/^np:skip:(\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
-    pending.clear(ctx.from.id);
-    const [project] = await sql<
-      { slug: string }[]
-    >`SELECT slug FROM projects WHERE id = ${Number(ctx.match[1])}`;
-    if (project)
-      await kit.show(
-        ctx,
-        `Done ✅ Open the project to add a description and stack: /project ${escapeHtml(project.slug)}`,
-        new InlineKeyboard().text("Open project", `p:${project.slug}`),
-        { edit: true },
-      );
+    if (!kit.isPrivate(ctx)) return;
+    // Only the project's own author, still in its chat, gets an answer: the id in the button can be anything.
+    const [project] = await sql<{ slug: string; chat_id: number }[]>`
+      SELECT p.slug, p.chat_id FROM projects p
+      WHERE p.id = ${Number(ctx.match[1])} AND NOT p.hidden
+        AND EXISTS (SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id WHERE pm.project_id = p.id AND u.tg_id = ${ctx.from.id})`;
+    if (!project || !(await kit.scopeForChat(ctx, project.chat_id))) return;
+    await kit.show(
+      ctx,
+      `Done ✅ Open the project to add a description and stack: /project ${escapeHtml(project.slug)}`,
+      new InlineKeyboard().text("Open project", `p:${project.slug}`),
+      { edit: true },
+    );
   });
+
+  const authorsOf = async (projectId: number) =>
+    (
+      await sql<{ display_name: string }[]>`
+        SELECT u.display_name FROM project_members pm JOIN users u ON u.id = pm.user_id WHERE pm.project_id = ${projectId} ORDER BY u.display_name`
+    )
+      .map((row) => escapeHtml(row.display_name))
+      .join(", ");
 
   async function handleInput(
     ctx: BotContext,
     input: PendingInput,
     rawText: string,
   ) {
-    const user = await kit.identity(ctx.from!);
-    const person = await getPerson(sql, input.chatId, user.id);
-    if (!person) return void (await ctx.reply("You're no longer in this chat 🤔"));
-    const scope: Scope = { user, chatId: input.chatId, person };
+    const scope = await kit.scopeForChat(ctx, input.chatId);
+    if (!scope) return;
+    const { user } = scope;
     const text = rawText.trim();
     switch (input.kind) {
       case "tagline": {
@@ -501,25 +512,35 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
         return profileScreen(ctx, scope);
       }
       case "new_project_name": {
-        const { project } = await upsertProject(sql, {
-          chatId: scope.chatId,
-          name: text.slice(0, 80),
-          status: "в работе",
-          authorIds: [user.id],
-          sourceMsgIds: [],
-          activityAt: new Date(),
-          source: "user",
-          actorUserId: user.id,
-        });
+        const name = text.slice(0, 80);
+        const result = await addUserProject(sql, { chatId: scope.chatId, name, actorUserId: user.id });
+        if (result.outcome === "exists") {
+          const authors = await authorsOf(result.project.id);
+          await kit.show(
+            ctx,
+            `There's already <b>${escapeHtml(result.project.name)}</b> in this chat's catalog${authors ? ` (by ${authors})` : ""}. If yours is a different project, give it a name of its own.`,
+            new InlineKeyboard()
+              .text("Open it", `p:${result.project.slug}`)
+              .text("Another name", `np:${encodeChat(scope.chatId)}:start`),
+          );
+          return;
+        }
         pending.set(ctx.from!.id, {
           kind: "new_project_link",
           chatId: scope.chatId,
-          projectId: project.id,
+          projectId: result.project.id,
         });
+        const project = `<b>${escapeHtml(result.project.name)}</b>`;
+        const intro =
+          result.outcome === "created"
+            ? `Project ${project} added ✅`
+            : result.outcome === "restored"
+              ? `Project ${project} is back in the catalog ✅`
+              : `${project} is already among your projects.`;
         await kit.show(
           ctx,
-          `Project <b>${escapeHtml(project.name)}</b> added ✅\nSend a link — repository or website:`,
-          new InlineKeyboard().text("Skip", `np:skip:${project.id}`),
+          `${intro}\nSend a link — repository or website:`,
+          new InlineKeyboard().text("Skip", `np:skip:${result.project.id}`),
         );
         return;
       }
@@ -528,52 +549,47 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
         const projectId = input.projectId;
         const field = input.kind === "new_project_link" ? "links" : input.field;
         const [current] = await sql<
-          { name: string; slug: string }[]
-        >`SELECT name, slug FROM projects WHERE id = ${projectId} AND chat_id = ${scope.chatId}`;
-        if (!current) return;
+          { slug: string; is_author: boolean }[]
+        >`SELECT p.slug, EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = p.id AND pm.user_id = ${user.id}) AS is_author
+          FROM projects p WHERE p.id = ${projectId} AND p.chat_id = ${scope.chatId} AND NOT p.hidden`;
+        if (!current || !(await canEditProject(sql, projectId, user.id, kit.isOwner(user))))
+          return void (await ctx.reply("You can't edit that project anymore 🤔"));
+        let fields: ProjectFields;
         if (field === "tagline") {
-          await upsertProject(sql, {
-            chatId: scope.chatId,
-            name: current.name,
-            tagline: text.slice(0, 200),
-            authorIds: [],
-            sourceMsgIds: [],
-            source: "user",
-            actorUserId: user.id,
-          });
+          fields = { tagline: text.slice(0, 200) };
         } else if (field === "stack") {
-          const stack = text
-            .split(/[,;\n]+/)
-            .map((part) => part.trim())
-            .filter(Boolean)
-            .slice(0, 20);
-          await sql`UPDATE projects SET stack = ${stack}, manual_fields = array(SELECT DISTINCT unnest(manual_fields || '{stack}'::text[])), updated_at = now() WHERE id = ${projectId}`;
+          fields = {
+            stack: text
+              .split(/[,;\n]+/)
+              .map((part) => part.trim().slice(0, 40))
+              .filter(Boolean)
+              .slice(0, 20),
+          };
         } else {
-          const urls = text.match(/https?:\/\/\S+/g) ?? [];
+          const urls = extractUrls(text)
+            .map(safeHttpUrl)
+            .filter((url): url is string => url !== null);
           if (urls.length === 0) {
             pending.set(ctx.from!.id, input);
             await ctx.reply(
               "I don't see a link. Send something like https://github.com/you/project",
-              { reply_markup: cancelKeyboard() },
+              { reply_markup: cancelKeyboard(scope.chatId) },
             );
             return;
           }
-          const repo =
-            urls.find((url) =>
-              /github\.com|gitlab\.com|codeberg\.org/.test(url),
-            ) ?? null;
-          const site = urls.find((url) => url !== repo) ?? null;
-          await upsertProject(sql, {
-            chatId: scope.chatId,
-            name: current.name,
-            links: { repo, site },
-            authorIds: [],
-            sourceMsgIds: [],
-            source: "user",
-            actorUserId: user.id,
-          });
+          const repo = urls.find((url) => isRepoHost(new URL(url).hostname));
+          const site = urls.find((url) => url !== repo);
+          fields = { links: { repo, site } };
         }
-        await ctx.reply("Saved ✅", {
+        const result = await updateProject(sql, {
+          chatId: scope.chatId,
+          projectId,
+          ...fields,
+          source: current.is_author ? "user" : "admin",
+          actorUserId: user.id,
+        });
+        if (!result) return void (await ctx.reply("That project is gone from the catalog 🤔"));
+        await ctx.reply(result.changed ? "Saved ✅" : "Nothing to change — it already says that.", {
           reply_markup: new InlineKeyboard().text(
             "Open project",
             `p:${current.slug}`,

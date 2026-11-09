@@ -6,11 +6,12 @@ import { Hono, type Context } from "hono";
 import { z } from "zod";
 import type { Sql } from "../core/db.js";
 import { FACT_KINDS, getFact, ownFacts, proposeFact, rejectFact, setFactHidden, visibleFacts } from "../core/facts.js";
-import { canEditProject, getProjectBySlug, hideProject, listProjects, PROJECT_STATUSES, projectsOfUser, setVote, upsertProject } from "../core/projects.js";
+import { addUserProject, canEditProject, getProjectBySlug, hideProject, listProjects, mergeProjects, PROJECT_STATUSES, projectsOfUser, renameProject, setVote, updateProject } from "../core/projects.js";
 import { topChronicle, topLimitFor } from "../core/chronicle.js";
-import { messageLink, truncate } from "../core/text.js";
+import { messageLink, safeHttpUrl, truncate } from "../core/text.js";
 import { approvedChats, chatsOfUser, setCurrentChat, type Chat } from "../core/chats.js";
 import { ensureMember, getPerson, peopleOfChat, resolveUser, setOptOut, setTagline, type Person, type User } from "../core/users.js";
+import { avatarPath, isAvatarSignature, type AvatarCache } from "./avatars.js";
 import { validateInitData } from "./init-data.js";
 
 export interface ApiDeps {
@@ -22,6 +23,8 @@ export interface ApiDeps {
   webDistDir: string;
   /** Local development: a request carrying this secret acts as `devLoginAs` without Telegram. */
   devLogin?: { token: string; loginAs: string };
+  /** Members' Telegram profile photos; without it every avatar falls back to the initial. */
+  avatars?: AvatarCache;
 }
 
 type Env = { Variables: { user: User; chatId: number; person: Person } };
@@ -39,20 +42,30 @@ const ManualFactSchema = z.object({
   value: z.string().trim().min(1).max(160),
 });
 
+/** An http(s) link, stored in the one safe form safeHttpUrl gives; an empty string clears the field. */
+const LinkSchema = z
+  .string()
+  .trim()
+  .max(500)
+  .refine((value) => value === "" || safeHttpUrl(value) !== null, "must be an http(s) link")
+  .transform((value) => (value === "" ? null : safeHttpUrl(value)));
+
+/** Each field: absent leaves it alone, null (or an empty string) clears it. */
 const ProjectPatchSchema = z.object({
+  name: z.string().trim().min(1).max(80).optional(),
   tagline: z.string().trim().max(200).nullable().optional(),
   status: z.enum(PROJECT_STATUSES).optional(),
   stack: z.array(z.string().trim().min(1).max(40)).max(20).optional(),
-  repo: z.string().url().nullable().optional(),
-  site: z.string().url().nullable().optional(),
+  repo: LinkSchema.nullable().optional(),
+  site: LinkSchema.nullable().optional(),
 });
 
 const ProjectCreateSchema = z.object({
   name: z.string().trim().min(1).max(80),
   tagline: z.string().trim().max(200).nullable().optional(),
   status: z.enum(PROJECT_STATUSES).optional(),
-  repo: z.string().url().nullable().optional(),
-  site: z.string().url().nullable().optional(),
+  repo: LinkSchema.nullable().optional(),
+  site: LinkSchema.nullable().optional(),
   stack: z.array(z.string().trim().min(1).max(40)).max(20).optional(),
 });
 
@@ -71,11 +84,32 @@ function publicUser(user: Person) {
 export function createApi(deps: ApiDeps): Hono<Env> {
   const { sql } = deps;
   const app = new Hono<Env>();
-  const isOwner = (user: User) => user.is_admin || (user.tg_id !== null && deps.adminTgIds.includes(user.tg_id));
+  // Owners are exactly the configured list; a stored is_admin flag grants nothing.
+  const isOwner = (user: User) => user.tg_id !== null && deps.adminTgIds.includes(user.tg_id);
 
   app.get("/healthz", async (c) => {
     await sql`SELECT 1`;
     return c.json({ ok: true });
+  });
+
+  // Signed, so <img> can load it without initData while nobody can walk user ids.
+  app.get("/avatars/:userId", async (c) => {
+    const userId = Number(c.req.param("userId"));
+    if (!Number.isSafeInteger(userId) || !isAvatarSignature(deps.botToken, userId, c.req.query("s"))) return c.body(null, 403);
+    const missing = () => c.body(null, 404, { "cache-control": "public, max-age=3600" });
+    if (!deps.avatars) return missing();
+    const [user] = await sql<{ tg_id: number | null }[]>`SELECT tg_id FROM users WHERE id = ${userId}`;
+    if (!user?.tg_id) return missing();
+    const avatar = await deps.avatars.get(user.tg_id);
+    if (!avatar) return missing();
+    return c.body(avatar.bytes, 200, { "content-type": avatar.type, "cache-control": "public, max-age=86400" });
+  });
+
+  const avatarUrl = (userId: number) => avatarPath(deps.botToken, userId);
+  const personPayload = (person: Person) => ({ ...publicUser(person), avatar_url: avatarUrl(person.id) });
+  const withAuthorAvatars = <T extends { authors: { id: number }[] }>(project: T) => ({
+    ...project,
+    authors: project.authors.map((author) => ({ ...author, avatar_url: avatarUrl(author.id) })),
   });
 
   const api = new Hono<Env>();
@@ -143,10 +177,11 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     await next();
   });
 
+  /** Null for messages without a t.me address (see messageLink). */
   const linkFor = (c: Context<Env>, msgId: number) => messageLink(c.get("chatId"), msgId);
-  /** Projects are addressed by id; make sure one from another chat is never touched. */
+  /** Projects are addressed by id; make sure one from another chat, or a deleted one, is never touched. */
   const projectInChat = async (c: Context<Env>, projectId: number) => {
-    const [row] = await sql<{ id: number }[]>`SELECT id FROM projects WHERE id = ${projectId} AND chat_id = ${c.get("chatId")}`;
+    const [row] = await sql<{ id: number }[]>`SELECT id FROM projects WHERE id = ${projectId} AND chat_id = ${c.get("chatId")} AND NOT hidden`;
     return Boolean(row);
   };
 
@@ -154,7 +189,10 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     (c: Context<Env>) =>
     <T extends { source_msg_ids: number[] }>(item: T) => ({
       ...item,
-      sources: item.source_msg_ids.slice(0, 3).map((id) => ({ id, url: linkFor(c, id) })),
+      sources: item.source_msg_ids.slice(0, 3).flatMap((id) => {
+        const url = linkFor(c, id);
+        return url ? [{ id, url }] : [];
+      }),
     });
 
   api.get("/me", async (c) => {
@@ -163,7 +201,7 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     const chatId = c.get("chatId");
     const [facts, projects] = await Promise.all([ownFacts(sql, chatId, user.id), projectsOfUser(sql, chatId, user.id)]);
     return c.json({
-      user: { ...publicUser(person), tagline: person.tagline, tagline_manual: person.tagline_manual, is_admin: isOwner(user) },
+      user: { ...personPayload(person), tagline: person.tagline, tagline_manual: person.tagline_manual, is_admin: isOwner(user) },
       facts: facts.map(withSources(c)),
       projects,
     });
@@ -220,7 +258,7 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     const extraOf = new Map(extras.map((row) => [row.user_id, row]));
     return c.json({
       people: people.map((person) => ({
-        ...publicUser(person),
+        ...personPayload(person),
         linked: person.tg_id !== null,
         top_facts: person.opted_out ? [] : extraOf.get(person.id)?.top_facts ?? [],
         project_count: extraOf.get(person.id)?.project_count ?? 0,
@@ -241,10 +279,11 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     ]);
     const viewer = c.get("user");
     return c.json({
-      person: publicUser(person),
+      person: personPayload(person),
       facts: facts.map(withSources(c)),
       projects,
       messages_30d: stats[0]?.messages_30d ?? 0,
+      is_me: viewer.id === person.id,
       can_edit: viewer.id === person.id || isOwner(viewer),
     });
   });
@@ -255,7 +294,7 @@ export function createApi(deps: ApiDeps): Hono<Env> {
       sort: sort === "new" || sort === "alive" ? sort : "top",
       viewerUserId: c.get("user").id,
     });
-    return c.json({ projects });
+    return c.json({ projects: projects.map(withAuthorAvatars) });
   });
 
   api.get("/projects/:slug", async (c) => {
@@ -263,47 +302,50 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     const chatId = c.get("chatId");
     const project = await getProjectBySlug(sql, chatId, c.req.param("slug"), user.id);
     if (!project) return c.json({ error: "not_found" }, 404);
-    // Only messages the chronicler linked to this project by meaning — never a plain word match.
+    // Only messages the chronicler linked to this project by meaning — never a plain word match. Texts cleared
+    // after the retention period have nothing left to quote.
     const discussions = await sql<{ msg_id: number; sent_at: Date; text: string; display_name: string | null }[]>`
       SELECT m.msg_id, m.sent_at, m.text, u.display_name
       FROM messages m LEFT JOIN users u ON u.id = m.user_id
-      WHERE m.chat_id = ${chatId}
+      WHERE m.chat_id = ${chatId} AND btrim(m.text) <> ''
         AND (m.msg_id = ANY(${project.source_msg_ids})
              OR m.msg_id IN (SELECT unnest(source_msg_ids) FROM project_signals WHERE project_id = ${project.id} AND NOT hidden))
       ORDER BY m.sent_at DESC
       LIMIT 6`;
+    // Only this chat's own topics, even if a topic of another chat was ever linked to this project.
     const history = await sql<{ id: number; title: string; summary: string; kind: string; importance: number; period_to: Date; msg_ids: number[] }[]>`
       SELECT id, title, summary, kind, importance, period_to, msg_ids FROM chronicle
-      WHERE project_id = ${project.id}
+      WHERE project_id = ${project.id} AND chat_id = ${chatId}
       ORDER BY period_to DESC
       LIMIT 10`;
     return c.json({
-      project,
+      project: withAuthorAvatars(project),
       can_edit: await canEditProject(sql, project.id, user.id, isOwner(user)),
       first_seen_url: project.first_seen_msg_id ? linkFor(c, project.first_seen_msg_id) : null,
-      discussions: discussions.map((row) => ({ ...row, text: truncate(row.text, 220), url: linkFor(c, row.msg_id) })),
+      discussions: discussions.flatMap((row) => {
+        const url = linkFor(c, row.msg_id);
+        return url ? [{ ...row, text: truncate(row.text, 220), url }] : [];
+      }),
       history: history.map((entry) => ({ ...entry, url: entry.msg_ids[0] ? linkFor(c, entry.msg_ids[0]) : null })),
     });
   });
 
+  /** Adds a project; a name, slug or link that belongs to someone else's project is refused (409), never merged into it. */
   api.post("/projects", async (c) => {
     const user = c.get("user");
     const body = ProjectCreateSchema.safeParse(await c.req.json());
     if (!body.success) return c.json({ error: "bad_request" }, 400);
-    const { project } = await upsertProject(sql, {
+    const result = await addUserProject(sql, {
       chatId: c.get("chatId"),
       name: body.data.name,
-      tagline: body.data.tagline ?? null,
+      tagline: body.data.tagline,
       status: body.data.status,
       stack: body.data.stack,
-      links: { repo: body.data.repo ?? null, site: body.data.site ?? null },
-      authorIds: [user.id],
-      sourceMsgIds: [],
-      activityAt: new Date(),
-      source: "user",
+      links: { repo: body.data.repo, site: body.data.site },
       actorUserId: user.id,
     });
-    return c.json({ slug: project.slug });
+    if (result.outcome === "exists") return c.json({ error: "exists", slug: result.project.slug }, 409);
+    return c.json({ slug: result.project.slug, outcome: result.outcome });
   });
 
   api.patch("/projects/:id", async (c) => {
@@ -313,23 +355,35 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     if (!(await canEditProject(sql, projectId, user.id, isOwner(user)))) return c.json({ error: "forbidden" }, 403);
     const body = ProjectPatchSchema.safeParse(await c.req.json());
     if (!body.success) return c.json({ error: "bad_request" }, 400);
-    const [current] = await sql<{ name: string; links: { repo?: string | null; site?: string | null } }[]>`SELECT name, links FROM projects WHERE id = ${projectId}`;
-    if (!current) return c.json({ error: "not_found" }, 404);
-    const linksChanged = body.data.repo !== undefined || body.data.site !== undefined;
-    await upsertProject(sql, {
-      chatId: c.get("chatId"),
-      name: current.name,
-      tagline: body.data.tagline,
-      status: body.data.status,
-      stack: body.data.stack,
-      links: linksChanged ? { repo: body.data.repo ?? current.links.repo ?? null, site: body.data.site ?? current.links.site ?? null } : undefined,
-      authorIds: [],
-      sourceMsgIds: [],
-      source: isOwner(user) ? "admin" : "user",
-      actorUserId: user.id,
-    });
-    if (body.data.stack) await sql`UPDATE projects SET stack = ${body.data.stack} WHERE id = ${projectId}`;
-    return c.json({ ok: true });
+    const { repo, site, name, ...fields } = body.data;
+    const source = (await canEditProject(sql, projectId, user.id, false)) ? "user" : "admin";
+    let renamed = false;
+    if (name !== undefined) {
+      const rename = await renameProject(sql, { chatId: c.get("chatId"), projectId, name, source, actorUserId: user.id });
+      if (rename.outcome === "not_found") return c.json({ error: "not_found" }, 404);
+      if (rename.outcome === "exists") return c.json({ error: "name_taken", slug: rename.clash }, 409);
+      renamed = rename.outcome === "renamed";
+    }
+    const links = repo !== undefined || site !== undefined ? { repo, site } : undefined;
+    const result = await updateProject(sql, { chatId: c.get("chatId"), projectId, ...fields, links, source, actorUserId: user.id });
+    if (!result) return c.json({ error: "not_found" }, 404);
+    return c.json({ ok: true, changed: result.changed || renamed, slug: result.project.slug });
+  });
+
+  // "This is a duplicate of …": an owner, or someone who authors both projects, folds this one into the other.
+  api.post("/projects/:id/merge", async (c) => {
+    const user = c.get("user");
+    const chatId = c.get("chatId");
+    const body = z.object({ into: z.string().trim().min(1).max(120) }).safeParse(await c.req.json());
+    if (!body.success) return c.json({ error: "bad_request" }, 400);
+    const [from] = await sql<{ id: number; slug: string }[]>`SELECT id, slug FROM projects WHERE id = ${Number(c.req.param("id"))} AND chat_id = ${chatId} AND NOT hidden`;
+    const [into] = await sql<{ id: number; slug: string }[]>`SELECT id, slug FROM projects WHERE slug = ${body.data.into} AND chat_id = ${chatId} AND NOT hidden`;
+    if (!from || !into) return c.json({ error: "not_found" }, 404);
+    if (from.id === into.id) return c.json({ error: "same_project" }, 400);
+    const allowed = isOwner(user) || ((await canEditProject(sql, from.id, user.id, false)) && (await canEditProject(sql, into.id, user.id, false)));
+    if (!allowed) return c.json({ error: "forbidden" }, 403);
+    await mergeProjects(sql, chatId, into.slug, [from.slug]);
+    return c.json({ ok: true, slug: into.slug });
   });
 
   api.delete("/projects/:id", async (c) => {
@@ -354,16 +408,6 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     const days = Math.min(Math.max(Number(c.req.query("days") ?? 7), 1), 60);
     const entries = await topChronicle(sql, c.get("chatId"), new Date(Date.now() - days * 86_400_000), topLimitFor(days));
     return c.json({ entries: entries.map((entry) => ({ ...entry, url: entry.msg_ids[0] ? linkFor(c, entry.msg_ids[0]) : null })) });
-  });
-
-  api.get("/links", async (c) => {
-    const links = await sql<{ url: string; domain: string; context: string | null; share_count: number; last_msg_id: number | null; display_name: string | null; first_seen_at: Date }[]>`
-      SELECT l.url, l.domain, l.context, l.share_count, l.last_msg_id, u.display_name, l.first_seen_at
-      FROM links l LEFT JOIN users u ON u.id = l.first_user_id
-      WHERE l.chat_id = ${c.get("chatId")} AND NOT l.from_forward
-      ORDER BY l.first_seen_at DESC
-      LIMIT 200`;
-    return c.json({ links: links.map((link) => ({ ...link, where: link.last_msg_id ? linkFor(c, link.last_msg_id) : null })) });
   });
 
   app.route("/api", api);

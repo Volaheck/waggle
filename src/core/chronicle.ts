@@ -1,4 +1,4 @@
-import type { Sql } from "./db.js";
+import type { Queryable, Sql } from "./db.js";
 import type { StoredMessage } from "./messages.js";
 import type { Person } from "./users.js";
 
@@ -14,6 +14,21 @@ export interface ChronicleEntry {
   importance: number;
   period_from: Date;
   period_to: Date;
+}
+
+/**
+ * A topic may only point to a project of its own chat. Links that an earlier version of the
+ * chronicler made across chats move to the chat's own project with that slug, or are cleared.
+ * Links to imported projects (chat 0) without such a match stay: attaching the import fixes them.
+ */
+export async function relinkForeignTopics(sql: Queryable): Promise<number> {
+  const rows = await sql`
+    UPDATE chronicle c
+    SET project_id = (SELECT own.id FROM projects own WHERE own.chat_id = c.chat_id AND own.slug = p.slug AND NOT own.hidden)
+    FROM projects p
+    WHERE p.id = c.project_id AND p.chat_id <> c.chat_id
+      AND (p.chat_id <> 0 OR EXISTS (SELECT 1 FROM projects own WHERE own.chat_id = c.chat_id AND own.slug = p.slug AND NOT own.hidden))`;
+  return rows.count;
 }
 
 /** How many events the chronicle shows for a period: it is a digest of the main things, not a transcript. */
@@ -57,8 +72,10 @@ export async function catchupFor(sql: Sql, chatId: number, user: Person, sinceHo
   const countSince = async (start: Date) =>
     (await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM messages WHERE chat_id = ${chatId} AND sent_at > ${start}`)[0]?.count ?? 0;
   let totalMessages = await countSince(from);
-  if (sinceHours === undefined && totalMessages < MIN_CATCHUP_MESSAGES) {
-    from = new Date(now - FALLBACK_HOURS * 3_600_000);
+  // Too little since the reader's last message: look further back, but never skip what they actually missed.
+  const fallback = new Date(now - FALLBACK_HOURS * 3_600_000);
+  if (sinceHours === undefined && totalMessages < MIN_CATCHUP_MESSAGES && from > fallback) {
+    from = fallback;
     totalMessages = await countSince(from);
   }
 
@@ -68,11 +85,13 @@ export async function catchupFor(sql: Sql, chatId: number, user: Person, sinceHo
       SELECT count(*)::int AS count, min(msg_id) AS first FROM messages
       WHERE chat_id = ${chatId} AND extracted_at IS NULL AND sent_at > ${from}`,
     sql<{ at: Date | null }[]>`SELECT max(finished_at) AS at FROM extraction_runs WHERE chat_id = ${chatId} AND status = 'done'`,
+    // A reply whose text was cleared after the retention period is left out; one with media still shows.
     sql<StoredMessage[]>`
       SELECT m.chat_id, m.msg_id, m.user_id, m.sent_at, m.text, m.reply_to_msg_id, m.is_forward, m.forward_source, m.media_type
       FROM messages m
       LEFT JOIN messages parent ON parent.chat_id = m.chat_id AND parent.msg_id = m.reply_to_msg_id
       WHERE m.chat_id = ${chatId} AND m.sent_at > ${from} AND m.user_id IS DISTINCT FROM ${user.id}
+        AND (btrim(m.text) <> '' OR m.media_type IS NOT NULL)
         AND (parent.user_id = ${user.id} OR (${user.username}::text IS NOT NULL AND m.text ILIKE '%@' || ${user.username}::text || '%'))
       ORDER BY m.msg_id DESC
       LIMIT 8`,

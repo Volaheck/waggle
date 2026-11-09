@@ -1,5 +1,6 @@
 import { Bot, GrammyError, InlineKeyboard } from "grammy";
 import type { Message, User as TelegramUser } from "grammy/types";
+import { migrateChat } from "../core/chat-migration.js";
 import { allChats, approvedChats, attachLegacyData, chatsOfUser, getChat, isApproved, legacyStats, registerChat, setChatStatus, setCurrentChat } from "../core/chats.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
@@ -8,12 +9,13 @@ import { mergeSeedUser } from "../core/merge.js";
 import { saveMessage, updateEditedMessage } from "../core/messages.js";
 import { catchupFor } from "../core/chronicle.js";
 import { escapeHtml } from "../core/text.js";
-import { ensureMember, fullName, markLeft, type User } from "../core/users.js";
-import { chatBudgetUsd } from "../worker/scheduler.js";
+import { ensureMember, fullName, markLeft, SERVICE_TG_IDS, type User } from "../core/users.js";
+import { nextConsolidationRetryAt } from "../worker/consolidate.js";
+import { chatBudgetUsd, nextExtractionRetryAt } from "../worker/scheduler.js";
 import { registerCatalog } from "./catalog.js";
 import { catchupHtml, clampTelegram, countOf, formatDate, userHeader } from "./format.js";
-import { commandArgs, createKit, decodeStartParam, encodeChat, type BotContext, type Scope } from "./kit.js";
-import { MembershipCache } from "./membership.js";
+import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
+import { isInChat, MembershipCache } from "./membership.js";
 import { registerProfile } from "./profile.js";
 
 export interface BotDeps {
@@ -28,7 +30,6 @@ const GROUP_COMMANDS = [
   { command: "chronicle", description: "Chronicle: what people talked about" },
   { command: "catchup", description: "What I missed (sent to DM)" },
   { command: "whoknows", description: "Who knows a topic" },
-  { command: "links", description: "Links from the chat" },
   { command: "help", description: "What the bot can do" },
 ];
 
@@ -39,7 +40,6 @@ const PRIVATE_COMMANDS = [
   { command: "people", description: "Members" },
   { command: "top", description: "Project rating" },
   { command: "whoknows", description: "Who knows a topic" },
-  { command: "links", description: "Links from the chat" },
   { command: "addproject", description: "Add your project" },
   { command: "whatyouknow", description: "What the bot knows about me" },
   { command: "forgetme", description: "Delete everything about me" },
@@ -65,7 +65,6 @@ const HELP_TEXT = [
   "<b>Chat</b>",
   "/catchup — what you missed (sent to DM; /catchup 12 — last 12 hours)",
   "/chronicle — chronicle: what people talked about",
-  "/links — links from the chat",
   "",
   "<b>Privacy</b>",
   "/whatyouknow — everything I know about you · /forgetme — delete it",
@@ -98,6 +97,32 @@ function messageText(message: Message): string {
   return (message.text ?? message.caption ?? message.poll?.question ?? "").trim();
 }
 
+/** Notes about the chat itself (an upgrade to a supergroup, forum topics) are not conversation. */
+function isChatServiceNote(message: Message): boolean {
+  return Boolean(
+    message.migrate_to_chat_id ||
+      message.migrate_from_chat_id ||
+      message.forum_topic_created ||
+      message.forum_topic_edited ||
+      message.forum_topic_closed ||
+      message.forum_topic_reopened ||
+      message.general_forum_topic_hidden ||
+      message.general_forum_topic_unhidden,
+  );
+}
+
+/** Posts of a linked channel, anonymous admins and channel identities have no person behind them. */
+function isAnonymousPost(message: Message, from: TelegramUser | undefined): boolean {
+  return Boolean(message.sender_chat || message.is_automatic_forward) || (from !== undefined && SERVICE_TG_IDS.includes(from.id));
+}
+
+/** The group a failed call was about and the supergroup it became, when Telegram says it was upgraded. */
+function upgradeOf(error: unknown, fallbackChatId?: number): { from: number; to: number } | undefined {
+  if (!(error instanceof GrammyError) || error.parameters.migrate_to_chat_id === undefined) return undefined;
+  const from = typeof error.payload.chat_id === "number" ? error.payload.chat_id : fallbackChatId;
+  return from === undefined ? undefined : { from, to: error.parameters.migrate_to_chat_id };
+}
+
 export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: MembershipCache } {
   const { sql, config } = deps;
   const bot = new Bot<BotContext>(config.BOT_TOKEN);
@@ -118,13 +143,45 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     }
   }
 
+  const greeting = () =>
+    `🐝 Hi! I'm Waggle, the chat's chronicler. Every ${config.EXTRACTION_INTERVAL_HOURS} h I go through new messages and keep a chronicle, member cards and a project catalog. In the group I stay quiet until someone calls me. Commands — /help`;
+
   async function greetApproved(chatId: number) {
     await bot.api
-      .sendMessage(
-        chatId,
-        `🐝 Hi! I'm Waggle, the chat's chronicler. Every ${config.EXTRACTION_INTERVAL_HOURS} h I go through new messages and keep a chronicle, member cards and a project catalog. In the group I stay quiet until someone calls me. Commands — /help`,
-      )
-      .catch(() => {});
+      .sendMessage(chatId, greeting())
+      .catch(async (error) => {
+        // An approval tapped for a group that has meanwhile become a supergroup goes to the supergroup.
+        const upgrade = upgradeOf(error, chatId);
+        if (!upgrade) return;
+        await followMigration(upgrade.from, upgrade.to, null);
+        if ((await getChat(sql, upgrade.to))?.status === "approved") await bot.api.sendMessage(upgrade.to, greeting()).catch(() => {});
+      })
+      .catch((error) => console.error(`[bot] could not greet ${chatId}:`, error));
+  }
+
+  /**
+   * A basic group became a supergroup: its approval and data move to the new id (see migrateChat).
+   * The first of the two announcements tells the owners; a new id that ends up pending is put to them again.
+   */
+  async function followMigration(oldChatId: number, newChatId: number, title: string | null): Promise<void> {
+    const result = await migrateChat(sql, oldChatId, newChatId);
+    if (!result.firstRun) return;
+    const name = result.chat?.title ?? title;
+    if (result.carried === null) {
+      if (!result.chat) {
+        await registerChat(sql, newChatId, title, null);
+        await askOwners(newChatId, title, undefined);
+      }
+      return;
+    }
+    if (result.chat?.status === "approved") {
+      const text = `🐝 The chat <b>${escapeHtml(name ?? String(newChatId))}</b> became a supergroup (<code>${newChatId}</code>). Its chronicle, cards and projects moved along with it.`;
+      for (const tgId of config.ADMIN_TG_IDS) await bot.api.sendMessage(tgId, text, { parse_mode: "HTML" }).catch(() => {});
+    } else if (result.chat?.status === "pending") {
+      await askOwners(newChatId, name, undefined);
+    } else if (result.chat?.status === "rejected") {
+      await bot.api.leaveChat(newChatId).catch(() => {});
+    }
   }
 
   async function legacyOffer(chatId: number): Promise<InlineKeyboard | undefined> {
@@ -147,7 +204,8 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     const status = ctx.myChatMember.new_chat_member.status;
     const title = ("title" in chat ? chat.title : null) ?? null;
     if (status === "left" || status === "kicked") {
-      await setChatStatus(sql, chat.id, "left", null);
+      // The bot leaves a rejected chat itself; that must not turn the rejection into a plain "left".
+      await sql`UPDATE chats SET status = 'left' WHERE id = ${chat.id} AND status <> 'rejected'`;
       return;
     }
     const before = await getChat(sql, chat.id);
@@ -177,6 +235,10 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     if (!ctx.chat || ctx.myChatMember) return next();
     if (ctx.chat.type === "channel") return;
     if (!isGroup(ctx)) return ctx.from?.is_bot ? undefined : next();
+    // Telegram announces an upgrade in both chats; the new chat is still unknown when its announcement arrives.
+    const title = ("title" in ctx.chat ? ctx.chat.title : null) ?? null;
+    if (ctx.message?.migrate_to_chat_id) return followMigration(ctx.chat.id, ctx.message.migrate_to_chat_id, title);
+    if (ctx.message?.migrate_from_chat_id) return followMigration(ctx.message.migrate_from_chat_id, ctx.chat.id, title);
     const record = await getChat(sql, ctx.chat.id);
     if (record?.status === "approved") return next();
     if (record?.status === "rejected") {
@@ -185,7 +247,6 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     }
     if (!record) {
       // Added before approvals existed or the join update was missed: queue it now.
-      const title = ("title" in ctx.chat ? ctx.chat.title : null) ?? null;
       await registerChat(sql, ctx.chat.id, title, null);
       await askOwners(ctx.chat.id, title, undefined);
     }
@@ -213,10 +274,14 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     }
     if (record.status !== "approved") return ctx.answerCallbackQuery({ text: "Approve the chat first" });
     await ctx.answerCallbackQuery({ text: "Moving…" });
-    const moved = await attachLegacyData(sql, chatId);
+    const moved = await attachLegacyData(sql, chatId, owner.id);
+    const notes = [
+      moved.projectsMerged ? `${countOf(moved.projectsMerged, "imported project")} merged into projects the chat already had` : "",
+      moved.cardsLinked ? `${countOf(moved.cardsLinked, "card")} linked to the members' accounts` : "",
+    ].filter(Boolean);
     await kit.show(
       ctx,
-      `📥 Import attached to <b>${title}</b>: ${countOf(moved.messages, "message")}, ${countOf(moved.members, "card")}, ${countOf(moved.projects, "project")}, ${countOf(moved.topics, "chronicle topic")}.`,
+      `📥 Import attached to <b>${title}</b>: ${countOf(moved.messages, "message")}, ${countOf(moved.members, "card")}, ${countOf(moved.projects, "project")}, ${countOf(moved.topics, "chronicle topic")}.${notes.length ? `\n${notes.join("; ")}.` : ""}`,
       undefined,
       { edit: true },
     );
@@ -230,7 +295,14 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     if (chats.length === 0) return void (await kit.show(ctx, "I haven't been added anywhere yet. Add the bot to a group and I'll send you an approval request."));
     const labels: Record<string, string> = { pending: "⏳ pending", approved: "✅ active", rejected: "🚫 rejected", left: "👋 left" };
     for (const chat of chats) {
-      const keyboard = chat.status === "pending" ? chatButtons(chat.id) : chat.status === "approved" ? await legacyOffer(chat.id) : undefined;
+      const keyboard =
+        chat.status === "pending"
+          ? chatButtons(chat.id)
+          : chat.status === "approved"
+            ? await legacyOffer(chat.id)
+            : chat.status === "rejected"
+              ? new InlineKeyboard().text("✅ Approve after all", `chatok:${encodeChat(chat.id)}`)
+              : undefined;
       await kit.show(ctx, `<b>${escapeHtml(chat.title ?? String(chat.id))}</b> · ${labels[chat.status]}\n<code>${chat.id}</code>`, keyboard);
     }
   });
@@ -240,7 +312,8 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
   bot.on("chat_member", async (ctx) => {
     const member = ctx.chatMember.new_chat_member;
     membership.invalidate(ctx.chat.id, member.user.id);
-    if (member.status === "left" || member.status === "kicked") await markLeft(sql, ctx.chat.id, member.user.id);
+    // A restricted (muted) member who leaves keeps status "restricted", with is_member false.
+    if (!isInChat(member)) await markLeft(sql, ctx.chat.id, member.user.id);
     else if (!member.user.is_bot) await kit.identity(member.user, ctx.chat.id);
   });
 
@@ -264,18 +337,22 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
         membership.invalidate(chatId, joined.id);
         if (!joined.is_bot) await kit.identity(joined, chatId);
       }
-      if (ctx.from && !ctx.from.is_bot && !message.new_chat_members && !message.left_chat_member) {
+      const anonymous = isAnonymousPost(message, ctx.from);
+      const person = ctx.from && !ctx.from.is_bot && !anonymous ? ctx.from : undefined;
+      if ((person || anonymous) && !message.new_chat_members && !message.left_chat_member && !isChatServiceNote(message)) {
         const isCommand = message.entities?.[0]?.type === "bot_command" && message.entities[0].offset === 0;
-        const user = await kit.identity(ctx.from, chatId);
+        const user = person ? await kit.identity(person, chatId) : undefined;
         if (!isCommand) {
+          const replied = realReply(message);
           await saveMessage(sql, {
             chatId,
             msgId: message.message_id,
-            userId: user.id,
+            userId: user?.id ?? null,
             sentAt: new Date(message.date * 1000),
             text: messageText(message),
-            replyToMsgId: message.reply_to_message?.message_id ?? null,
-            isForward: Boolean(message.forward_origin),
+            replyToMsgId: replied?.message_id ?? null,
+            replyToBot: replied?.from?.id === ctx.me.id,
+            isForward: Boolean(message.forward_origin || message.is_automatic_forward),
             forwardSource: forwardSourceOf(message),
             mediaType: mediaTypeOf(message),
           });
@@ -290,16 +367,23 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     return next();
   });
 
+  // Any button ends what the bot was waiting to be typed: Cancel, Back, another screen alike. A prompt re-arms it after this.
+  bot.on("callback_query", async (ctx, next) => {
+    if (kit.isPrivate(ctx)) kit.pending.clear(ctx.from.id);
+    return next();
+  });
+
   const profile = registerProfile(kit);
   const catalog = registerCatalog(kit);
 
   // ---------- Switching chats in DM ----------
 
-  const menu = () => new InlineKeyboard().text("👤 My card", "me:home").text("🏆 Projects", "pl:top:0").row().text("📜 Chronicle", "ch:3:0").text("👥 Members", "pp:0");
+  const menu = (chatId: number) =>
+    new InlineKeyboard().text("👤 My card", `me:${encodeChat(chatId)}:home`).text("🏆 Projects", "pl:top:0").row().text("📜 Chronicle", "ch:3:0").text("👥 Members", "pp:0");
 
   async function homeScreen(ctx: BotContext, scope: Scope, greeting: string, edit = false) {
     const chats = await chatsOfUser(sql, scope.user.id);
-    const keyboard = menu();
+    const keyboard = menu(scope.chatId);
     const app = kit.appButton(ctx, scope.chatId, "📱 App", "/", "home");
     if (app) keyboard.row().add(app);
     if (chats.length > 1) keyboard.row().text("🔁 Other chat", "chat:pick");
@@ -392,9 +476,11 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     if (!ctx.from || !isGroup(ctx)) return;
     const admin = await kit.identity(ctx.from, ctx.chat.id);
     if (!kit.isOwner(admin)) return;
-    const target = ctx.msg?.reply_to_message?.from;
+    const target = realReply(ctx.msg)?.from;
     const seedName = commandArgs(ctx);
-    if (!target || !seedName) return void (await kit.show(ctx, "Reply to the person's message: /link Name from the seed cards"));
+    if (!target || target.is_bot || SERVICE_TG_IDS.includes(target.id) || !seedName) {
+      return void (await kit.show(ctx, "Reply to the person's message: /link Name from the seed cards"));
+    }
     const into = await kit.identity(target, ctx.chat.id);
     const [seed] = await sql<User[]>`
       SELECT u.* FROM users u JOIN members m ON m.user_id = u.id
@@ -423,16 +509,27 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
                 WHERE m.chat_id = ${chat.id} AND u.tg_id IS NULL) AS unlinked`;
       const spent = await monthSpendUsd(sql, chat.id);
       const budget = chatBudgetUsd(chat, config.CHAT_MONTHLY_BUDGET_USD);
+      const [skipped] = await sql<{ messages: number }[]>`
+        SELECT coalesce(sum((range->>'messages')::int), 0)::int AS messages
+        FROM extraction_runs r, jsonb_array_elements(coalesce(r.stats->'skipped', '[]'::jsonb)) AS range
+        WHERE r.chat_id = ${chat.id} AND r.started_at > now() - interval '30 days'`;
+      const [passRetry, cleanupRetry] = await Promise.all([nextExtractionRetryAt(sql, chat.id), nextConsolidationRetryAt(sql, chat.id)]);
       const lastLine = last
         ? `${last.at ? formatDate(last.at, config.DISPLAY_TIMEZONE) : "running now"} · ${last.status} · ${countOf(last.messages_count, "message")}${last.error ? `\n⚠️ ${escapeHtml(last.error)}` : ""}`
         : "none yet";
+      const later = (at: Date | null) => (at && at.getTime() > Date.now() ? formatDate(at, config.DISPLAY_TIMEZONE) : null);
       lines.push(
         "",
-        `💬 <b>${escapeHtml(chat.title ?? String(chat.id))}</b>`,
-        `Messages: ${counts?.messages}, waiting for the chronicler: ${counts?.pending}. Last run — ${lastLine}`,
-        `Members: ${counts?.members}, facts: ${counts?.facts}, projects: ${counts?.projects}, topics: ${counts?.topics}`,
-        counts?.unlinked?.length ? `Unlinked cards: ${counts.unlinked.map(escapeHtml).join(", ")} — reply with /link Name` : "All cards are linked",
-        `AI this month: $${spent.toFixed(3)} of $${budget.toFixed(2)}`,
+        ...[
+          `💬 <b>${escapeHtml(chat.title ?? String(chat.id))}</b>`,
+          `Messages: ${counts?.messages}, waiting for the chronicler: ${counts?.pending}. Last run — ${lastLine}`,
+          later(passRetry) ? `The chronicler failed; next attempt ${later(passRetry)}` : "",
+          later(cleanupRetry) ? `⚠️ The weekly card clean-up failed; next attempt ${later(cleanupRetry)}` : "",
+          skipped?.messages ? `⚠️ Skipped in the last 30 days: ${countOf(skipped.messages, "message")} the chronicler could not process` : "",
+          `Members: ${counts?.members}, facts: ${counts?.facts}, projects: ${counts?.projects}, topics: ${counts?.topics}`,
+          counts?.unlinked?.length ? `Unlinked cards: ${counts.unlinked.map(escapeHtml).join(", ")} — reply with /link Name` : "All cards are linked",
+          `AI this month: $${spent.toFixed(3)} of $${budget.toFixed(2)}`,
+        ].filter(Boolean),
       );
     }
     lines.push("", `Total AI spend this month: $${(await monthSpendUsd(sql)).toFixed(3)} of $${config.MONTHLY_LLM_BUDGET_USD}`);
@@ -449,14 +546,22 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
       const input = kit.pending.take(ctx.from.id);
       if (input) return profile.handleInput(ctx, input, text);
       const scope = await kit.scope(ctx);
-      if (scope) await kit.show(ctx, "Pick what to open, or see /help 👇", menu());
+      if (scope) await kit.show(ctx, "Pick what to open, or see /help 👇", menu(scope.chatId));
       return;
     }
     const username = bot.botInfo.username;
     if (text.toLowerCase().includes(`@${username.toLowerCase()}`)) await kit.show(ctx, HELP_TEXT);
   });
 
-  bot.catch((error) => {
+  // Registered last: a button from an older version (or a removed feature) gets an answer instead of an endless spinner.
+  bot.on("callback_query:data", (ctx) => ctx.answerCallbackQuery({ text: "This button is outdated — send the command again" }));
+
+  bot.catch(async (error) => {
+    const upgrade = upgradeOf(error.error, error.ctx.chat?.id);
+    if (upgrade) {
+      await followMigration(upgrade.from, upgrade.to, null).catch((migrationError) => console.error(`[bot] could not follow ${upgrade.from} → ${upgrade.to}:`, migrationError));
+      return;
+    }
     console.error(`[bot] update ${error.ctx.update.update_id} failed:`, error.error);
     if (error.ctx.callbackQuery) void error.ctx.answerCallbackQuery({ text: "Something went wrong 😕" }).catch(() => {});
   });
@@ -470,17 +575,30 @@ const OWNER_COMMANDS = [
   { command: "botstatus", description: "Chronicler status and budget" },
 ];
 
-export async function registerCommands(bot: Bot<BotContext>, ownerTgIds: number[]): Promise<void> {
+/**
+ * With `sql`, owners removed from ADMIN_TG_IDS also lose their owner menu, and the stored is_admin flag is
+ * brought in line with the list (nothing trusts the flag; it is kept accurate for whoever reads the table).
+ */
+export async function registerCommands(bot: Bot<BotContext>, ownerTgIds: number[], sql?: Sql): Promise<void> {
   await bot.api.setMyCommands(GROUP_COMMANDS, { scope: { type: "all_group_chats" } });
   await bot.api.setMyCommands(PRIVATE_COMMANDS, { scope: { type: "all_private_chats" } });
   for (const tgId of ownerTgIds) {
     await bot.api.setMyCommands(OWNER_COMMANDS, { scope: { type: "chat", chat_id: tgId } }).catch(() => {});
   }
+  if (!sql) return;
+  const former = await sql<{ tg_id: number }[]>`
+    SELECT tg_id FROM users WHERE is_admin AND tg_id IS NOT NULL AND NOT (tg_id = ANY(${ownerTgIds}::bigint[]))`;
+  for (const { tg_id: tgId } of former) {
+    await bot.api.deleteMyCommands({ scope: { type: "chat", chat_id: tgId } }).catch(() => {});
+  }
+  await sql`
+    UPDATE users SET is_admin = coalesce(tg_id = ANY(${ownerTgIds}::bigint[]), false)
+    WHERE is_admin IS DISTINCT FROM coalesce(tg_id = ANY(${ownerTgIds}::bigint[]), false)`;
 }
 
-export async function notifyAdmins(bot: Bot<BotContext>, sql: Sql, adminTgIds: number[], text: string): Promise<void> {
-  const fromDb = (await sql<{ tg_id: number }[]>`SELECT tg_id FROM users WHERE is_admin AND tg_id IS NOT NULL`).map((row) => row.tg_id);
-  for (const tgId of new Set([...adminTgIds, ...fromDb])) {
+/** Owners are the configured ADMIN_TG_IDS only; `sql` is unused and kept for existing callers. */
+export async function notifyAdmins(bot: Bot<BotContext>, _sql: Sql, adminTgIds: number[], text: string): Promise<void> {
+  for (const tgId of new Set(adminTgIds)) {
     await bot.api.sendMessage(tgId, text).catch(() => {});
   }
 }

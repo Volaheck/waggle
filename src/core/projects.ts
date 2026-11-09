@@ -1,42 +1,18 @@
 import type { Queryable, Sql } from "./db.js";
 import { isNearDuplicate } from "./facts.js";
-import { normalizeUrl, slugify } from "./text.js";
+import { normalizeUrl, safeHttpUrl, slugify } from "./text.js";
 
-export const PROJECT_STATUSES = ["идея", "в работе", "запущен", "на паузе", "заброшен"] as const;
+/** Stored as is and used verbatim by the chronicler, whose schemas accept exactly these codes. */
+export const PROJECT_STATUSES = ["idea", "in_progress", "launched", "paused", "abandoned"] as const;
 export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
 
-/** Statuses are stored in Russian; these are the labels users see. */
 export const STATUS_LABELS: Record<ProjectStatus, string> = {
-  идея: "idea",
-  "в работе": "in progress",
-  запущен: "launched",
-  "на паузе": "paused",
-  заброшен: "abandoned",
+  idea: "idea",
+  in_progress: "in progress",
+  launched: "launched",
+  paused: "paused",
+  abandoned: "abandoned",
 };
-
-/**
- * Status codes the chronicler (an LLM) reads and writes. Its prompts must contain no Russian:
- * a single Russian word there is enough to make it write the content of an English chat in Russian.
- */
-export const STATUS_CODE_LIST = ["idea", "in_progress", "launched", "paused", "abandoned"] as const;
-export type StatusCode = (typeof STATUS_CODE_LIST)[number];
-
-const STATUS_BY_CODE: Record<StatusCode, ProjectStatus> = {
-  idea: "идея",
-  in_progress: "в работе",
-  launched: "запущен",
-  paused: "на паузе",
-  abandoned: "заброшен",
-};
-const CODE_BY_STATUS = new Map(Object.entries(STATUS_BY_CODE).map(([code, status]) => [status as string, code as StatusCode]));
-
-export function statusCode(status: string): StatusCode | null {
-  return CODE_BY_STATUS.get(status) ?? null;
-}
-
-export function statusFromCode(code: StatusCode | null | undefined): ProjectStatus | null {
-  return code ? STATUS_BY_CODE[code] : null;
-}
 
 export interface ProjectLinks {
   repo?: string | null;
@@ -122,7 +98,7 @@ export async function listProjects(sql: Sql, chatId: number, options: { sort?: P
            coalesce(v.votes, 0) AS votes,
            coalesce(s.signals_count, 0) AS signals_count,
            round((coalesce(v.votes, 0) * ${RATING.vote}::numeric + coalesce(s.signal_points, 0)::numeric)
-                 * CASE WHEN p.status = 'заброшен' THEN ${RATING.abandonedMultiplier}::numeric ELSE 1 END)::int AS score,
+                 * CASE WHEN p.status = 'abandoned' THEN ${RATING.abandonedMultiplier}::numeric ELSE 1 END)::int AS score,
            coalesce((SELECT json_agg(json_build_object('id', u.id, 'display_name', u.display_name, 'username', u.username, 'role', pm.role) ORDER BY pm.role IS NULL, u.display_name)
                      FROM project_members pm JOIN users u ON u.id = pm.user_id WHERE pm.project_id = p.id), '[]') AS authors,
            coalesce((SELECT json_agg(json_build_object('kind', r.kind, 'note', r.note, 'msg_id', r.source_msg_ids[1], 'happened_at', r.happened_at))
@@ -146,7 +122,20 @@ export const RATING_EXPLANATION = [
 
 export async function getProjectBySlug(sql: Sql, chatId: number, slug: string, viewerUserId?: number): Promise<ProjectListItem | undefined> {
   const all = await listProjects(sql, chatId, { viewerUserId });
-  return all.find((project) => project.slug === slug.toLowerCase());
+  const wanted = slug.toLowerCase();
+  const direct = all.find((project) => project.slug === wanted);
+  if (direct) return direct;
+  // Old links and buttons keep working after a rename or a merge: follow the project to where it lives now.
+  const moved = (await projectForSlug(sql, chatId, wanted)) ?? (await renamedFrom(sql, chatId, wanted));
+  return moved ? all.find((project) => project.id === moved.id) : undefined;
+}
+
+async function renamedFrom(sql: Queryable, chatId: number, oldSlug: string): Promise<Project | undefined> {
+  const [project] = await sql<Project[]>`
+    SELECT p.* FROM change_log l JOIN projects p ON p.id = l.entity_id
+    WHERE l.entity = 'project' AND l.op = 'rename' AND l.before->>'slug' = ${oldSlug} AND p.chat_id = ${chatId} AND NOT p.hidden
+    ORDER BY l.id DESC LIMIT 1`;
+  return project;
 }
 
 export async function findProject(sql: Sql, chatId: number, query: string): Promise<Project | undefined> {
@@ -183,21 +172,55 @@ export interface ProjectUpsert {
   actorUserId?: number;
 }
 
+export interface UpsertResult {
+  project: Project;
+  created: boolean;
+  /** False when the call left the project as it was: no field took a new value and no author was added. */
+  changed: boolean;
+}
+
+type Candidate = Project & { author_ids: number[] };
+
+const EDITABLE_FIELDS = ["tagline", "status", "stack", "links"] as const;
+type EditableField = (typeof EDITABLE_FIELDS)[number];
+type EditableValues = Pick<Project, EditableField>;
+
+/** Matching and creating projects of one chat happen one at a time, so two adds of one name cannot both insert. */
+async function lockChatProjects(tx: Queryable, chatId: number): Promise<void> {
+  await tx`SELECT pg_advisory_xact_lock(hashtext('waggle:projects'), hashtext(${String(chatId)}))`;
+}
+
+async function chatCandidates(tx: Queryable, chatId: number): Promise<Candidate[]> {
+  return tx<Candidate[]>`
+    SELECT p.*, coalesce(array_agg(pm.user_id) FILTER (WHERE pm.user_id IS NOT NULL), '{}') AS author_ids
+    FROM projects p LEFT JOIN project_members pm ON pm.project_id = p.id
+    WHERE p.chat_id = ${chatId}
+    GROUP BY p.id
+    ORDER BY p.hidden, p.id`;
+}
+
 function sameUrl(a?: string | null, b?: string | null): boolean {
   if (!a || !b) return false;
   return normalizeUrl(a)?.norm === normalizeUrl(b)?.norm;
+}
+
+function linkList(links: ProjectLinks | undefined): string[] {
+  return [links?.repo, links?.site, ...(links?.other ?? [])].filter((link): link is string => Boolean(link));
+}
+
+function sharesLink(project: ProjectLinks, links: ProjectLinks): boolean {
+  const own = new Set(linkList(project).map((link) => normalizeUrl(link)?.norm));
+  return linkList(links).some((link) => {
+    const norm = normalizeUrl(link)?.norm;
+    return norm !== undefined && own.has(norm);
+  });
 }
 
 /**
  * The same product must not appear twice: match by slug, name, a shared link,
  * or a name that means the same thing with at least one author in common.
  */
-async function findExisting(sql: Sql, upsert: ProjectUpsert, slug: string): Promise<Project | undefined> {
-  const candidates = await sql<(Project & { author_ids: number[] })[]>`
-    SELECT p.*, coalesce(array_agg(pm.user_id) FILTER (WHERE pm.user_id IS NOT NULL), '{}') AS author_ids
-    FROM projects p LEFT JOIN project_members pm ON pm.project_id = p.id
-    WHERE p.chat_id = ${upsert.chatId}
-    GROUP BY p.id`;
+function findExisting(candidates: Candidate[], upsert: ProjectUpsert, slug: string): Candidate | undefined {
   const name = upsert.name.toLowerCase();
   return (
     candidates.find((project) => project.slug === slug || project.name.toLowerCase() === name) ??
@@ -208,84 +231,351 @@ async function findExisting(sql: Sql, upsert: ProjectUpsert, slug: string): Prom
   );
 }
 
-/**
- * Creates or enriches a project. Fields a human edited (manual_fields) are never
- * overwritten by the extractor; for the rest the newest non-empty value wins.
- */
-export async function upsertProject(sql: Sql, upsert: ProjectUpsert): Promise<{ project: Project; created: boolean }> {
-  const slug = slugify(upsert.slug || upsert.name);
-  const existing = await findExisting(sql, upsert, slug);
-
-  return sql.begin(async (tx) => {
-    let project: Project;
-    let created = false;
-    if (!existing) {
-      const uniqueSlug = await freeSlug(tx, upsert.chatId, slug);
-      const [inserted] = await tx<Project[]>`
-        INSERT INTO projects (chat_id, slug, name, tagline, status, stack, links, confidence, first_seen_msg_id, last_activity_at, source_msg_ids)
-        VALUES (${upsert.chatId}, ${uniqueSlug}, ${upsert.name}, ${upsert.tagline ?? null}, ${upsert.status ?? "в работе"}, ${upsert.stack ?? []},
-                ${tx.json(cleanLinks(upsert.links))}, ${upsert.confidence ?? 1}, ${upsert.firstSeenMsgId ?? upsert.sourceMsgIds[0] ?? null},
-                ${upsert.activityAt ?? null}, ${upsert.sourceMsgIds})
-        RETURNING *`;
-      project = inserted!;
-      created = true;
-    } else {
-      const locked = upsert.source === "llm" ? new Set(existing.manual_fields) : new Set<string>();
-      const pick = <T>(field: string, next: T | null | undefined, current: T): T =>
-        locked.has(field) || next === undefined || next === null || (Array.isArray(next) && next.length === 0) ? current : next;
-      const mergedLinks = locked.has("links") ? existing.links : { ...existing.links, ...cleanLinks(upsert.links) };
-      const mergedStack = locked.has("stack") ? existing.stack : [...new Set([...existing.stack, ...(upsert.stack ?? [])])];
-      const manualFields =
-        upsert.source === "user" || upsert.source === "admin"
-          ? [...new Set([...existing.manual_fields, ...changedFields(upsert)])]
-          : existing.manual_fields;
-      const [updated] = await tx<Project[]>`
-        UPDATE projects SET
-          tagline = ${pick("tagline", upsert.tagline, existing.tagline)},
-          status = ${pick("status", upsert.status, existing.status)},
-          stack = ${mergedStack},
-          links = ${tx.json(mergedLinks)},
-          confidence = greatest(confidence, ${upsert.confidence ?? 0}),
-          manual_fields = ${manualFields},
-          last_activity_at = greatest(last_activity_at, ${upsert.activityAt ?? null}),
-          source_msg_ids = coalesce((SELECT array_agg(DISTINCT x) FROM unnest(source_msg_ids || ${upsert.sourceMsgIds}::bigint[]) AS x), '{}'),
-          updated_at = now()
-        WHERE id = ${existing.id}
-        RETURNING *`;
-      project = updated!;
-    }
-
-    for (const authorId of upsert.authorIds) {
-      await tx`INSERT INTO project_members (project_id, user_id) VALUES (${project.id}, ${authorId}) ON CONFLICT DO NOTHING`;
-    }
-    await tx`
-      INSERT INTO change_log (entity, entity_id, op, after, source, actor_user_id, source_msg_ids)
-      VALUES ('project', ${project.id}, ${created ? "create" : "update"},
-              ${tx.json({ name: upsert.name, tagline: upsert.tagline ?? null, status: upsert.status ?? null, links: cleanLinks(upsert.links) })},
-              ${upsert.source}, ${upsert.actorUserId ?? null}, ${upsert.sourceMsgIds})`;
-    return { project, created };
-  });
+/** A duplicate folded into another entry leads to it (through every later merge too); a project people deleted leads nowhere. */
+async function mergeTarget(tx: Queryable, project: Project): Promise<Project | undefined> {
+  let current = project;
+  for (let hop = 0; hop < 5 && current.hidden; hop += 1) {
+    const [direct] = await tx<Project[]>`
+      SELECT p.* FROM change_log l JOIN projects p ON p.id = (l.after->>'into')::int
+      WHERE l.entity = 'project' AND l.entity_id = ${current.id} AND l.op = 'merged_into' AND p.chat_id = ${current.chat_id}
+      ORDER BY l.id DESC LIMIT 1`;
+    // Merges recorded before 'merged_into' existed only name the folded slug on the surviving project.
+    const [recorded] = direct
+      ? []
+      : await tx<Project[]>`
+          SELECT p.* FROM change_log l JOIN projects p ON p.id = l.entity_id
+          WHERE l.entity = 'project' AND l.op = 'merge' AND l.before->>'merged' = ${current.slug}
+            AND p.chat_id = ${current.chat_id} AND p.id <> ${current.id}
+          ORDER BY l.id DESC LIMIT 1`;
+    const next = direct ?? recorded;
+    if (!next) return undefined;
+    current = next;
+  }
+  return current.hidden ? undefined : current;
 }
 
-function changedFields(upsert: ProjectUpsert): string[] {
-  const fields: string[] = [];
-  if (upsert.tagline !== undefined) fields.push("tagline");
-  if (upsert.status) fields.push("status");
-  if (upsert.stack) fields.push("stack");
-  if (upsert.links) fields.push("links");
-  return fields;
+/** The chat's shown project for a slug the chronicler wrote; a duplicate folded into another entry resolves to that entry. */
+export async function projectForSlug(sql: Queryable, chatId: number, slug: string): Promise<Project | undefined> {
+  const [project] = await sql<Project[]>`SELECT * FROM projects WHERE chat_id = ${chatId} AND slug = ${slugify(slug)}`;
+  if (!project) return undefined;
+  return project.hidden ? mergeTarget(sql, project) : project;
+}
+
+function withScheme(raw: string | null | undefined): string | null {
+  const value = raw?.trim();
+  if (!value) return null;
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)+(\/|$)/i.test(value) ? `https://${value}` : value;
 }
 
 function cleanLinks(links: ProjectLinks | undefined): ProjectLinks {
   if (!links) return {};
   const result: ProjectLinks = {};
-  if (links.repo) result.repo = links.repo;
-  if (links.site) result.site = links.site;
-  if (links.other?.length) result.other = links.other;
+  const repo = safeHttpUrl(withScheme(links.repo));
+  const site = safeHttpUrl(withScheme(links.site));
+  const other = [...new Set((links.other ?? []).map((link) => safeHttpUrl(withScheme(link))).filter((link): link is string => Boolean(link)))];
+  if (repo) result.repo = repo;
+  if (site) result.site = site;
+  if (other.length) result.other = other;
   return result;
 }
 
-async function freeSlug(sql: Queryable, chatId: number, base: string): Promise<string> {
+function sameValue(field: EditableField, a: EditableValues, b: EditableValues): boolean {
+  if (field === "stack") return a.stack.length === b.stack.length && a.stack.every((item, index) => item === b.stack[index]);
+  if (field === "links") {
+    const others = (links: ProjectLinks) => JSON.stringify(links.other ?? []);
+    return (a.links.repo ?? null) === (b.links.repo ?? null) && (a.links.site ?? null) === (b.links.site ?? null) && others(a.links) === others(b.links);
+  }
+  return a[field] === b[field];
+}
+
+function pickFields(values: EditableValues, fields: EditableField[]): Partial<EditableValues> {
+  return Object.fromEntries(fields.map((field) => [field, values[field]]));
+}
+
+/** Fields that carry a real value, which a person filling them in means to keep. */
+function filledFields(values: EditableValues, statusChosen: boolean): EditableField[] {
+  return EDITABLE_FIELDS.filter((field) =>
+    field === "tagline" ? Boolean(values.tagline) : field === "status" ? statusChosen : field === "stack" ? values.stack.length > 0 : linkList(values.links).length > 0,
+  );
+}
+
+/** Members the chronicler may name as authors: someone who opted out is never made one, even if they opted out while it was answering. */
+async function willingAuthors(tx: Queryable, chatId: number, userIds: number[]): Promise<number[]> {
+  if (userIds.length === 0) return [];
+  const rows = await tx<{ user_id: number }[]>`
+    SELECT user_id FROM members WHERE chat_id = ${chatId} AND user_id = ANY(${userIds}) AND NOT opted_out`;
+  return rows.map((row) => row.user_id);
+}
+
+async function addAuthors(tx: Queryable, projectId: number, userIds: number[]): Promise<number[]> {
+  const added: number[] = [];
+  for (const userId of new Set(userIds)) {
+    const [row] = await tx<{ user_id: number }[]>`
+      INSERT INTO project_members (project_id, user_id) VALUES (${projectId}, ${userId}) ON CONFLICT DO NOTHING RETURNING user_id`;
+    if (row) added.push(row.user_id);
+  }
+  return added;
+}
+
+async function insertProject(
+  tx: Queryable,
+  values: { chatId: number; slug: string; name: string; tagline: string | null; status: ProjectStatus | null; stack: string[]; links: ProjectLinks; manualFields: EditableField[] },
+  extra: { confidence: number; firstSeenMsgId: number | null; activityAt: Date | null; sourceMsgIds: number[]; source: ProjectUpsert["source"]; actorUserId: number | null },
+): Promise<Project> {
+  const uniqueSlug = await freeSlug(tx, values.chatId, values.slug);
+  const [project] = await tx<Project[]>`
+    INSERT INTO projects (chat_id, slug, name, tagline, status, stack, links, confidence, manual_fields, first_seen_msg_id, last_activity_at, source_msg_ids)
+    VALUES (${values.chatId}, ${uniqueSlug}, ${values.name}, ${values.tagline}, ${values.status ?? "in_progress"}, ${values.stack}, ${tx.json(values.links)},
+            ${extra.confidence}, ${values.manualFields}, ${extra.firstSeenMsgId}, ${extra.activityAt}, ${extra.sourceMsgIds})
+    RETURNING *`;
+  await tx`
+    INSERT INTO change_log (entity, entity_id, op, after, source, actor_user_id, source_msg_ids)
+    VALUES ('project', ${project!.id}, 'create',
+            ${tx.json({ name: project!.name, slug: project!.slug, ...pickFields(project!, [...EDITABLE_FIELDS]) })},
+            ${extra.source}, ${extra.actorUserId}, ${extra.sourceMsgIds})`;
+  return project!;
+}
+
+/**
+ * Creates or enriches a project from the chronicler or the seed. Fields a human edited (manual_fields)
+ * are never overwritten by the extractor; for the rest the newest non-empty value wins.
+ * A shown project always wins the match over a hidden one; a hidden match that was folded into another
+ * entry leads to that entry, and one people deleted stays deleted.
+ */
+export async function upsertProject(sql: Sql, upsert: ProjectUpsert): Promise<UpsertResult> {
+  const slug = slugify(upsert.slug || upsert.name);
+  const byHand = upsert.source === "user" || upsert.source === "admin";
+  const links = cleanLinks(upsert.links);
+
+  return sql.begin(async (tx) => {
+    await lockChatProjects(tx, upsert.chatId);
+    const authorIds = upsert.source === "llm" ? await willingAuthors(tx, upsert.chatId, upsert.authorIds) : upsert.authorIds;
+    const request = { ...upsert, authorIds };
+    const candidates = await chatCandidates(tx, upsert.chatId);
+    const shown = findExisting(candidates.filter((project) => !project.hidden), request, slug);
+    const hidden = shown || byHand ? undefined : findExisting(candidates.filter((project) => project.hidden), request, slug);
+    const existing = shown ?? (hidden ? ((await mergeTarget(tx, hidden)) ?? hidden) : undefined);
+
+    if (!existing) {
+      const values: EditableValues = { tagline: upsert.tagline ?? null, status: upsert.status ?? "in_progress", stack: [...new Set(upsert.stack ?? [])], links };
+      const project = await insertProject(
+        tx,
+        { chatId: upsert.chatId, slug, name: upsert.name, ...values, status: upsert.status ?? null, manualFields: byHand ? filledFields(values, Boolean(upsert.status)) : [] },
+        {
+          confidence: upsert.confidence ?? 1,
+          firstSeenMsgId: upsert.firstSeenMsgId ?? upsert.sourceMsgIds[0] ?? null,
+          activityAt: upsert.activityAt ?? null,
+          sourceMsgIds: upsert.sourceMsgIds,
+          source: upsert.source,
+          actorUserId: upsert.actorUserId ?? null,
+        },
+      );
+      await addAuthors(tx, project.id, authorIds);
+      return { project, created: true, changed: true };
+    }
+
+    const locked = new Set(upsert.source === "llm" ? existing.manual_fields : []);
+    const next: EditableValues = {
+      tagline: locked.has("tagline") || !upsert.tagline ? existing.tagline : upsert.tagline,
+      status: locked.has("status") || !upsert.status ? existing.status : upsert.status,
+      stack: locked.has("stack") ? existing.stack : [...new Set([...existing.stack, ...(upsert.stack ?? [])])],
+      links: locked.has("links") ? existing.links : { ...existing.links, ...links },
+    };
+    const changedFields = EDITABLE_FIELDS.filter((field) => !sameValue(field, existing, next));
+    const authorsAdded = await addAuthors(tx, existing.id, authorIds);
+    const changed = changedFields.length > 0 || authorsAdded.length > 0;
+    const [project] = await tx<Project[]>`
+      UPDATE projects SET
+        tagline = ${next.tagline},
+        status = ${next.status},
+        stack = ${next.stack},
+        links = ${tx.json(next.links)},
+        confidence = greatest(confidence, ${upsert.confidence ?? 0}),
+        manual_fields = ${byHand ? [...new Set([...existing.manual_fields, ...changedFields])] : existing.manual_fields},
+        last_activity_at = greatest(last_activity_at, ${upsert.activityAt ?? null}),
+        source_msg_ids = coalesce((SELECT array_agg(DISTINCT x) FROM unnest(source_msg_ids || ${upsert.sourceMsgIds}::bigint[]) AS x), '{}'),
+        updated_at = CASE WHEN ${changed} THEN now() ELSE updated_at END
+      WHERE id = ${existing.id}
+      RETURNING *`;
+    if (changed) {
+      await tx`
+        INSERT INTO change_log (entity, entity_id, op, before, after, source, actor_user_id, source_msg_ids)
+        VALUES ('project', ${existing.id}, 'update', ${tx.json(pickFields(existing, changedFields))},
+                ${tx.json({ ...pickFields(next, changedFields), ...(authorsAdded.length ? { authors_added: authorsAdded } : {}) })},
+                ${upsert.source}, ${upsert.actorUserId ?? null}, ${upsert.sourceMsgIds})`;
+    }
+    return { project: project!, created: false, changed };
+  });
+}
+
+/** What a person sets on a project. Undefined leaves a field alone; null (or an empty text) clears it. */
+export interface ProjectFields {
+  tagline?: string | null;
+  status?: ProjectStatus;
+  stack?: string[];
+  links?: { repo?: string | null; site?: string | null };
+}
+
+function withLinks(current: ProjectLinks, patch: { repo?: string | null; site?: string | null }): ProjectLinks {
+  const result: ProjectLinks = { ...current };
+  for (const key of ["repo", "site"] as const) {
+    const value = patch[key];
+    if (value === undefined) continue;
+    if (value === null || !value.trim()) {
+      delete result[key];
+      continue;
+    }
+    const url = safeHttpUrl(value);
+    if (url) result[key] = url;
+  }
+  return result;
+}
+
+/** Applies a person's edit to one project row, locks what changed against the chronicler and logs only what really changed. */
+async function applyEdit(
+  tx: Queryable,
+  current: Project,
+  fields: ProjectFields,
+  who: { source: "user" | "admin"; actorUserId: number },
+  options: { activityAt?: Date; restore?: boolean } = {},
+): Promise<{ project: Project; changed: boolean }> {
+  const next: EditableValues = {
+    tagline: fields.tagline === undefined ? current.tagline : fields.tagline?.trim() || null,
+    status: fields.status ?? current.status,
+    stack: fields.stack === undefined ? current.stack : [...new Set(fields.stack.map((item) => item.trim()).filter(Boolean))],
+    links: fields.links === undefined ? current.links : withLinks(current.links, fields.links),
+  };
+  const changedFields = EDITABLE_FIELDS.filter((field) => !sameValue(field, current, next));
+  if (changedFields.length === 0 && !options.restore) return { project: current, changed: false };
+  const [project] = await tx<Project[]>`
+    UPDATE projects SET
+      tagline = ${next.tagline},
+      status = ${next.status},
+      stack = ${next.stack},
+      links = ${tx.json(next.links)},
+      manual_fields = ${[...new Set([...current.manual_fields, ...changedFields])]},
+      hidden = ${options.restore ? false : current.hidden},
+      last_activity_at = greatest(last_activity_at, ${options.activityAt ?? null}),
+      updated_at = now()
+    WHERE id = ${current.id}
+    RETURNING *`;
+  await tx`
+    INSERT INTO change_log (entity, entity_id, op, before, after, source, actor_user_id)
+    VALUES ('project', ${current.id}, ${options.restore ? "restore" : "update"}, ${tx.json(pickFields(current, changedFields))},
+            ${tx.json(pickFields(next, changedFields))}, ${who.source}, ${who.actorUserId})`;
+  return { project: project!, changed: true };
+}
+
+/** An edit addressed by project id: it can only ever touch that row, in that chat. Deleted projects are not edited. */
+export async function updateProject(
+  sql: Sql,
+  edit: ProjectFields & { chatId: number; projectId: number; source: "user" | "admin"; actorUserId: number; activityAt?: Date },
+): Promise<{ project: Project; changed: boolean } | undefined> {
+  return sql.begin(async (tx) => {
+    const [current] = await tx<Project[]>`
+      SELECT * FROM projects WHERE id = ${edit.projectId} AND chat_id = ${edit.chatId} AND NOT hidden FOR UPDATE`;
+    if (!current) return undefined;
+    return applyEdit(tx, current, edit, edit, { activityAt: edit.activityAt });
+  });
+}
+
+export type RenameOutcome = "renamed" | "unchanged" | "exists" | "not_found" | "locked";
+
+/**
+ * Renames a project and moves its slug to the new name. Another visible project of the chat with the
+ * same name or slug blocks it. The old slug is kept in change_log, so old links still find the project.
+ * A name a person set by hand is final for the chronicler ("locked").
+ */
+export async function renameProject(
+  sql: Sql,
+  input: { chatId: number; projectId: number; name: string; source: "user" | "admin" | "llm"; actorUserId: number | null },
+): Promise<{ outcome: RenameOutcome; project?: Project; clash?: string }> {
+  const name = input.name.trim().replace(/\s+/g, " ").slice(0, 80);
+  return sql.begin(async (tx) => {
+    await lockChatProjects(tx, input.chatId);
+    const [current] = await tx<Project[]>`
+      SELECT * FROM projects WHERE id = ${input.projectId} AND chat_id = ${input.chatId} AND NOT hidden FOR UPDATE`;
+    if (!current) return { outcome: "not_found" };
+    if (!name || current.name === name) return { outcome: "unchanged", project: current };
+    if (input.source === "llm" && current.manual_fields.includes("name")) return { outcome: "locked", project: current };
+    const base = slugify(name);
+    const [clash] = await tx<{ slug: string }[]>`
+      SELECT slug FROM projects
+      WHERE chat_id = ${input.chatId} AND id <> ${current.id} AND NOT hidden AND (lower(name) = lower(${name}) OR slug = ${base})
+      LIMIT 1`;
+    if (clash) return { outcome: "exists", project: current, clash: clash.slug };
+    const slug = base === current.slug ? base : await freeSlug(tx, input.chatId, base);
+    const manual = input.source === "llm" ? current.manual_fields : [...new Set([...current.manual_fields, "name"])];
+    const [project] = await tx<Project[]>`
+      UPDATE projects SET name = ${name}, slug = ${slug}, manual_fields = ${manual}, updated_at = now() WHERE id = ${current.id} RETURNING *`;
+    await tx`
+      INSERT INTO change_log (entity, entity_id, op, before, after, source, actor_user_id)
+      VALUES ('project', ${current.id}, 'rename', ${tx.json({ name: current.name, slug: current.slug })},
+              ${tx.json({ name, slug })}, ${input.source}, ${input.actorUserId})`;
+    return { outcome: "renamed", project: project! };
+  });
+}
+
+export interface UserProjectInput extends ProjectFields {
+  chatId: number;
+  name: string;
+  actorUserId: number;
+  sourceMsgIds?: number[];
+}
+
+/**
+ * - created: a new project, authored by the person;
+ * - own: they already author a project with this name, slug or link, and the given values were applied to it;
+ * - restored: their own deleted project with this name came back;
+ * - exists: someone else's project has this name, slug or link, and nothing was changed.
+ */
+export type UserProjectOutcome = "created" | "own" | "restored" | "exists";
+
+/**
+ * A member adds a project by hand. It never takes over another member's entry: only the person's own projects
+ * are matched for an update, and deleted projects of others are ignored (the new one gets a free slug).
+ */
+export async function addUserProject(sql: Sql, input: UserProjectInput): Promise<{ outcome: UserProjectOutcome; project: Project; changed: boolean }> {
+  const name = input.name.trim();
+  const slug = slugify(name);
+  const links = cleanLinks(input.links);
+  const fields: ProjectFields = {
+    tagline: input.tagline?.trim() || undefined,
+    status: input.status,
+    stack: input.stack?.length ? input.stack : undefined,
+    links: { repo: links.repo, site: links.site },
+  };
+
+  return sql.begin(async (tx) => {
+    await lockChatProjects(tx, input.chatId);
+    const candidates = await chatCandidates(tx, input.chatId);
+    const matches = candidates.filter((project) => project.slug === slug || project.name.toLowerCase() === name.toLowerCase() || sharesLink(project.links, links));
+    const isOwn = (project: Candidate) => project.author_ids.includes(input.actorUserId);
+    const shown = matches.filter((project) => !project.hidden);
+    const own = shown.find(isOwn);
+    if (own) {
+      const result = await applyEdit(tx, own, fields, { source: "user", actorUserId: input.actorUserId }, { activityAt: new Date() });
+      return { outcome: "own", ...result };
+    }
+    if (shown[0]) return { outcome: "exists", project: shown[0], changed: false };
+    const deleted = matches.find((project) => project.hidden && isOwn(project) && (project.slug === slug || project.name.toLowerCase() === name.toLowerCase()));
+    if (deleted) {
+      const result = await applyEdit(tx, deleted, fields, { source: "user", actorUserId: input.actorUserId }, { activityAt: new Date(), restore: true });
+      return { outcome: "restored", ...result };
+    }
+    const values: EditableValues = { tagline: fields.tagline ?? null, status: input.status ?? "in_progress", stack: [...new Set(input.stack ?? [])], links };
+    const project = await insertProject(
+      tx,
+      { chatId: input.chatId, slug, name, ...values, status: input.status ?? null, manualFields: filledFields(values, input.status !== undefined) },
+      { confidence: 1, firstSeenMsgId: input.sourceMsgIds?.[0] ?? null, activityAt: new Date(), sourceMsgIds: input.sourceMsgIds ?? [], source: "user", actorUserId: input.actorUserId },
+    );
+    await addAuthors(tx, project.id, [input.actorUserId]);
+    return { outcome: "created", project, changed: true };
+  });
+}
+
+/** The base slug if the chat does not use it yet (deleted projects keep theirs), else base-2, base-3… */
+export async function freeSlug(sql: Queryable, chatId: number, base: string): Promise<string> {
   const taken = new Set(
     (await sql<{ slug: string }[]>`SELECT slug FROM projects WHERE chat_id = ${chatId} AND (slug = ${base} OR slug LIKE ${`${base}-%`})`).map((row) => row.slug),
   );
@@ -313,7 +603,8 @@ export async function canEditProject(sql: Sql, projectId: number, userId: number
 }
 
 export async function hideProject(sql: Sql, projectId: number, actorUserId: number): Promise<void> {
-  await sql`UPDATE projects SET hidden = true, updated_at = now() WHERE id = ${projectId}`;
+  const hidden = await sql`UPDATE projects SET hidden = true, updated_at = now() WHERE id = ${projectId} AND NOT hidden RETURNING id`;
+  if (hidden.length === 0) return;
   await sql`INSERT INTO change_log (entity, entity_id, op, source, actor_user_id) VALUES ('project', ${projectId}, 'hide', 'user', ${actorUserId})`;
 }
 
@@ -354,6 +645,10 @@ export async function mergeProjects(sql: Sql, chatId: number, intoSlug: string, 
       await tx`
         INSERT INTO change_log (entity, entity_id, op, before, source)
         VALUES ('project', ${into.id}, 'merge', ${tx.json({ merged: project.slug })}, 'llm')`;
+      // The folded entry remembers where it went, so a later mention of its old slug reaches the surviving project.
+      await tx`
+        INSERT INTO change_log (entity, entity_id, op, after, source)
+        VALUES ('project', ${project.id}, 'merged_into', ${tx.json({ into: into.id, slug: into.slug })}, 'llm')`;
     }
     return from.length;
   });

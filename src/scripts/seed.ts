@@ -4,7 +4,16 @@ import { z } from "zod";
 import { LEGACY_CHAT_ID } from "../core/chats.js";
 import { createSql, migrate, type Sql } from "../core/db.js";
 import { FACT_KINDS, proposeFact } from "../core/facts.js";
-import { PROJECT_STATUSES, setMemberRole, upsertProject } from "../core/projects.js";
+import { PROJECT_STATUSES, setMemberRole, upsertProject, type ProjectStatus } from "../core/projects.js";
+
+/** Seed files written before statuses became codes still carry the Russian words. */
+const LEGACY_STATUSES: Record<string, ProjectStatus> = {
+  идея: "idea",
+  "в работе": "in_progress",
+  запущен: "launched",
+  "на паузе": "paused",
+  заброшен: "abandoned",
+};
 
 const PersonSchema = z.object({
   display_name: z.string().min(1),
@@ -24,7 +33,7 @@ const ProjectSchema = z.object({
   slug: z.string().min(1),
   name: z.string().min(1),
   tagline: z.string().nullable().optional(),
-  status: z.enum(PROJECT_STATUSES),
+  status: z.preprocess((value) => (typeof value === "string" ? (LEGACY_STATUSES[value] ?? value) : value), z.enum(PROJECT_STATUSES)),
   stack: z.array(z.string()).default([]),
   links: z.object({ repo: z.string().nullable().optional(), site: z.string().nullable().optional(), other: z.array(z.string()).optional() }),
   authors: z.array(z.string()),
@@ -36,6 +45,11 @@ const ProjectSchema = z.object({
 
 export type SeedPerson = z.infer<typeof PersonSchema>;
 export type SeedProject = z.infer<typeof ProjectSchema>;
+
+/** Checks the contents of the two seed files; old statuses are read as today's codes. */
+export function parseSeed(people: unknown, projects: unknown): { people: SeedPerson[]; projects: SeedProject[] } {
+  return { people: z.array(PersonSchema).parse(people), projects: z.array(ProjectSchema).parse(projects) };
+}
 
 /** A seeded person is matched by @username anywhere, or by name among the chat's members. */
 async function upsertSeedUser(sql: Sql, chatId: number, person: SeedPerson): Promise<number> {
@@ -114,8 +128,7 @@ if (isMain) {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error("DATABASE_URL is not set");
   const [peopleFile = "seed/people.json", projectsFile = "seed/projects.json"] = process.argv.slice(2);
-  const people = z.array(PersonSchema).parse(JSON.parse(await readFile(peopleFile, "utf8")));
-  const projects = z.array(ProjectSchema).parse(JSON.parse(await readFile(projectsFile, "utf8")));
+  const { people, projects } = parseSeed(JSON.parse(await readFile(peopleFile, "utf8")), JSON.parse(await readFile(projectsFile, "utf8")));
   // Without SEED_CHAT_ID the cards wait as imported history until a bot owner attaches them to a chat.
   const chatId = Number(process.env.SEED_CHAT_ID ?? LEGACY_CHAT_ID);
   if (!Number.isInteger(chatId)) throw new Error("SEED_CHAT_ID must be a Telegram chat id");

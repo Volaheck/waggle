@@ -1,12 +1,11 @@
 import type Anthropic from "@anthropic-ai/sdk";
-import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { z } from "zod";
 import type { Sql } from "../core/db.js";
 import { dropFact, mergeFacts, normalizeStacks, type Fact } from "../core/facts.js";
-import { assertBudget, recordUsage } from "../core/llm.js";
+import { assertBudget, callStructured, recordUsage } from "../core/llm.js";
 import { detectLanguage } from "../core/language.js";
-import { mergeProjects, STATUS_CODE_LIST, statusCode, statusFromCode, upsertProject } from "../core/projects.js";
-import { PROMPT_STATUS_CODES } from "./extract.js";
+import { mergeProjects, PROJECT_STATUSES, upsertProject, type ProjectStatus } from "../core/projects.js";
+import { isProjectUpdate, PROMPT_STATUS_CODES } from "./extract.js";
 
 /** Kinds whose values are written in words, so they show the chat's language (stack and links read the same anywhere). */
 const WORDY_KINDS = new Set(["role", "expertise", "interest", "looking_for", "can_help"]);
@@ -15,7 +14,7 @@ export const ConsolidationSchema = z.object({
   fact_merges: z.array(z.object({ fact_ids: z.array(z.number().int()), value: z.string() })),
   fact_drops: z.array(z.object({ fact_id: z.number().int() })),
   project_merges: z.array(z.object({ into: z.string(), from: z.array(z.string()) })),
-  project_updates: z.array(z.object({ slug: z.string(), tagline: z.string().nullable(), status: z.enum(STATUS_CODE_LIST).nullable() })),
+  project_updates: z.array(z.object({ slug: z.string(), tagline: z.string().nullable(), status: z.enum(PROJECT_STATUSES).nullable() })),
 });
 
 export type ConsolidationResult = z.infer<typeof ConsolidationSchema>;
@@ -47,14 +46,15 @@ export interface ConsolidationInput {
   chatId: number;
   users: { id: number; display_name: string }[];
   facts: Fact[];
-  projects: { slug: string; name: string; tagline: string | null; status: string; links: Record<string, unknown>; authors: string[] }[];
+  projects: { slug: string; name: string; tagline: string | null; status: ProjectStatus; links: Record<string, unknown>; authors: string[] }[];
 }
 
+/** Hidden facts stay out of the clean-up: the person hid them, so neither a merge nor a drop may touch them. */
 export async function loadConsolidationInput(sql: Sql, chatId: number): Promise<ConsolidationInput> {
   const users = await sql<{ id: number; display_name: string }[]>`
     SELECT u.id, u.display_name FROM users u JOIN members m ON m.user_id = u.id
     WHERE m.chat_id = ${chatId} AND NOT m.opted_out ORDER BY u.id`;
-  const facts = await sql<Fact[]>`SELECT * FROM facts WHERE chat_id = ${chatId} AND status IN ('auto', 'manual', 'hidden') ORDER BY user_id, kind, id`;
+  const facts = await sql<Fact[]>`SELECT * FROM facts WHERE chat_id = ${chatId} AND status IN ('auto', 'manual') ORDER BY user_id, kind, id`;
   const projects = await sql<ConsolidationInput["projects"]>`
     SELECT p.slug, p.name, p.tagline, p.status, p.links,
            coalesce(array_agg('u' || pm.user_id) FILTER (WHERE pm.user_id IS NOT NULL), '{}') AS authors
@@ -73,7 +73,7 @@ export function buildConsolidationPrompt(input: ConsolidationInput): string {
     .filter(Boolean)
     .join("\n");
   const catalog = input.projects
-    .map((project) => `${project.slug} | ${project.name} | ${statusCode(project.status) ?? "-"} | authors: ${project.authors.join(", ")} | ${project.tagline ?? ""} | ${JSON.stringify(project.links)}`)
+    .map((project) => `${project.slug} | ${project.name} | ${project.status} | authors: ${project.authors.join(", ")} | ${project.tagline ?? ""} | ${JSON.stringify(project.links)}`)
     .join("\n");
   const language = detectLanguage([
     ...input.facts.filter((fact) => WORDY_KINDS.has(fact.kind)).map((fact) => fact.value),
@@ -118,8 +118,8 @@ export async function applyConsolidation(sql: Sql, input: ConsolidationInput, re
   for (const update of result.project_updates) {
     const project = input.projects.find((candidate) => candidate.slug === update.slug);
     if (!project || (!update.tagline && !update.status)) continue;
-    await upsertProject(sql, { chatId: input.chatId, slug: project.slug, name: project.name, tagline: update.tagline, status: statusFromCode(update.status), authorIds: [], sourceMsgIds: [], source: "llm" });
-    stats.projectsUpdated += 1;
+    const outcome = await upsertProject(sql, { chatId: input.chatId, slug: project.slug, name: project.name, tagline: update.tagline, status: update.status, authorIds: [], sourceMsgIds: [], source: "llm" });
+    if (isProjectUpdate(outcome)) stats.projectsUpdated += 1;
   }
   await sql`
     INSERT INTO app_state (key, value) VALUES (${stateKey(input.chatId)}, ${sql.json({ at: new Date().toISOString(), stats: { ...stats } })})
@@ -127,12 +127,40 @@ export async function applyConsolidation(sql: Sql, input: ConsolidationInput, re
   return stats;
 }
 
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const WEEK_MS = 7 * 24 * HOUR_MS;
+/** A large chat's first clean-up can produce a long answer; the stream makes the room cheap to offer. */
+const CONSOLIDATION_MAX_TOKENS = 64000;
 
 /** Weekly, and only when cards or the catalog changed since the previous clean-up. */
 const stateKey = (chatId: number) => `last_consolidation:${chatId}`;
+/** Written before every paid call, so a clean-up that keeps failing is retried with a growing pause instead of on every tick. */
+const attemptKey = (chatId: number) => `consolidation_attempt:${chatId}`;
+
+/** 1 h after the first failed attempt, then 4 h, 16 h, about 3 days, and at most a week. */
+export function consolidationRetryDelayMs(failedAttempts: number): number {
+  return Math.min(WEEK_MS, HOUR_MS * 4 ** Math.max(0, failedAttempts - 1));
+}
+
+/** Attempts made since the last successful clean-up; the newest one is unfinished, i.e. it failed. */
+async function failedAttempts(sql: Sql, chatId: number): Promise<{ count: number; lastAt: Date } | null> {
+  const rows = await sql<{ key: string; value: { attempts?: number }; updated_at: Date }[]>`
+    SELECT key, value, updated_at FROM app_state WHERE key IN (${stateKey(chatId)}, ${attemptKey(chatId)})`;
+  const attempt = rows.find((row) => row.key === attemptKey(chatId));
+  const done = rows.find((row) => row.key === stateKey(chatId));
+  if (!attempt || (done && done.updated_at >= attempt.updated_at)) return null;
+  return { count: Number(attempt.value.attempts ?? 1), lastAt: attempt.updated_at };
+}
+
+/** When a clean-up that failed may run again; null when the last one did not fail. */
+export async function nextConsolidationRetryAt(sql: Sql, chatId: number): Promise<Date | null> {
+  const failed = await failedAttempts(sql, chatId);
+  return failed ? new Date(failed.lastAt.getTime() + consolidationRetryDelayMs(failed.count)) : null;
+}
 
 export async function isConsolidationDue(sql: Sql, chatId: number, now = new Date()): Promise<boolean> {
+  const retryAt = await nextConsolidationRetryAt(sql, chatId);
+  if (retryAt && now < retryAt) return false;
   const [state] = await sql<{ updated_at: Date }[]>`SELECT updated_at FROM app_state WHERE key = ${stateKey(chatId)}`;
   if (state && now.getTime() - state.updated_at.getTime() < WEEK_MS) return false;
   const since = state?.updated_at ?? new Date(0);
@@ -147,23 +175,26 @@ export async function runConsolidation(
   anthropic: Anthropic,
   model: string,
   budget: { totalUsd: number; chatId: number; chatUsd: number },
+  /** Cancels the call, when the bot is stopping and cannot wait for it. */
+  signal?: AbortSignal,
 ): Promise<ConsolidationStats> {
-  await assertBudget(sql, budget.totalUsd, { id: budget.chatId, limitUsd: budget.chatUsd });
-  await normalizeStacks(sql, budget.chatId);
-  const input = await loadConsolidationInput(sql, budget.chatId);
-  const response = await anthropic.messages
-    .stream({
-      model,
-      max_tokens: 16000,
-      output_config: { effort: "low", format: zodOutputFormat(ConsolidationSchema) },
-      system: CONSOLIDATION_SYSTEM_PROMPT,
-      messages: [{ role: "user", content: buildConsolidationPrompt(input) }],
-    })
-    .finalMessage();
-  await recordUsage(sql, "consolidate", model, response.usage, budget.chatId);
-  if (response.stop_reason === "refusal" || response.stop_reason === "max_tokens") throw new Error(`Card clean-up stopped: ${response.stop_reason}`);
-  const text = response.content.map((block) => (block.type === "text" ? block.text : "")).join("");
-  const parsed = ConsolidationSchema.safeParse(JSON.parse(text));
-  if (!parsed.success) throw new Error(`Card clean-up: response does not match the schema: ${parsed.error.message}`);
-  return applyConsolidation(sql, input, parsed.data);
+  const chatId = budget.chatId;
+  await assertBudget(sql, budget.totalUsd, { id: chatId, limitUsd: budget.chatUsd });
+  const previous = await failedAttempts(sql, chatId);
+  await sql`
+    INSERT INTO app_state (key, value) VALUES (${attemptKey(chatId)}, ${sql.json({ attempts: (previous?.count ?? 0) + 1 })})
+    ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()`;
+  await normalizeStacks(sql, chatId);
+  const input = await loadConsolidationInput(sql, chatId);
+  const outcome = await callStructured(anthropic, {
+    model,
+    maxTokens: CONSOLIDATION_MAX_TOKENS,
+    system: CONSOLIDATION_SYSTEM_PROMPT,
+    prompt: buildConsolidationPrompt(input),
+    schema: ConsolidationSchema,
+    onUsage: (usage) => recordUsage(sql, "consolidate", model, usage, chatId),
+    signal,
+  });
+  if (!outcome.ok) throw new Error(`Card clean-up stopped: ${outcome.message}`);
+  return applyConsolidation(sql, input, outcome.data);
 }

@@ -1,6 +1,7 @@
 import { InlineKeyboard } from "grammy";
 import { visibleFacts, whoKnows } from "../core/facts.js";
 import {
+  addUserProject,
   canEditProject,
   findProject,
   getProjectBySlug,
@@ -11,21 +12,24 @@ import {
   RATING_EXPLANATION,
   setVote,
   STATUS_LABELS,
-  upsertProject,
+  updateProject,
   type ProjectSort,
 } from "../core/projects.js";
 import { topChronicle, topLimitFor } from "../core/chronicle.js";
 import {
   escapeHtml,
-  messageLink,
-  normalizeUrl,
+  isRepoHost,
+  projectNameFromUrl,
+  safeHttpUrl,
   truncate,
 } from "../core/text.js";
 import {
   findPersonByRef,
   getPerson,
   peopleOfChat,
+  SERVICE_TG_IDS,
   type Person,
+  type User,
 } from "../core/users.js";
 import {
   chronicleLine,
@@ -37,8 +41,10 @@ import {
 } from "./format.js";
 import {
   commandArgs,
+  encodeChat,
   grid,
   pager,
+  realReply,
   type BotContext,
   type BotKit,
   type Scope,
@@ -47,7 +53,6 @@ import {
 const PEOPLE_PER_PAGE = 8;
 const PROJECTS_PER_PAGE = 8;
 const CHRONICLE_PER_PAGE = 5;
-const LINKS_PER_PAGE = 10;
 
 const SORT_LABELS: Record<ProjectSort, string> = {
   top: "🏆 Top",
@@ -180,7 +185,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
       2,
     );
     if (scope.user.id === person.id && kit.isPrivate(ctx))
-      keyboard.row().text("✏️ Edit my card", "me:home");
+      keyboard.row().text("✏️ Edit my card", `me:${encodeChat(scope.chatId)}:home`);
     keyboard.row().text("👥 All members", "pp:0");
     const app = kit.appButton(
       ctx,
@@ -212,12 +217,18 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     "who",
     scoped(async (ctx, scope) => {
       const ref = commandArgs(ctx);
-      const replied = ctx.msg?.reply_to_message?.from;
+      const replied = realReply(ctx.msg);
       let targetId: number | undefined;
       if (ref) targetId = (await findPersonByRef(sql, scope.chatId, ref))?.id;
-      else if (replied && !replied.is_bot)
-        targetId = (await kit.identity(replied, scope.chatId)).id;
-      else targetId = scope.user.id;
+      else if (replied) {
+        const author = replied.from;
+        if (!author || author.is_bot || replied.sender_chat || replied.is_automatic_forward || SERVICE_TG_IDS.includes(author.id))
+          return void (await kit.show(ctx, "That was posted by a bot or on behalf of a channel — I keep cards only for people."));
+        // Replying to someone does not make them a member: Telegram says whether they are still in the chat.
+        targetId = (await kit.currentMember(scope.chatId, author))?.id;
+        if (!targetId)
+          return void (await kit.show(ctx, `${escapeHtml(author.first_name)} isn't in this chat anymore.`));
+      } else targetId = scope.user.id;
       if (!targetId)
         return void (await kit.show(
           ctx,
@@ -314,7 +325,7 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     for (const button of pager(`pl:${sort}`, current, totalPages))
       keyboard.add(button);
     keyboard.row().text("❓ How the rating works", "rating:help");
-    if (kit.isPrivate(ctx)) keyboard.text("➕ Add yours", "np:start");
+    if (kit.isPrivate(ctx)) keyboard.text("➕ Add yours", `np:${encodeChat(scope.chatId)}:start`);
     await kit.show(
       ctx,
       [`🛠 <b>Chat projects</b> · ${SORT_LABELS[sort]}`, "", ...lines].join("\n"),
@@ -406,57 +417,65 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     }),
   );
 
-  bot.callbackQuery(/^vote:(\d+)$/, async (ctx) => {
+  interface ButtonProject {
+    user: User;
+    person: Person | undefined;
+    project: { id: number; slug: string; chat_id: number; name: string; tagline: string | null; stack: string[] };
+  }
+
+  /**
+   * A project addressed by id from a button, which can carry any id. It is acted on only in an approved chat
+   * the presser is in right now (a group button only for that group's own projects); for editing the presser
+   * must also be an author, or an owner, who moderates without being a member. Every refusal looks the same.
+   */
+  async function projectFromButton(ctx: BotContext, projectId: number, purpose: "vote" | "edit"): Promise<ButtonProject | undefined> {
+    if (!ctx.from) return undefined;
     const user = await kit.identity(ctx.from);
-    const projectId = Number(ctx.match[1]);
-    const [project] = await sql<
-      { slug: string; chat_id: number; voted: boolean }[]
-    >`
-      SELECT slug, chat_id, EXISTS (SELECT 1 FROM votes WHERE project_id = ${projectId} AND user_id = ${user.id}) AS voted
-      FROM projects WHERE id = ${projectId}`;
-    if (!project) return ctx.answerCallbackQuery({ text: "Project not found" });
-    const result = await setVote(sql, projectId, user.id, !project.voted);
+    const [project] = await sql<ButtonProject["project"][]>`
+      SELECT p.id, p.slug, p.chat_id, p.name, p.tagline, p.stack FROM projects p JOIN chats c ON c.id = p.chat_id
+      WHERE p.id = ${projectId} AND NOT p.hidden AND c.status = 'approved'`;
+    if (!project || (!kit.isPrivate(ctx) && ctx.chat?.id !== project.chat_id)) return undefined;
+    const moderator = purpose === "edit" && kit.isOwner(user);
+    const person = moderator ? await getPerson(sql, project.chat_id, user.id) : await kit.currentMember(project.chat_id, ctx.from);
+    if (!moderator && !person) return undefined;
+    if (purpose === "edit" && !(await canEditProject(sql, project.id, user.id, moderator))) return undefined;
+    return { user, person, project };
+  }
+
+  bot.callbackQuery(/^vote:(\d+)$/, async (ctx) => {
+    const found = await projectFromButton(ctx, Number(ctx.match[1]), "vote");
+    if (!found?.person) return ctx.answerCallbackQuery({ text: "Project not found" });
+    const { user, person, project } = found;
+    const [vote] = await sql<{ voted: boolean }[]>`
+      SELECT EXISTS (SELECT 1 FROM votes WHERE project_id = ${project.id} AND user_id = ${user.id}) AS voted`;
+    const voted = Boolean(vote?.voted);
+    const result = await setVote(sql, project.id, user.id, !voted);
     if (result === "own_project")
       return ctx.answerCallbackQuery({
         text: "You can't vote for your own project 🙂",
       });
     await ctx.answerCallbackQuery({
-      text: project.voted ? "Vote removed" : "Counted 👍",
+      text: voted ? "Vote removed" : "Counted 👍",
     });
-    const person = await getPerson(sql, project.chat_id, user.id);
-    if (person)
-      await projectScreen(
-        ctx,
-        { user, chatId: project.chat_id, person },
-        project.slug,
-        true,
-      );
+    await projectScreen(
+      ctx,
+      { user, chatId: project.chat_id, person },
+      project.slug,
+      true,
+    );
   });
 
   bot.callbackQuery(
     /^pe:(\d+):(status|tagline|stack|links|delete)$/,
     async (ctx) => {
-      const user = await kit.identity(ctx.from);
-      const projectId = Number(ctx.match[1]);
-      if (
-        !kit.isPrivate(ctx) ||
-        !(await canEditProject(sql, projectId, user.id, kit.isOwner(user)))
-      )
+      const found = kit.isPrivate(ctx) ? await projectFromButton(ctx, Number(ctx.match[1]), "edit") : undefined;
+      if (!found)
         return ctx.answerCallbackQuery({
           text: "Only the author can edit, in a DM with the bot",
         });
       await ctx.answerCallbackQuery();
-      const [project] = await sql<
-        {
-          slug: string;
-          chat_id: number;
-          name: string;
-          tagline: string | null;
-          stack: string[];
-        }[]
-      >`
-      SELECT slug, chat_id, name, tagline, stack FROM projects WHERE id = ${projectId}`;
-      if (!project) return;
+      const { project } = found;
+      const projectId = project.id;
       const back = new InlineKeyboard().text("Cancel", `p:${project.slug}`);
       switch (ctx.match[2]) {
         case "status":
@@ -529,45 +548,32 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
   );
 
   bot.callbackQuery(/^ps:(\d+):(\d)$/, async (ctx) => {
-    const user = await kit.identity(ctx.from);
-    const projectId = Number(ctx.match[1]);
     const status = PROJECT_STATUSES[Number(ctx.match[2])];
-    if (
-      !status ||
-      !(await canEditProject(sql, projectId, user.id, kit.isOwner(user)))
-    )
-      return ctx.answerCallbackQuery();
-    const [project] = await sql<
-      { name: string; slug: string; chat_id: number }[]
-    >`SELECT name, slug, chat_id FROM projects WHERE id = ${projectId}`;
-    if (!project) return ctx.answerCallbackQuery();
-    await upsertProject(sql, {
+    const found = status && kit.isPrivate(ctx) ? await projectFromButton(ctx, Number(ctx.match[1]), "edit") : undefined;
+    if (!found || !status) return ctx.answerCallbackQuery();
+    const { user, project } = found;
+    await updateProject(sql, {
       chatId: project.chat_id,
-      name: project.name,
+      projectId: project.id,
       status,
-      authorIds: [],
-      sourceMsgIds: [],
-      activityAt: new Date(),
-      source: kit.isOwner(user) ? "admin" : "user",
+      source: (await canEditProject(sql, project.id, user.id, false)) ? "user" : "admin",
       actorUserId: user.id,
+      activityAt: new Date(),
     });
     await ctx.answerCallbackQuery({ text: `Status: ${STATUS_LABELS[status]}` });
-    const person = await getPerson(sql, project.chat_id, user.id);
-    if (person)
+    if (found.person)
       await projectScreen(
         ctx,
-        { user, chatId: project.chat_id, person },
+        { user, chatId: project.chat_id, person: found.person },
         project.slug,
         true,
       );
   });
 
   bot.callbackQuery(/^pdel:(\d+)$/, async (ctx) => {
-    const user = await kit.identity(ctx.from);
-    const projectId = Number(ctx.match[1]);
-    if (!(await canEditProject(sql, projectId, user.id, kit.isOwner(user))))
-      return ctx.answerCallbackQuery({ text: "Only the author can remove it" });
-    await hideProject(sql, projectId, user.id);
+    const found = kit.isPrivate(ctx) ? await projectFromButton(ctx, Number(ctx.match[1]), "edit") : undefined;
+    if (!found) return ctx.answerCallbackQuery({ text: "Only the author can remove it" });
+    await hideProject(sql, found.project.id, found.user.id);
     await ctx.answerCallbackQuery({ text: "Removed" });
     await kit.show(
       ctx,
@@ -581,45 +587,48 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
     "addproject",
     scoped(async (ctx, scope) => {
       const [rawUrl, ...rest] = commandArgs(ctx).split(/\s+/);
-      const normalized = rawUrl ? normalizeUrl(rawUrl) : null;
-      if (!rawUrl || !normalized) {
+      const url = safeHttpUrl(rawUrl);
+      const name = url ? projectNameFromUrl(url) : null;
+      if (!url || !name) {
         if (kit.isPrivate(ctx))
           return void (await kit.show(
             ctx,
             "Use a link: /addproject https://github.com/you/repo Short description — or step by step:",
-            new InlineKeyboard().text("➕ New project", "np:start"),
+            new InlineKeyboard().text("➕ New project", `np:${encodeChat(scope.chatId)}:start`),
           ));
         return void (await kit.show(
           ctx,
           "Format: /addproject https://github.com/you/repo Short description",
         ));
       }
-      const user = scope.user;
-      const isRepo = ["github.com", "gitlab.com", "codeberg.org"].includes(
-        normalized.domain,
-      );
-      const pathParts = new URL(rawUrl).pathname.split("/").filter(Boolean);
-      const name =
-        isRepo && pathParts[1]
-          ? pathParts[1]
-          : (normalized.domain.split(".")[0] ?? normalized.domain);
-      const { project, created } = await upsertProject(sql, {
+      const description = rest.join(" ").trim().slice(0, 200);
+      const result = await addUserProject(sql, {
         chatId: scope.chatId,
         name,
-        tagline: rest.join(" ") || null,
-        links: isRepo ? { repo: rawUrl } : { site: rawUrl },
-        authorIds: [user.id],
+        tagline: description || undefined,
+        links: isRepoHost(new URL(url).hostname) ? { repo: url } : { site: url },
         sourceMsgIds:
           ctx.msg && !kit.isPrivate(ctx) ? [ctx.msg.message_id] : [],
-        activityAt: new Date(),
-        source: "user",
-        actorUserId: user.id,
+        actorUserId: scope.user.id,
       });
-      await kit.show(
-        ctx,
-        `${created ? "Added" : "Updated"} project <b>${escapeHtml(project.name)}</b> ✅`,
-        new InlineKeyboard().text("Open card", `p:${project.slug}`),
-      );
+      const project = `<b>${escapeHtml(result.project.name)}</b>`;
+      const open = new InlineKeyboard().text("Open card", `p:${result.project.slug}`);
+      if (result.outcome === "exists") {
+        const [row] = await sql<{ authors: string | null }[]>`
+          SELECT string_agg(u.display_name, ', ' ORDER BY u.display_name) AS authors
+          FROM project_members pm JOIN users u ON u.id = pm.user_id WHERE pm.project_id = ${result.project.id}`;
+        return void (await kit.show(
+          ctx,
+          `There's already ${project} in this chat's catalog${row?.authors ? ` (by ${escapeHtml(row.authors)})` : ""}, so I left it as it is. If yours is a different project, add it under its own name with ➕ New project in a DM with me.`,
+          open,
+        ));
+      }
+      const text = {
+        created: `Added project ${project} ✅`,
+        own: result.changed ? `Updated project ${project} ✅` : `${project} is already among your projects — nothing to change.`,
+        restored: `Project ${project} is back in the catalog ✅`,
+      }[result.outcome];
+      await kit.show(ctx, text, open);
     }),
   );
 
@@ -688,68 +697,6 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
   });
   bot.callbackQuery(/^ch:(\d+):(\d+)$/, (ctx) =>
     chronicle(ctx, Number(ctx.match[1]), Number(ctx.match[2]), true),
-  );
-
-  // ---------- Links ----------
-
-  async function linksScreen(
-    ctx: BotContext,
-    scope: Scope,
-    page: number,
-    edit: boolean,
-  ) {
-    const [total] = await sql<
-      { count: number }[]
-    >`SELECT count(*)::int AS count FROM links WHERE chat_id = ${scope.chatId} AND NOT from_forward`;
-    const totalPages = Math.max(
-      1,
-      Math.ceil((total?.count ?? 0) / LINKS_PER_PAGE),
-    );
-    const current = Math.min(page, totalPages - 1);
-    const links = await sql<
-      {
-        url: string;
-        context: string | null;
-        last_msg_id: number | null;
-        display_name: string | null;
-        share_count: number;
-      }[]
-    >`
-      SELECT l.url, l.context, l.last_msg_id, u.display_name, l.share_count
-      FROM links l LEFT JOIN users u ON u.id = l.first_user_id
-      WHERE l.chat_id = ${scope.chatId} AND NOT l.from_forward
-      ORDER BY l.first_seen_at DESC
-      LIMIT ${LINKS_PER_PAGE} OFFSET ${current * LINKS_PER_PAGE}`;
-    const lines = links.map((link) => {
-      const where = link.last_msg_id
-        ? ` <a href="${messageLink(scope.chatId, link.last_msg_id)}">💬</a>`
-        : "";
-      const who = link.display_name
-        ? ` — ${escapeHtml(link.display_name)}`
-        : "";
-      const context = link.context
-        ? `\n   <i>${escapeHtml(truncate(link.context, 90))}</i>`
-        : "";
-      return `• ${escapeHtml(truncate(link.url.replace(/^https?:\/\//, ""), 70))}${who}${link.share_count > 1 ? ` ×${link.share_count}` : ""}${where}${context}`;
-    });
-    const keyboard = new InlineKeyboard();
-    for (const button of pager("ln", current, totalPages)) keyboard.add(button);
-    await kit.show(
-      ctx,
-      [
-        `🔗 <b>Links from the chat</b> (newest first)`,
-        "",
-        ...(lines.length ? lines : ["Nothing yet."]),
-      ].join("\n"),
-      keyboard,
-      { edit },
-    );
-  }
-
-  const links = scoped(linksScreen);
-  bot.command("links", (ctx) => links(ctx, 0, false));
-  bot.callbackQuery(/^ln:(\d+)$/, (ctx) =>
-    links(ctx, Number(ctx.match[1]), true),
   );
 
   bot.callbackQuery("noop", (ctx) => ctx.answerCallbackQuery());
