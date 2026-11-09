@@ -653,7 +653,7 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       await assistant.idle();
       expect(claude.requests).toHaveLength(1);
       const [first] = claude.requests;
-      expect(first).toMatchObject({ model: "claude-haiku-5-5", effort: "medium" });
+      expect(first).toMatchObject({ model: "claude-haiku-5-5", effort: "high" });
       expect(first!.userId).toMatch(/^[0-9a-f]{32}$/);
       expect(first!.content).toContain("Rust");
       expect(first!.content).toContain("call me [phone]");
