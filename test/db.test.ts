@@ -118,7 +118,6 @@ describe.skipIf(!DATABASE_URL)("with postgres", () => {
         { person: `u${fan.id}`, kind: "stack", value: "Zed (перешёл с VS Code)", confidence: 0.9, source_msg_ids: [9004] },
       ],
       facts_update: [],
-      facts_outdated: [],
       projects: [],
       project_renames: [],
       project_signals: [

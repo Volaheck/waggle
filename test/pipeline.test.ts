@@ -79,6 +79,14 @@ describe("structured output format", () => {
     expect(objectsWithoutStrictness(format.schema)).toBe(0);
     expect(enumsUnder(structuredOutputFormat(ConsolidationSchema).schema)).toEqual([[...PROJECT_STATUSES]]);
   });
+
+  it("keeps the extraction schema small enough for the API to compile", () => {
+    // Measured on 2026-11-09 with claude-sonnet-5-5: these seven arrays of objects are accepted, and an eighth one makes
+    // the API refuse every call ("The compiled grammar is too large"), which tests with a fake client never notice.
+    // Before adding a field or an array, try a real call with the new schema.
+    const properties = (structuredOutputFormat(ExtractionSchema).schema as { properties: Record<string, unknown> }).properties;
+    expect(Object.keys(properties)).toEqual(["topics", "facts_add", "facts_update", "projects", "project_renames", "project_signals", "taglines"]);
+  });
 });
 
 describe("chat language by votes", () => {
@@ -162,7 +170,7 @@ function fakeAnthropic(answer: (request: { system: string; prompt: string }) => 
   return { client, requests };
 }
 
-const EMPTY_EXTRACTION: ExtractionResult = { topics: [], facts_add: [], facts_update: [], facts_outdated: [], projects: [], project_renames: [], project_signals: [], taglines: [] };
+const EMPTY_EXTRACTION: ExtractionResult = { topics: [], facts_add: [], facts_update: [], projects: [], project_renames: [], project_signals: [], taglines: [] };
 const EMPTY_CLEANUP = JSON.stringify({ fact_merges: [], fact_drops: [], project_merges: [], project_updates: [] });
 const MODEL = "claude-sonnet-5-5";
 /** 10K input and 1K output tokens at Sonnet 5.5 prices. */
@@ -758,6 +766,33 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     expect((await getPerson(sql, chat.id, quiet.id))!.tagline).toBeNull();
     const authors = await sql<{ user_id: number }[]>`SELECT pm.user_id FROM project_members pm JOIN projects p ON p.id = pm.project_id WHERE p.chat_id = ${chat.id} AND p.slug = 'pulse'`;
     expect(authors.map((row) => row.user_id)).toEqual([author.id]);
+  });
+
+  it("marks a fact outdated when the chronicler updates it to null, and rewrites it otherwise", async () => {
+    const chat = await newChat("Outdated facts");
+    const anna = await person(chat.id, "Anna");
+    const tool = await fact(chat.id, anna.id, "stack", "Codex");
+    const role = await fact(chat.id, anna.id, "role", "frontend developer");
+    await message(chat.id, 1, anna.id, "Switched from Codex to Claude, and I do backend now");
+    const data: BatchData = {
+      chatId: chat.id,
+      batch: await sql<StoredMessage[]>`SELECT * FROM messages WHERE chat_id = ${chat.id} ORDER BY msg_id`,
+      context: [],
+      users: await peopleOfChat(sql, chat.id),
+      facts: await visibleFacts(sql, chat.id, anna.id),
+      projects: [],
+    };
+    const stats = await applyExtraction(sql, await newRun(chat.id), data, {
+      ...EMPTY_EXTRACTION,
+      facts_update: [
+        { fact_id: tool, value: null, source_msg_ids: [1] },
+        { fact_id: role, value: "backend developer", source_msg_ids: [1] },
+      ],
+    });
+    expect(stats).toMatchObject({ factsOutdated: 1, factsUpdated: 1 });
+    const rows = await sql<{ id: number; value: string; status: string }[]>`SELECT id, value, status FROM facts WHERE chat_id = ${chat.id} ORDER BY id`;
+    expect(rows.find((row) => row.id === tool)).toMatchObject({ value: "Codex", status: "deprecated" });
+    expect(rows.find((row) => row.id === role)).toMatchObject({ value: "backend developer" });
   });
 
   it("renames a project only on its author's or a bot owner's word, never a joke by someone else", async () => {

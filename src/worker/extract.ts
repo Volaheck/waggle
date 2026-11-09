@@ -49,16 +49,12 @@ export const ExtractionSchema = z.object({
       source_msg_ids: z.array(z.number().int()),
     }),
   ),
+  // An outdated fact is an update to null: structured outputs refuse a grammar this big with one more array of objects
+  // (measured 2026-11-09, claude-sonnet-5-5), so the schema keeps seven of them; see the test on its size.
   facts_update: z.array(
     z.object({
       fact_id: z.number().int(),
-      value: z.string(),
-      source_msg_ids: z.array(z.number().int()),
-    }),
-  ),
-  facts_outdated: z.array(
-    z.object({
-      fact_id: z.number().int(),
+      value: z.string().nullable().describe("the new wording, or null when the fact is no longer true"),
       source_msg_ids: z.array(z.number().int()),
     }),
   ),
@@ -143,7 +139,7 @@ Rules:
 - Never record: political views, attitudes toward war and toward countries, health, personal finances and income or any amounts of money, private life and family, an exact address, conflicts between members, passwords or any secrets.
 - confidence from 0.5 to 1.0: 0.9+ — the person said it directly about themselves; 0.7 — it follows confidently from several remarks; 0.5–0.6 — likely, but needs confirmation.
 - source_msg_ids — 1–3 ids of the new messages the fact is based on.
-- facts_outdated — ids of existing facts that the new messages clearly contradict ("switched from Codex to Claude" makes "Codex" outdated). If in doubt, leave them alone.
+- An existing fact that the new messages clearly contradict is outdated: put it in facts_update with value null ("switched from Codex to Claude" makes "Codex" outdated). If in doubt, leave it alone.
 
 3. Projects (projects)
 - Only projects the members make or have made themselves: "I made", "my", "I'm building", "pushed a release", a demo of their own product, their own repository. Other people's repositories, news, awesome lists and forwarded posts are not projects.
@@ -409,14 +405,12 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
     }
 
     const knownFactIds = new Set(data.facts.map((fact) => fact.id));
-    for (const item of result.facts_outdated) {
-      if (!knownFactIds.has(item.fact_id)) continue;
-      if (await deprecateFact(tx, item.fact_id, validSources(item.source_msg_ids))) stats.factsOutdated += 1;
-    }
-
     for (const item of result.facts_update) {
       if (!knownFactIds.has(item.fact_id)) continue;
-      if (await rewriteFact(tx, item.fact_id, item.value, validSources(item.source_msg_ids), "llm")) stats.factsUpdated += 1;
+      const sources = validSources(item.source_msg_ids);
+      if (item.value === null) {
+        if (await deprecateFact(tx, item.fact_id, sources)) stats.factsOutdated += 1;
+      } else if (await rewriteFact(tx, item.fact_id, item.value, sources, "llm")) stats.factsUpdated += 1;
     }
 
     stats.signals += await applySignals(tx, data.chatId, runId, result, batchById, users, projectIdOf);
