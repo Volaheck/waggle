@@ -80,9 +80,9 @@ const REQUEST_TIMEOUT_MS = 60_000;
 /** One person, one answer per this interval: what they write meanwhile waits and is answered together after it. */
 const PER_MEMBER_GAP_MS = 4_000;
 /** Generous on purpose: banter runs fast, and REPLIES_MONTHLY_BUDGET_USD is what bounds the spending. */
-const PER_CHAT_PER_HOUR = 250;
+const PER_CHAT_PER_HOUR = 100;
 /** One member cannot take the whole chat's hour. */
-const PER_MEMBER_PER_HOUR = 50;
+const PER_MEMBER_PER_HOUR = 25;
 /** Refusals for different members in one chat within an hour: the cause is in the shared context, so the chat waits. */
 const CHAT_REFUSALS_BEFORE_SILENCE = 2;
 /** After the model refused someone, their mentions are ignored for this long. */
