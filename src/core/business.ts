@@ -53,7 +53,11 @@ export async function saveConnection(sql: Sql, connection: { id: string; ownerTg
     INSERT INTO business_connections (id, owner_tg_id, owner_chat_id, enabled)
     VALUES (${connection.id}, ${connection.ownerTgId}, ${connection.ownerChatId}, ${connection.enabled})
     ON CONFLICT (id) DO UPDATE SET owner_tg_id = excluded.owner_tg_id, owner_chat_id = excluded.owner_chat_id, enabled = excluded.enabled, updated_at = now()`;
-  if (!connection.enabled) await sql`DELETE FROM business_messages WHERE connection_id = ${connection.id}`;
+  if (!connection.enabled) {
+    await sql`DELETE FROM business_messages WHERE connection_id = ${connection.id}`;
+    await sql`DELETE FROM business_dialogue WHERE connection_id = ${connection.id}`;
+    await sql`DELETE FROM business_reminders WHERE connection_id = ${connection.id}`;
+  }
 }
 
 export async function connectionById(sql: Sql, id: string): Promise<BusinessConnectionRow | undefined> {
@@ -91,4 +95,9 @@ export async function takeDeletedMessages(sql: Sql, connectionId: string, chatId
 export async function clearExpiredBusinessMessages(sql: Sql, retentionDays: number): Promise<number> {
   const rows = await sql`DELETE FROM business_messages WHERE sent_at < now() - make_interval(days => ${retentionDays}) RETURNING 1`;
   return rows.length;
+}
+
+export async function connectionsOfOwner(sql: Sql, ownerTgId: number): Promise<BusinessConnectionRow[]> {
+  return sql<BusinessConnectionRow[]>`
+    SELECT id, owner_tg_id, owner_chat_id, enabled FROM business_connections WHERE owner_tg_id = ${ownerTgId} AND enabled ORDER BY updated_at`;
 }

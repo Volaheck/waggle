@@ -1,8 +1,18 @@
 import type { Api, Bot } from "grammy";
 import type { BusinessConnection, Chat, Message } from "grammy/types";
 import {
+  addDays,
+  localDate,
+  reminderForOwner,
+  saveDialogueLine,
+  setReminderStatus,
+  zonedTime,
+  activeReminders,
+} from "../core/business-reminders.js";
+import {
   clearExpiredBusinessMessages,
   connectionById,
+  connectionsOfOwner,
   saveConnection,
   takeDeletedMessages,
   upsertBusinessMessage,
@@ -13,7 +23,8 @@ import {
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
 import { escapeHtml, truncate } from "../core/text.js";
-import { countOf, formatDate } from "./format.js";
+import { reminderButtons, reminderLine } from "../worker/business-reminders.js";
+import { clampTelegram, countOf, formatDate } from "./format.js";
 import type { BotContext } from "./kit.js";
 
 /** One report stays well below Telegram's 4096 characters. */
@@ -155,8 +166,8 @@ async function resendMedia(api: Api, chatId: number, kind: BusinessMediaKind, fi
  * Only owners (ADMIN_TG_IDS) get this; for anyone else the bot keeps nothing. The owner's own messages are not kept.
  * Registered before every other handler: these updates never reach the group logic.
  */
-export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config: Config }): void {
-  const { sql, config } = deps;
+export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config: Config; remindersOn: boolean }): void {
+  const { sql, config, remindersOn } = deps;
   const isOwner = (tgId: number) => config.ADMIN_TG_IDS.includes(tgId);
   const timeZone = config.DISPLAY_TIMEZONE;
 
@@ -209,6 +220,12 @@ export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config:
         [
           "🔌 <b>Connected.</b> When someone deletes or edits a message in the chats you gave me, I'll show you here what it was.",
           `I keep their messages for ${countOf(config.BUSINESS_MESSAGE_RETENTION_DAYS, "day")}, your own messages not at all. Disconnecting deletes what I kept.`,
+          ...(remindersOn
+            ? [
+                "",
+                "⏰ I also read these chats, both sides, for promises and plans (“I'll send it tomorrow”, “call on Friday at 7”) and remind you of them here; /reminders lists them. The lines are kept for 2 days, and their text goes to Claude with phone numbers, emails and secrets masked.",
+              ]
+            : []),
         ].join("\n"),
       );
     } else if (!connection.is_enabled && before?.enabled) {
@@ -216,10 +233,29 @@ export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config:
     }
   });
 
+  /** Both sides go to the conversation the reminders are read from. */
+  const keepDialogueLine = async (connection: BusinessConnectionRow, message: Message) => {
+    if (!remindersOn) return;
+    const media = mediaOf(message);
+    const text = [media ? `[${MEDIA_LABELS[media.kind]}]` : "", textOf(message)].filter(Boolean).join(" ");
+    if (!text) return;
+    await saveDialogueLine(sql, {
+      connectionId: connection.id,
+      chatId: message.chat.id,
+      msgId: message.message_id,
+      fromOwner: message.from?.id === connection.owner_tg_id,
+      chatName: chatName(message.chat as Chat.PrivateChat),
+      text,
+      sentAt: new Date(message.date * 1000),
+    });
+  };
+
   bot.on("business_message", async (ctx) => {
     const message = ctx.businessMessage;
     const connection = await activeConnection(ctx.api, message.business_connection_id);
-    if (!connection || message.from?.id === connection.owner_tg_id) return;
+    if (!connection) return;
+    await keepDialogueLine(connection, message);
+    if (message.from?.id === connection.owner_tg_id) return;
     const kept = toBusinessMessage(connection.id, message);
     if (kept) await upsertBusinessMessage(sql, kept);
   });
@@ -227,7 +263,9 @@ export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config:
   bot.on("edited_business_message", async (ctx) => {
     const message = ctx.editedBusinessMessage;
     const connection = await activeConnection(ctx.api, message.business_connection_id);
-    if (!connection || message.from?.id === connection.owner_tg_id) return;
+    if (!connection) return;
+    await keepDialogueLine(connection, message);
+    if (message.from?.id === connection.owner_tg_id) return;
     const after = toBusinessMessage(connection.id, message);
     if (!after) return;
     const before = await upsertBusinessMessage(sql, after);
@@ -254,6 +292,44 @@ export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config:
       await tell(connection.owner_chat_id, `…and ${countOf(media.length - MEDIA_RESENT_PER_REPORT, "more file")} I didn't resend.`);
     }
   });
+
+  // ---------- Reminders: buttons and the list ----------
+
+  bot.callbackQuery(/^bzr:(done|drop|hour|tomorrow):(\d+)$/, async (ctx) => {
+    const [, action, rawId] = ctx.match;
+    const reminder = isOwner(ctx.from.id) ? await reminderForOwner(sql, Number(rawId), ctx.from.id) : undefined;
+    if (!reminder) return ctx.answerCallbackQuery({ text: "This reminder is gone" });
+    const line = reminderLine(reminder, timeZone);
+    let outcome: string;
+    if (action === "done" || action === "drop") {
+      await setReminderStatus(sql, reminder.id, action === "done" ? "done" : "dropped");
+      outcome = action === "done" ? `✅ ${line}` : `✖ <s>${line}</s>`;
+    } else {
+      const at =
+        action === "hour" ? new Date(Date.now() + 60 * 60 * 1000) : zonedTime(addDays(localDate(new Date(), timeZone), 1), "10:00", timeZone);
+      await setReminderStatus(sql, reminder.id, "open", at);
+      outcome = `⏰ ${line}\nAgain ${formatDate(at, timeZone)}.`;
+    }
+    await ctx.editMessageText(outcome, { parse_mode: "HTML" }).catch(() => {});
+    await ctx.answerCallbackQuery();
+  });
+
+  bot.command("reminders", async (ctx, next) => {
+    if (ctx.chat.type !== "private" || !ctx.from || !isOwner(ctx.from.id)) return next();
+    if (!remindersOn) return ctx.reply("Reminders are off (no ANTHROPIC_API_KEY, or BUSINESS_REMINDERS_MONTHLY_BUDGET_USD is 0).");
+    const connections = await connectionsOfOwner(sql, ctx.from.id);
+    const reminders = (await Promise.all(connections.map((connection) => activeReminders(sql, connection.id)))).flat();
+    if (connections.length === 0) {
+      return ctx.reply("Connect me to your account first: Settings → Telegram Business → Chat Automation.");
+    }
+    if (reminders.length === 0) return ctx.reply("Nothing to remind you of yet.");
+    const shown = reminders.slice(0, 10);
+    for (const reminder of shown) {
+      const when = reminder.status === "sent" ? "sent" : `reminder ${formatDate(reminder.remind_at, timeZone)}`;
+      await ctx.reply(clampTelegram(`${reminderLine(reminder, timeZone)}\n<i>${when}</i>`), { parse_mode: "HTML", reply_markup: reminderButtons(reminder.id) });
+    }
+    if (reminders.length > shown.length) await ctx.reply(`…and ${countOf(reminders.length - shown.length, "more")}.`);
+  });
 }
 
 /** Messages kept from connected chats are deleted after the retention period, reported or not. */
@@ -269,4 +345,9 @@ export function startBusinessRetention(sql: Sql, retentionDays: number, log: (li
   void run();
   const timer = setInterval(() => void run(), RETENTION_CHECK_MS);
   return () => clearInterval(timer);
+}
+
+/** Reading owners' DMs for promises and plans needs the model and a cap above zero. */
+export function businessRemindersOn(anthropic: unknown, config: Pick<Config, "BUSINESS_REMINDERS_MONTHLY_BUDGET_USD">): boolean {
+  return Boolean(anthropic) && config.BUSINESS_REMINDERS_MONTHLY_BUDGET_USD > 0;
 }

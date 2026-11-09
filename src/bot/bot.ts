@@ -30,7 +30,7 @@ import { chatBudgetUsd, nextExtractionRetryAt } from "../worker/scheduler.js";
 import { registerCatalog } from "./catalog.js";
 import { catchupHtml, clampTelegram, countOf, formatDate, userHeader } from "./format.js";
 import { registerAliases } from "./aliases.js";
-import { BUSINESS_UPDATES, registerBusiness } from "./business.js";
+import { BUSINESS_UPDATES, businessRemindersOn, registerBusiness } from "./business.js";
 import { createAssistant, isAddressedToBot, PREMIUM_REPLY_PURPOSE, repliesSpendUsd, type Assistant, type AssistantDeps } from "./assistant.js";
 import { createInterjector, type Interjector } from "./interjector.js";
 import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
@@ -357,7 +357,7 @@ export function createBot(deps: BotDeps): {
   }
 
   // Owners' own private chats, through Telegram Business: handled apart from everything below.
-  registerBusiness(bot, { sql, config });
+  registerBusiness(bot, { sql, config, remindersOn: businessRemindersOn(deps.anthropic, config) });
 
   bot.on("my_chat_member", async (ctx) => {
     if (!isGroup(ctx)) return;
@@ -839,6 +839,7 @@ const OWNER_COMMANDS = [
   { command: "chats", description: "Bot's chats: approve, attach import" },
   { command: "botstatus", description: "Chronicler status and budget" },
   { command: "notes", description: "Private notes the bot keeps (owners only)" },
+  { command: "reminders", description: "Promises and plans from your own DMs" },
 ];
 
 /**
