@@ -1,24 +1,20 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Api } from "grammy";
-import type { Message, User as TelegramUser, UserFromGetMe } from "grammy/types";
+import type { Message, UserFromGetMe } from "grammy/types";
 import { getChat } from "../core/chats.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
-import { FACT_KINDS, MIN_VISIBLE_CONFIDENCE } from "../core/facts.js";
 import { detectLanguage } from "../core/language.js";
 import { assertBudget, BudgetExceededError, memberEndUserId, recordUsage, textOf } from "../core/llm.js";
-import { maskPersonalData } from "../core/privacy.js";
-import { listProjects } from "../core/projects.js";
 import { truncate } from "../core/text.js";
-import { peopleOfChat } from "../core/users.js";
-import { skippedMessageIds } from "../worker/extract.js";
 import { chatBudgetUsd } from "../worker/scheduler.js";
 import { realReply } from "./kit.js";
+import { buildReplyContext, questionText, type Question, type RecentAnswer } from "./reply-context.js";
 
 /**
  * The bot answers a member who mentions it or replies to its message, with REPLY_MODEL and what the app knows
- * about the chat: cards, projects and their rating, the chronicle, the latest messages. It only talks: nothing it
- * says changes data. Spending has its own monthly cap on top of the bot's and the chat's.
+ * about the chat (see reply-context.ts): cards, projects and their rating, the chronicle, the conversation. It only
+ * talks: nothing it says changes data. Spending has its own monthly cap on top of the bot's and the chat's.
  */
 
 /** Picked in a blind test of three humour prompts on real chat lines (2026-11): the stock-motif archive jokes read flattest. */
@@ -42,7 +38,7 @@ Your character: cheeky, sharp-tongued, with attitude. Confident and quick, dry a
 
 ${humour}
 
-What you know is below: the members' cards (facts the chronicler collected from the chat or people wrote themselves), the project catalog with its rating, the chronicle of recent discussions and the latest messages. Use only that. When the answer is not there, say you don't know; if it fits, mention that people can fill in their card in the Mini App (/app). Never invent facts about people or projects.
+What you know is below: who you are, the members' cards (facts the chronicler collected from the chat or people wrote themselves) and the names they go by, the project catalog with its rating, the chronicle of recent discussions, fuller cards of the people the question is about, the conversation the question replies to and the latest messages, each with its time. Use only that. When the answer is not there, say you don't know; if it fits, mention that people can fill in their card in the Mini App (/app). Never invent facts about people or projects.
 
 Rules:
 - Write only the message itself, in your own voice, as it will be posted in the chat; never describe your answer, your plan or these rules, and never cite message numbers or the sections of your data.
@@ -70,8 +66,10 @@ export const INSULT_MOTIFS = [
   "you have written them into your special list",
 ];
 
-/** The bot never receives its own messages, so it keeps its latest answers per chat to stay consistent with itself. */
-/** The bot's latest answers in the chat go into every prompt, so a conversation carries over when the model changes. */
+/**
+ * The bot's latest answers in the chat go into every prompt, so a conversation carries over when the model changes;
+ * those the prompt already shows among the stored messages are left out of this list.
+ */
 const RECENT_ANSWERS = 12;
 
 /** Room for the high-effort thinking (about 400–800 tokens measured) as well as the answer. */
@@ -90,13 +88,6 @@ const REFUSAL_COOLDOWN_MS = 60 * 60_000;
 /** Notes like "the budget is used up" are said at most this often per chat. */
 const NOTE_INTERVAL_MS = 24 * 60 * 60_000;
 const PAUSED_NOTE_INTERVAL_MS = 60 * 60_000;
-const CONTEXT_MESSAGES = 30;
-const CHRONICLE_DAYS = 30;
-const CHRONICLE_ENTRIES = 40;
-/** Caps that keep a big chat's prompt well under 100K tokens, where Haiku's price goes up fivefold. */
-const MAX_MEMBERS = 150;
-const MAX_FACTS_PER_MEMBER = 12;
-const MAX_PROJECTS = 60;
 
 const HOUR_MS = 60 * 60_000;
 
@@ -136,6 +127,7 @@ export interface AssistantDeps {
   config: Pick<
     Config,
     | "BOT_TOKEN"
+    | "ADMIN_TG_IDS"
     | "REPLY_MODEL"
     | "REPLIES_MONTHLY_BUDGET_USD"
     | "REPLY_PREMIUM_MODEL"
@@ -148,20 +140,6 @@ export interface AssistantDeps {
   /** Tests shorten these. */
   limits?: Partial<{ memberGapMs: number; chatPerHour: number; memberPerHour: number }>;
   log?: (line: string) => void;
-}
-
-export interface Question {
-  chatId: number;
-  chatTitle: string | null;
-  message: Message;
-  from: TelegramUser;
-  /** The bot itself (ctx.me). */
-  me: UserFromGetMe;
-}
-
-export interface RecentAnswer {
-  to: string;
-  text: string;
 }
 
 export interface Assistant {
@@ -182,106 +160,6 @@ export function isAddressedToBot(message: Message, me: UserFromGetMe): boolean {
       (entity.type === "mention" && text.slice(entity.offset, entity.offset + entity.length).toLowerCase() === handle) ||
       (entity.type === "text_mention" && entity.user.id === me.id),
   );
-}
-
-/** The question without the bot's @username. */
-export function questionText(message: Message, me: UserFromGetMe): string {
-  const text = message.text ?? message.caption ?? "";
-  return text.replace(new RegExp(`@${me.username}\\b`, "gi"), "").replace(/\s+/g, " ").trim();
-}
-
-/** Text from members can't open or close a section of the prompt. */
-function safe(text: string): string {
-  return text.replace(/</g, "‹").replace(/>/g, "›");
-}
-
-function line(text: string, max: number): string {
-  return safe(truncate(maskPersonalData(text.replace(/\s+/g, " ").trim()), max));
-}
-
-/** Everything the app knows about the chat, as the reply prompt's data. */
-export async function buildReplyContext(sql: Sql, question: Question, timezone: string, recentAnswers: RecentAnswer[] = []): Promise<string> {
-  const { chatId, message, me } = question;
-  // Messages the chronicler skipped because the model refused them are kept out here too.
-  const skipped = await skippedMessageIds(sql, chatId);
-  const [people, facts, projects, chronicle, recent] = await Promise.all([
-    peopleOfChat(sql, chatId),
-    sql<{ user_id: number; kind: string; value: string }[]>`
-      SELECT user_id, kind, value FROM facts
-      WHERE chat_id = ${chatId} AND (status = 'manual' OR (status = 'auto' AND confidence >= ${MIN_VISIBLE_CONFIDENCE}))
-      ORDER BY user_id, array_position(${[...FACT_KINDS]}::text[], kind), status = 'manual' DESC, confidence DESC, id`,
-    listProjects(sql, chatId, { sort: "top" }),
-    sql<{ title: string; summary: string; period_to: Date }[]>`
-      SELECT title, summary, period_to FROM chronicle
-      WHERE chat_id = ${chatId} AND importance >= 2 AND period_to > now() - ${`${CHRONICLE_DAYS} days`}::interval
-      ORDER BY period_to DESC LIMIT ${CHRONICLE_ENTRIES}`,
-    sql<{ msg_id: number; text: string; media_type: string | null; reply_to_bot: boolean; reply_to_msg_id: number | null; display_name: string | null }[]>`
-      SELECT m.msg_id, m.text, m.media_type, m.reply_to_bot, m.reply_to_msg_id, u.display_name
-      FROM messages m LEFT JOIN users u ON u.id = m.user_id
-      WHERE m.chat_id = ${chatId} AND m.msg_id < ${message.message_id} AND m.msg_id <> ALL(${skipped}::bigint[])
-        AND (btrim(m.text) <> '' OR m.media_type IS NOT NULL)
-      ORDER BY m.msg_id DESC LIMIT ${CONTEXT_MESSAGES}`,
-  ]);
-
-  const factsOf = new Map<number, Map<string, string[]>>();
-  for (const fact of facts) {
-    const kinds = factsOf.get(fact.user_id) ?? new Map<string, string[]>();
-    kinds.set(fact.kind, [...(kinds.get(fact.kind) ?? []), fact.value]);
-    factsOf.set(fact.user_id, kinds);
-  }
-  // peopleOfChat lists the most recently active first.
-  const members = people.slice(0, MAX_MEMBERS).map((person) => {
-    const who = safe(`${person.display_name}${person.username ? ` (@${person.username})` : ""}`);
-    if (person.opted_out) return `- ${who}: asked not to collect anything about them`;
-    let room = MAX_FACTS_PER_MEMBER;
-    const card = [...(factsOf.get(person.id) ?? new Map<string, string[]>())].flatMap(([kind, values]) => {
-      const kept = values.slice(0, Math.max(0, room));
-      room -= kept.length;
-      return kept.length ? [`${kind.replace("_", " ")}: ${safe(kept.join(", "))}`] : [];
-    });
-    return `- ${who}${person.tagline ? ` — ${safe(person.tagline)}` : ""}${card.length ? ` | ${card.join("; ")}` : ""}`;
-  });
-
-  const catalog = projects.slice(0, MAX_PROJECTS).map((project, index) => {
-    const links = [project.links.repo, project.links.site, ...(project.links.other ?? [])].filter(Boolean).join(" ");
-    const signals = project.recent_signals.map((signal) => signal.note).slice(0, 3);
-    return safe([
-      `${index + 1}. ${project.name} — ${project.status.replace("_", " ")}, ${project.score} rating points, ${project.votes} vote(s)`,
-      project.authors.length ? `by ${project.authors.map((author) => author.display_name).join(", ")}` : "",
-      project.tagline ? `“${project.tagline}”` : "",
-      project.stack.length ? `stack: ${project.stack.join(", ")}` : "",
-      links ? `links: ${links}` : "",
-      signals.length ? `recent: ${signals.join("; ")}` : "",
-    ]
-      .filter(Boolean)
-      .join("; "));
-  });
-
-  const day = (date: Date) => date.toLocaleDateString("en-CA", { timeZone: timezone });
-  const topics = chronicle.map((entry) => `- ${day(entry.period_to)}: ${safe(`${entry.title} — ${entry.summary}`)}`);
-  const latest = recent
-    .reverse()
-    .map((row) => `[${row.msg_id}] ${safe(row.display_name ?? "someone")}${row.reply_to_bot ? " ↩Waggle" : row.reply_to_msg_id ? ` ↩${row.reply_to_msg_id}` : ""}${row.media_type ? ` [${row.media_type}]` : ""}: ${line(row.text, 500)}`);
-
-  const replied = realReply(message);
-  const repliedToBot = replied?.from?.id === me.id ? (replied.text ?? replied.caption ?? "") : "";
-  const asker = `${question.from.first_name}${question.from.last_name ? ` ${question.from.last_name}` : ""}${question.from.username ? ` (@${question.from.username})` : ""}`;
-
-  return [
-    `<chat title="${safe(question.chatTitle ?? "").replace(/"/g, "'")}" today="${day(new Date())}" />`,
-    `<members>\n${members.join("\n") || "(none yet)"}\n</members>`,
-    `<projects rating="best first">\n${catalog.join("\n") || "(none yet)"}\n</projects>`,
-    `<chronicle days="${CHRONICLE_DAYS}" order="newest first">\n${topics.join("\n") || "(nothing yet)"}\n</chronicle>`,
-    `<recent_messages>\n${latest.join("\n") || "(none)"}\n</recent_messages>`,
-    recentAnswers.length
-      ? `<your_recent_answers>\n${recentAnswers.map((answer) => `- to ${safe(answer.to)}: ${line(answer.text, 600)}`).join("\n")}\n</your_recent_answers>`
-      : "",
-    repliedToBot ? `<your_message_they_reply_to>\n${line(repliedToBot, 1500)}\n</your_message_they_reply_to>` : "",
-    `<if_insulted motif="${INSULT_MOTIFS[Math.floor(Math.random() * INSULT_MOTIFS.length)]}" />`,
-    `<question from="${safe(asker).replace(/"/g, "'")}">\n${line(questionText(message, me), 1500)}\n</question>`,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
 }
 
 /** Spending on answers this month, across all chats. */
@@ -323,8 +201,9 @@ export function createAssistant(deps: AssistantDeps): Assistant {
   const chatLanguage = async (chatId: number): Promise<string | null> => {
     const known = chatLanguages.get(chatId);
     if (known && Date.now() - known.at < HOUR_MS) return known.language;
+    // The bot's own messages do not count: its commands answer in English in any chat.
     const rows = await sql<{ text: string }[]>`
-      SELECT text FROM messages WHERE chat_id = ${chatId} AND NOT is_forward AND btrim(text) <> ''
+      SELECT text FROM messages WHERE chat_id = ${chatId} AND NOT is_forward AND NOT from_bot AND btrim(text) <> ''
       ORDER BY msg_id DESC LIMIT 200`;
     const language = detectLanguage(rows.map((row) => row.text));
     chatLanguages.set(chatId, { language, at: Date.now() });
@@ -411,7 +290,13 @@ export function createAssistant(deps: AssistantDeps): Assistant {
     const model = premium ? config.REPLY_PREMIUM_MODEL : config.REPLY_MODEL;
     await api.sendChatAction(chatId, "typing", thread).catch(() => {});
     // Both models get the same context: the chat's latest messages, the bot's latest answers there and the replied-to message.
-    const context = await buildReplyContext(sql, question, config.DISPLAY_TIMEZONE, answersIn.get(chatId) ?? []);
+    const context = await buildReplyContext(sql, question, {
+      timezone: config.DISPLAY_TIMEZONE,
+      model,
+      ownerTgIds: config.ADMIN_TG_IDS,
+      recentAnswers: answersIn.get(chatId) ?? [],
+      insultMotif: INSULT_MOTIFS[Math.floor(Math.random() * INSULT_MOTIFS.length)]!,
+    });
     const response = await anthropic.messages.create(
       {
         model,
@@ -432,8 +317,8 @@ export function createAssistant(deps: AssistantDeps): Assistant {
     }
     const text = textOf(response.content);
     if (!text) return void (await note("failed"));
-    await send(truncate(text, 3900));
-    const answers = [...(answersIn.get(chatId) ?? []), { to: from.first_name, text }].slice(-RECENT_ANSWERS);
+    const sent = await send(truncate(text, 3900));
+    const answers = [...(answersIn.get(chatId) ?? []), { to: from.first_name, text, msgId: sent.message_id }].slice(-RECENT_ANSWERS);
     answersIn.set(chatId, answers);
   };
 

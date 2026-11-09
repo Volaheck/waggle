@@ -9,11 +9,11 @@ Honeybees do a *waggle dance* to tell the hive where the good flowers are. Waggl
 ## What it does
 
 - **Chronicle — "the main stuff".** Not a transcript but a digest: the chronicler picks the events that mattered and rates each from 1 to 5. The chronicle tab shows the top 5 for a day, 10 for a week, 15 for a month. `/catchup` sends you what you missed.
-- **Member cards.** Role, stack, expertise, interests — collected from the conversation as it happens, with a link to the message each fact came from. People edit, hide or remove anything about themselves.
+- **Member cards.** Role, stack, expertise, interests, what someone is looking for in their work and what they can help with — collected from the conversation as it happens, with a link to the message each fact came from. People edit, hide or remove anything about themselves.
 - **Project catalog with a rating.** Projects are detected from the chat; the rating comes from real signals the chronicler notices — feedback, actual usage, contributions, releases — plus 👍 votes, with anti-gaming rules.
 - **No duplicates, by meaning.** «GPT-6», «ChatGPT» and «Codex» are one fact; a topic about *Nova Glass* goggles is not linked to a member's project called *nova*. Deterministic rules catch the obvious cases, a weekly LLM clean-up catches the rest.
 - **Any number of chats.** Add the bot to another group and, once an owner approves it, that chat gets its own chronicle, cards and catalog. A person in two chats has two independent cards; nothing leaks between chats.
-- **Ask the bot.** Mention @waggle_robot or reply to its message and it answers from what it knows: who knows what, which projects lead the rating, what the chat discussed. It answers with Claude Haiku, only talks (it never changes cards or the rating) and has its own monthly cap.
+- **Ask the bot.** Mention @waggle_robot or reply to its message and it answers from what it knows: who knows what, which projects lead the rating and why, what the chat discussed. It follows a conversation back to where it started (its own messages included), knows when each message was written, who the people named in a question are — by name, @username, nickname or the other alphabet — and who built it; asked to settle an argument, it reads the whole argument. It answers with Claude Haiku, only talks (it never changes cards or the rating) and has its own monthly cap.
 - **Full-featured text bot + Mini App.** Everything works through commands and inline buttons; the Mini App (React) mirrors it with a calm UI that follows the Telegram light/dark theme.
 
 ## How it spends tokens
@@ -28,6 +28,8 @@ Bot commands never call the LLM — they read the database. Only a mention of th
 | `/who @user` (or as a reply) | someone's card |
 | `/people` | all members |
 | `/whoknows topic` | who has experience with a topic |
+| `/alias me Name`, `/aliases`, `/unalias Name` | what the chat calls you; all such names; remove one (yours, or any for an owner) |
+| `/alias @username Name`, `/alias #project Name` | owner: what the chat calls a member; owner or the project's author: another name of a project |
 | `/top`, `/projects` | project rating: top, active, new |
 | `/project name` | project card, 👍 vote, editing for authors |
 | `/addproject url description` | add your project |
@@ -74,6 +76,6 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together
 
 ## Privacy
 
-Waggle never records politics, health, finances, private life, addresses or secrets — the prompts forbid it and a stop-list filters it. Only text goes to Claude, never photos or files, and phone numbers, emails, card and account numbers and pasted secrets are masked before it does. If Claude keeps refusing a chat's messages, the chronicler pauses there until a bot owner resumes it. Every fact links to its source message, people can hide or remove facts (a removed fact never comes back, even reworded), and `/forgetme` deletes everything about a person.
+Waggle never records politics, health (sleep and mental state included), finances, private life and marriage, citizenship and documents, death, addresses or secrets — the prompts forbid it and a stop-list filters it. Only text goes to Claude, never photos or files, and phone numbers, emails, card and account numbers and pasted secrets are masked before it does. If Claude keeps refusing a chat's messages, the chronicler pauses there until a bot owner resumes it. Every fact links to its source message, people can hide or remove facts (a removed fact never comes back, even reworded), and `/forgetme` deletes everything about a person, the names the chat calls them by included.
 
-Message texts are kept for 7 days (`MESSAGE_RETENTION_DAYS`): after that, as soon as the chronicler has processed a message, its text is deleted. What stays of the message is its author and time, so links to source messages and activity counts keep working. A message the chronicler has not processed yet — say, while a spending cap pauses it — keeps its text until it has been processed.
+Message texts are kept for 7 days (`MESSAGE_RETENTION_DAYS`): after that, as soon as the chronicler has processed a message, its text is deleted. The bot's own messages in a group are kept the same way, so it can follow a conversation with it; deleting your message texts with `/forgetme` deletes the bot's answers to them as well. What stays of the message is its author and time, so links to source messages and activity counts keep working. A message the chronicler has not processed yet — say, while a spending cap pauses it — keeps its text until it has been processed.

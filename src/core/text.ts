@@ -16,26 +16,34 @@ export function normalizeValue(value: string): string {
 const FORBIDDEN_STEMS = [
   "политик", "путин", "зеленск", "трамп", "войн", "всу", "мобилиз", "оппозиц", "санкци",
   "здоров", "болезн", "болеет", "диагноз", "лечени", "таблетк", "депресс", "терапи", "врач",
+  "суицид", "самоубий", "бессонниц", "недосып", "скончал",
   "зарплат", "ипотек", "налог", "сбережен", "задолж",
-  "девушк", "развод", "отношени", "свидани", "секс",
+  "девушк", "развод", "отношени", "свидани", "секс", "женат", "неженат", "замуж",
   "адрес", "улиц", "квартир", "прописк",
-  "религи", "национальн", "ориентац",
+  "религи", "национальн", "ориентац", "гражданств", "паспорт", "внж", "вид на жительств",
   "politic", "putin", "zelensk", "mobiliz", "mobilis", "sanction",
   "illness", "disease", "diagnosis", "diagnosed", "medicat", "depression", "depressed", "therap", "hospital", "pregnan", "mental health",
+  "suicid", "insomni", "funeral",
   "salar", "mortgage",
   "girlfriend", "boyfriend", "divorc", "sexual",
   "home address", "apartment",
-  "religio", "nationalit", "ethnic",
+  "religio", "nationalit", "ethnic", "citizenship",
 ];
 
 /** Short words that are forbidden only as whole words («долг», but not «долгие»; «tax», but not «taxi»). */
 const FORBIDDEN_WORDS = [
-  "долг", "долги", "долгов", "жена", "жены", "жене", "муж", "мужа", "мужем",
+  "долг", "долги", "долгов", "жена", "жены", "жене", "муж", "мужа", "мужем", "зп",
   "war", "wars", "trump", "tax", "taxes", "loan", "loans", "wife", "wives", "husband", "husbands", "sex",
 ];
 
+/**
+ * Words whose stem a tech chat also uses in another sense: funerals, but not «похоронили фичу»;
+ * a passport, but not the Passport.js library or its passport-* strategies.
+ */
+const FORBIDDEN_FORMS = [String.raw`похорон(?:ы|ам|ами|ах|н\p{L}*)?(?!\p{L})`, String.raw`passport(?!(?: |-)?js(?!\p{L})|-)`];
+
 const FORBIDDEN_PATTERN = new RegExp(
-  `(?<![\\p{L}])(?:${FORBIDDEN_STEMS.join("|")})|(?<![\\p{L}])(?:${FORBIDDEN_WORDS.join("|")})(?![\\p{L}])`,
+  `(?<![\\p{L}])(?:${[...FORBIDDEN_STEMS, ...FORBIDDEN_FORMS].join("|")})|(?<![\\p{L}])(?:${FORBIDDEN_WORDS.join("|")})(?![\\p{L}])`,
   "u",
 );
 
@@ -166,6 +174,58 @@ export function nameKey(name: string): string {
     .join("")
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim();
+}
+
+/** Cyrillic letters as names are usually spelt in Latin («Михаил» → «Mikhail», «Юлия» → «Yuliya»); slugs keep their own table. */
+const NAME_LETTERS_TO_LATIN: Record<string, string> = {
+  а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "yo", ж: "zh", з: "z", и: "i", й: "y", к: "k", л: "l", м: "m", н: "n",
+  о: "o", п: "p", р: "r", с: "s", т: "t", у: "u", ф: "f", х: "kh", ц: "ts", ч: "ch", ш: "sh", щ: "shch", ъ: "", ы: "y", ь: "",
+  э: "e", ю: "yu", я: "ya", і: "i", ї: "yi", є: "ye", ґ: "g", ў: "u",
+};
+
+/** Latin spellings of names back to Cyrillic, tried longest first: «Anatoliy» → «Анатолий», «Zhanna» → «Жанна», «Alex» → «Алекс». */
+const NAME_SPELLINGS_TO_CYRILLIC: [string, string][] = (
+  [
+    ["shch", "щ"], ["sch", "щ"], ["iya", "ия"], ["yo", "ё"], ["yu", "ю"], ["ya", "я"], ["ye", "е"], ["zh", "ж"], ["kh", "х"], ["ch", "ч"],
+    ["sh", "ш"], ["ts", "ц"], ["ph", "ф"], ["th", "т"], ["ck", "к"], ["iy", "ий"], ["yy", "ый"], ["ey", "ей"], ["ay", "ай"],
+    ["oy", "ой"], ["uy", "уй"], ["ia", "ия"], ["ce", "се"], ["ci", "си"], ["x", "кс"], ["j", "дж"], ["w", "в"], ["q", "к"],
+    ["c", "к"], ["h", "х"], ["y", "и"], ["a", "а"], ["b", "б"], ["v", "в"], ["g", "г"], ["d", "д"], ["e", "е"], ["z", "з"],
+    ["i", "и"], ["k", "к"], ["l", "л"], ["m", "м"], ["n", "н"], ["o", "о"], ["p", "п"], ["r", "р"], ["s", "с"], ["t", "т"],
+    ["u", "у"], ["f", "ф"],
+  ] as [string, string][]
+).sort((a, b) => b[0].length - a[0].length);
+
+function withCaseOf(source: string, result: string): string {
+  if (source.length > 1 && source === source.toUpperCase()) return result.toUpperCase();
+  return source[0] === source[0]!.toLowerCase() ? result : result.charAt(0).toUpperCase() + result.slice(1);
+}
+
+function cyrillicToLatin(word: string): string {
+  return withCaseOf(word, [...word.toLowerCase()].map((char) => NAME_LETTERS_TO_LATIN[char] ?? char).join(""));
+}
+
+function latinToCyrillic(word: string): string {
+  const lower = word.toLowerCase();
+  let result = "";
+  for (let at = 0; at < lower.length; ) {
+    const rule = NAME_SPELLINGS_TO_CYRILLIC.find(([latin]) => lower.startsWith(latin, at));
+    result += rule ? rule[1] : lower[at];
+    at += rule ? rule[0].length : 1;
+  }
+  return withCaseOf(word, result);
+}
+
+/**
+ * A name as it may be written in the other alphabet: «Gleb» → «Глеб», «Тор» → «Tor»; a name mixing both gets both.
+ * Best effort, letter by letter: «Mike» comes out as «Мике», not «Майк».
+ */
+export function transliterateName(name: string): string[] {
+  const cleaned = name.normalize("NFKC").replace(/[^\p{L}\p{N}\s.'-]+/gu, " ").replace(/\s+/g, " ").trim();
+  const variants = [
+    /\p{Script=Cyrillic}/u.test(cleaned) ? cleaned.replace(/\p{Script=Cyrillic}+/gu, cyrillicToLatin) : "",
+    /\p{Script=Latin}/u.test(cleaned) ? cleaned.replace(/\p{Script=Latin}+/gu, latinToCyrillic) : "",
+  ];
+  return [...new Set(variants)].filter((variant) => /\p{L}/u.test(variant) && variant.toLowerCase() !== cleaned.toLowerCase());
 }
 
 /** Cuts on whole characters: half an emoji is invalid UTF-16, and Telegram refuses the message. */

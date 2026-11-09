@@ -25,6 +25,8 @@ export interface StoredMessage {
   is_forward: boolean;
   forward_source: string | null;
   media_type: string | null;
+  /** Posted by the bot itself (user_id is NULL). */
+  from_bot?: boolean;
 }
 
 /** Returns false when the message was stored already (Telegram delivered the update again). */
@@ -44,6 +46,32 @@ export async function saveMessage(sql: Sql, message: IncomingMessage): Promise<b
           left_at = NULL`;
   }
   return inserted.count > 0;
+}
+
+export interface OutgoingMessage {
+  chatId: number;
+  msgId: number;
+  sentAt: Date;
+  text: string;
+  replyToMsgId: number | null;
+}
+
+/**
+ * Telegram never sends the bot its own messages, so what it posts in an approved group is stored here, without an
+ * author. The chronicler goes through these rows like any others (as context it never takes facts from), and the
+ * usual retention clears their texts.
+ */
+export async function saveBotMessage(sql: Queryable, message: OutgoingMessage): Promise<boolean> {
+  const inserted = await sql`
+    INSERT INTO messages (chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, from_bot)
+    SELECT ${message.chatId}, ${message.msgId}, NULL, ${message.sentAt}, ${message.text}, ${message.replyToMsgId}, true
+    WHERE EXISTS (SELECT 1 FROM chats WHERE id = ${message.chatId} AND status = 'approved')
+    ON CONFLICT (chat_id, msg_id) DO NOTHING`;
+  return inserted.count > 0;
+}
+
+export async function updateBotMessage(sql: Queryable, chatId: number, msgId: number, text: string, editedAt: Date): Promise<void> {
+  await sql`UPDATE messages SET text = ${text}, edited_at = ${editedAt} WHERE chat_id = ${chatId} AND msg_id = ${msgId} AND from_bot`;
 }
 
 export async function updateEditedMessage(sql: Sql, chatId: number, msgId: number, text: string, editedAt: Date): Promise<void> {

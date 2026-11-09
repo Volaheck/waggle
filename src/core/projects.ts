@@ -68,11 +68,24 @@ const RATING = {
   abandonedMultiplier: 0.3,
 } as const;
 
+/** An abandoned project's score is multiplied by this; the bot may say so, unlike the other weights. */
+export const ABANDONED_MULTIPLIER = RATING.abandonedMultiplier;
+
+/** What one signal adds to the score today: its impact by the kind's weight, fading with age (the window is applied apart). */
+function signalPoints(sql: Sql, signal: string) {
+  const weights = RATING.kindWeight;
+  const row = sql.unsafe(signal);
+  return sql`${row}.impact * CASE ${row}.kind
+      WHEN 'usage' THEN ${weights.usage}::numeric WHEN 'contribution' THEN ${weights.contribution}::numeric
+      WHEN 'praise' THEN ${weights.praise}::numeric WHEN 'milestone' THEN ${weights.milestone}::numeric
+      WHEN 'critique' THEN ${weights.critique}::numeric ELSE ${weights.interest}::numeric END
+    * exp(-extract(epoch FROM now() - ${row}.happened_at) / (86400.0 * ${RATING.decayDays}::numeric))`;
+}
+
 export async function listProjects(sql: Sql, chatId: number, options: { sort?: ProjectSort; viewerUserId?: number; limit?: number } = {}): Promise<ProjectListItem[]> {
   const sort = options.sort ?? "top";
   const viewer = options.viewerUserId ?? 0;
   const limit = options.limit ?? 200;
-  const weights = RATING.kindWeight;
   const orderBy =
     sort === "new"
       ? sql`p.created_at DESC`
@@ -84,11 +97,7 @@ export async function listProjects(sql: Sql, chatId: number, options: { sort?: P
       SELECT ps.project_id,
              count(*)::int AS signals_count,
              max(ps.happened_at) AS last_signal,
-             sum(ps.impact * CASE ps.kind
-                   WHEN 'usage' THEN ${weights.usage}::numeric WHEN 'contribution' THEN ${weights.contribution}::numeric
-                   WHEN 'praise' THEN ${weights.praise}::numeric WHEN 'milestone' THEN ${weights.milestone}::numeric
-                   WHEN 'critique' THEN ${weights.critique}::numeric ELSE ${weights.interest}::numeric END
-                 * exp(-extract(epoch FROM now() - ps.happened_at) / (86400.0 * ${RATING.decayDays}::numeric))) AS signal_points
+             sum(${signalPoints(sql, "ps")}) AS signal_points
       FROM project_signals ps
       WHERE NOT ps.hidden AND ps.happened_at > now() - ${`${RATING.windowDays} days`}::interval
       GROUP BY ps.project_id
@@ -110,6 +119,62 @@ export async function listProjects(sql: Sql, chatId: number, options: { sort?: P
     WHERE p.chat_id = ${chatId} AND NOT p.hidden
     ORDER BY ${orderBy}
     LIMIT ${limit}`;
+}
+
+export interface RatedSignal {
+  kind: string;
+  impact: number;
+  note: string;
+  happened_at: Date;
+  /** What it adds to the score today; 0 once it is older than the rating window. */
+  points: number;
+}
+
+export interface RatingBreakdown {
+  /** When each vote was cast; who cast it is never part of this. */
+  votes: Date[];
+  /** Every shown signal of all time, newest first. */
+  signals: RatedSignal[];
+}
+
+export async function ratingBreakdown(sql: Sql, projectIds: number[]): Promise<Map<number, RatingBreakdown>> {
+  const breakdown = new Map<number, RatingBreakdown>(projectIds.map((id) => [id, { votes: [], signals: [] }]));
+  if (projectIds.length === 0) return breakdown;
+  const [votes, signals] = await Promise.all([
+    sql<{ project_id: number; created_at: Date }[]>`SELECT project_id, created_at FROM votes WHERE project_id = ANY(${projectIds}) ORDER BY created_at`,
+    sql<(RatedSignal & { project_id: number })[]>`
+      SELECT ps.project_id, ps.kind, ps.impact, ps.note, ps.happened_at,
+             CASE WHEN ps.happened_at > now() - ${`${RATING.windowDays} days`}::interval THEN (${signalPoints(sql, "ps")})::float8 ELSE 0 END AS points
+      FROM project_signals ps
+      WHERE ps.project_id = ANY(${projectIds}) AND NOT ps.hidden
+      ORDER BY ps.happened_at DESC`,
+  ]);
+  for (const vote of votes) breakdown.get(vote.project_id)?.votes.push(vote.created_at);
+  for (const { project_id: projectId, ...signal } of signals) breakdown.get(projectId)?.signals.push(signal);
+  return breakdown;
+}
+
+export interface FormerName {
+  project_id: number;
+  name: string;
+  at: Date;
+  /** A duplicate entry folded into the project, rather than a rename. */
+  merged: boolean;
+}
+
+/** Names the chat's projects had before: renames, and the duplicate entries folded into them. Oldest first. */
+export async function formerNames(sql: Sql, chatId: number): Promise<FormerName[]> {
+  return sql<FormerName[]>`
+    SELECT project_id, name, at, merged FROM (
+      SELECT l.id, l.entity_id AS project_id, l.before->>'name' AS name, l.at, false AS merged
+      FROM change_log l JOIN projects p ON p.id = l.entity_id
+      WHERE l.entity = 'project' AND l.op = 'rename' AND p.chat_id = ${chatId} AND l.before->>'name' IS NOT NULL
+      UNION ALL
+      SELECT l.id, (l.after->>'into')::int, folded.name, l.at, true
+      FROM change_log l JOIN projects folded ON folded.id = l.entity_id
+      WHERE l.entity = 'project' AND l.op = 'merged_into' AND folded.chat_id = ${chatId}
+    ) AS history
+    ORDER BY id`;
 }
 
 export const RATING_EXPLANATION = [
@@ -614,7 +679,16 @@ export async function setMemberRole(sql: Sql, projectId: number, userId: number,
     ON CONFLICT (project_id, user_id) DO UPDATE SET role = excluded.role`;
 }
 
-/** Folds duplicate catalog entries into one: authors, votes, signals and links move over, the rest is hidden. */
+/** A folded project's aliases name the project it went into; one that project already has is dropped. */
+export async function moveProjectAliases(tx: Queryable, fromId: number, intoId: number): Promise<void> {
+  await tx`
+    UPDATE aliases a SET project_id = ${intoId}
+    WHERE a.project_id = ${fromId}
+      AND NOT EXISTS (SELECT 1 FROM aliases x WHERE x.chat_id = a.chat_id AND x.project_id = ${intoId} AND x.alias_norm = a.alias_norm)`;
+  await tx`DELETE FROM aliases WHERE project_id = ${fromId}`;
+}
+
+/** Folds duplicate catalog entries into one: authors, votes, signals, aliases and links move over, the rest is hidden. */
 export async function mergeProjects(sql: Sql, chatId: number, intoSlug: string, fromSlugs: string[]): Promise<number> {
   return sql.begin(async (tx) => {
     const [into] = await tx<Project[]>`SELECT * FROM projects WHERE chat_id = ${chatId} AND slug = ${intoSlug} AND NOT hidden FOR UPDATE`;
@@ -631,6 +705,7 @@ export async function mergeProjects(sql: Sql, chatId: number, intoSlug: string, 
         ON CONFLICT DO NOTHING`;
       await tx`UPDATE project_signals SET project_id = ${into.id} WHERE project_id = ${project.id}`;
       await tx`UPDATE chronicle SET project_id = ${into.id} WHERE project_id = ${project.id}`;
+      await moveProjectAliases(tx, project.id, into.id);
       const links = { ...project.links, ...into.links, other: [...new Set([...(into.links.other ?? []), ...(project.links.other ?? [])])] };
       await tx`
         UPDATE projects SET

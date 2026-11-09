@@ -1,3 +1,4 @@
+import { moveAliases } from "./aliases.js";
 import type { Chat, ChatStatus } from "./chats.js";
 import type { Queryable, Sql } from "./db.js";
 import { freeSlug } from "./projects.js";
@@ -117,6 +118,9 @@ async function moveChatData(tx: Queryable, from: number, to: number): Promise<Ch
   await tx`DELETE FROM facts f USING members m WHERE f.chat_id = ${to} AND m.chat_id = ${to} AND m.user_id = f.user_id AND m.opted_out`;
   await tx`DELETE FROM rejected_facts r USING members m WHERE r.chat_id = ${to} AND m.chat_id = ${to} AND m.user_id = r.user_id AND m.opted_out`;
   await tx`UPDATE members SET tagline = NULL, tagline_manual = false WHERE chat_id = ${to} AND opted_out AND tagline IS NOT NULL`;
+
+  // Projects keep their ids, so a project's aliases only change chats.
+  await moveAliases(tx, from, to);
 
   // A project keeps its id (votes, authors and signals stay attached); a slug the new id already uses gets a suffix.
   const projects = await tx<{ id: number; slug: string }[]>`SELECT id, slug FROM projects WHERE chat_id = ${from} ORDER BY hidden, id`;

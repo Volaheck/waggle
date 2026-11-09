@@ -179,6 +179,7 @@ async function applyOptOut(tx: Queryable, userId: number, optedOut: boolean, sco
   if (optedOut) {
     await tx`DELETE FROM facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     await tx`DELETE FROM rejected_facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
+    await tx`DELETE FROM aliases WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     // Notes on how the person uses others' projects are shown on those project cards, so they go as well.
     await tx`
       DELETE FROM project_signals s USING projects p
@@ -196,13 +197,18 @@ export async function setOptOut(sql: Sql, userId: number, optedOut: boolean, cha
 
 /**
  * /forgetme and "stop collecting" in one chat (or, without a chat id, everywhere). With `messages` the text of
- * the person's messages is blanked too.
+ * the person's messages is blanked too, and so is the text of the bot's answers to them.
  */
 export async function forgetUser(sql: Sql, userId: number, options: { chatId?: number; messages: boolean }): Promise<void> {
   const scope = options.chatId ?? null;
   await sql.begin(async (tx) => {
     await applyOptOut(tx, userId, true, scope);
     if (!options.messages) return;
+    await tx`
+      UPDATE messages answer SET text = '', extracted_at = now()
+      FROM messages asked
+      WHERE answer.from_bot AND asked.chat_id = answer.chat_id AND asked.msg_id = answer.reply_to_msg_id
+        AND asked.user_id = ${userId} AND (${scope}::bigint IS NULL OR answer.chat_id = ${scope}::bigint)`;
     await tx`
       UPDATE messages SET text = '', extracted_at = now()
       WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;

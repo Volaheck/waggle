@@ -1,5 +1,5 @@
 import type Anthropic from "@anthropic-ai/sdk";
-import { Bot, GrammyError, InlineKeyboard } from "grammy";
+import { Bot, GrammyError, InlineKeyboard, type Transformer } from "grammy";
 import type { Message, User as TelegramUser } from "grammy/types";
 import { migrateChat } from "../core/chat-migration.js";
 import { allChats, approvedChats, attachLegacyData, chatsOfUser, getChat, isApproved, legacyStats, registerChat, resumeChronicle, setChatStatus, setCurrentChat } from "../core/chats.js";
@@ -15,9 +15,11 @@ import { nextConsolidationRetryAt } from "../worker/consolidate.js";
 import { chatBudgetUsd, nextExtractionRetryAt } from "../worker/scheduler.js";
 import { registerCatalog } from "./catalog.js";
 import { catchupHtml, clampTelegram, countOf, formatDate, userHeader } from "./format.js";
+import { registerAliases } from "./aliases.js";
 import { createAssistant, isAddressedToBot, PREMIUM_REPLY_PURPOSE, repliesSpendUsd, type Assistant, type AssistantDeps } from "./assistant.js";
 import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
 import { isInChat, MembershipCache } from "./membership.js";
+import { outgoingLog } from "./outgoing.js";
 import { registerProfile } from "./profile.js";
 
 export interface BotDeps {
@@ -27,6 +29,8 @@ export interface BotDeps {
   anthropic?: Anthropic;
   /** Tests shorten the answers' rate limits. */
   answerLimits?: AssistantDeps["limits"];
+  /** Tests stand in for Telegram here: installed first, so the log of the bot's own messages runs on top of it. */
+  transport?: Transformer;
 }
 
 const GROUP_COMMANDS = [
@@ -36,6 +40,7 @@ const GROUP_COMMANDS = [
   { command: "chronicle", description: "Chronicle: what people talked about" },
   { command: "catchup", description: "What I missed (sent to DM)" },
   { command: "whoknows", description: "Who knows a topic" },
+  { command: "aliases", description: "What people and projects are called here" },
   { command: "help", description: "What the bot can do" },
 ];
 
@@ -46,6 +51,7 @@ const PRIVATE_COMMANDS = [
   { command: "people", description: "Members" },
   { command: "top", description: "Project rating" },
   { command: "whoknows", description: "Who knows a topic" },
+  { command: "aliases", description: "What people and projects are called here" },
   { command: "addproject", description: "Add your project" },
   { command: "whatyouknow", description: "What the bot knows about me" },
   { command: "forgetme", description: "Delete everything about me" },
@@ -62,6 +68,7 @@ const HELP_TEXT = [
   "/who @username — who this is (or reply to a message with the command)",
   "/people — all members",
   "/whoknows topic — who knows the topic",
+  "/alias me Name — what the chat calls you (/aliases — all such names)",
   "",
   "<b>Projects</b>",
   "/top — the chat's project rating",
@@ -149,6 +156,8 @@ export function createBot(deps: BotDeps): {
   const assistant =
     deps.anthropic && config.REPLIES_MONTHLY_BUDGET_USD > 0 ? createAssistant({ sql, anthropic: deps.anthropic, config, limits: deps.answerLimits }) : undefined;
   const bot = new Bot<BotContext>(config.BOT_TOKEN);
+  if (deps.transport) bot.api.config.use(deps.transport);
+  bot.api.config.use(outgoingLog(sql));
   const membership = new MembershipCache(bot.api);
   const pendingOffers = new Set<Promise<void>>();
   const onJoined = (chatId: number, user: User) => {
@@ -532,6 +541,7 @@ export function createBot(deps: BotDeps): {
 
   const profile = registerProfile(kit);
   const catalog = registerCatalog(kit);
+  registerAliases(kit);
 
   // ---------- Switching chats in DM ----------
 
@@ -673,8 +683,8 @@ export function createBot(deps: BotDeps): {
         SELECT (SELECT count(*)::int FROM members WHERE chat_id = ${chat.id} AND left_at IS NULL) AS members,
                (SELECT count(*)::int FROM facts WHERE chat_id = ${chat.id} AND status IN ('auto', 'manual')) AS facts,
                (SELECT count(*)::int FROM projects WHERE chat_id = ${chat.id} AND NOT hidden) AS projects,
-               (SELECT count(*)::int FROM messages WHERE chat_id = ${chat.id}) AS messages,
-               (SELECT count(*)::int FROM messages WHERE chat_id = ${chat.id} AND extracted_at IS NULL) AS pending,
+               (SELECT count(*)::int FROM messages WHERE chat_id = ${chat.id} AND NOT from_bot) AS messages,
+               (SELECT count(*)::int FROM messages WHERE chat_id = ${chat.id} AND NOT from_bot AND extracted_at IS NULL) AS pending,
                (SELECT count(*)::int FROM chronicle WHERE chat_id = ${chat.id}) AS topics,
                (SELECT array_agg(u.display_name ORDER BY u.display_name) FROM users u JOIN members m ON m.user_id = u.id
                 WHERE m.chat_id = ${chat.id} AND u.tg_id IS NULL) AS unlinked`;

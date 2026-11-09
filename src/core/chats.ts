@@ -1,9 +1,10 @@
 import type { TransactionSql } from "postgres";
+import { moveAliases } from "./aliases.js";
 import { relinkForeignTopics } from "./chronicle.js";
 import type { Sql } from "./db.js";
 import { isSameFact } from "./facts.js";
 import { mergeSeedUser } from "./merge.js";
-import { projectForSlug } from "./projects.js";
+import { moveProjectAliases, projectForSlug } from "./projects.js";
 import { normalizeUrl } from "./text.js";
 
 export type ChatStatus = "pending" | "approved" | "rejected" | "left";
@@ -132,6 +133,8 @@ export async function attachLegacyData(sql: Sql, chatId: number, actorUserId?: n
         UPDATE messages m SET chat_id = ${chatId}
         WHERE m.chat_id = ${LEGACY_CHAT_ID} AND NOT EXISTS (SELECT 1 FROM messages x WHERE x.chat_id = ${chatId} AND x.msg_id = m.msg_id)`
     ).count;
+    // Before the projects, so an imported project merged into the chat's own takes its aliases along.
+    await moveAliases(tx, LEGACY_CHAT_ID, chatId);
     const projects = await attachProjects(tx, chatId, actorUserId ?? null);
     // Notes on how someone who opted out uses projects go too, as when they opt out themselves.
     await tx`
@@ -254,6 +257,7 @@ async function mergeImportedProject(tx: TransactionSql, imported: ProjectRow, in
     ON CONFLICT DO NOTHING`;
   await tx`UPDATE project_signals SET project_id = ${into.id} WHERE project_id = ${imported.id}`;
   await tx`UPDATE chronicle SET project_id = ${into.id} WHERE project_id = ${imported.id}`;
+  await moveProjectAliases(tx, imported.id, into.id);
   await tx`
     UPDATE projects SET
       tagline = ${tagline}, status = ${status}, stack = ${stack}, links = ${tx.json(links)},
