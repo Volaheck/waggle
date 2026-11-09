@@ -631,7 +631,7 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       };
       return { client: client as unknown as Anthropic, requests, answerWith: (next: typeof answer) => void (answer = next) };
     };
-    const answeringBot = (claude: ReturnType<typeof fakeClaude>, limits: { memberGapMs?: number; chatPerHour?: number } = {}) => {
+    const answeringBot = (claude: ReturnType<typeof fakeClaude>, limits: { memberGapMs?: number; chatPerHour?: number; memberPerHour?: number } = {}) => {
       const made = createBot({
         sql,
         config: { ...config([OWNER]), REPLY_MODEL: "claude-haiku-5-5", REPLIES_MONTHLY_BUDGET_USD: 10 } as Config,
@@ -762,6 +762,32 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       await assistant.idle();
       expect(claude.requests).toHaveLength(1);
       expect(sent().filter((text) => text.includes("answered a lot here this hour"))).toHaveLength(1);
+    });
+
+    it("tells a member who asked a lot once, in the chat's own language", async () => {
+      const RU = -1001000000077;
+      await registerChat(sql, RU, "Гамма", null);
+      await setChatStatus(sql, RU, "approved", null);
+      const anna = tg(9101, "Anna");
+      const lines = [
+        "Привет всем, как у вас сегодня дела с проектами?",
+        "Мы наконец выкатили новую версию бота в продакшен",
+        "Кто-нибудь пробовал новую модель для работы с кодом?",
+        "Вечером обсудим архитектуру и посмотрим на метрики",
+      ];
+      for (const [index, text] of lines.entries()) {
+        await saveMessage(sql, { chatId: RU, msgId: 88001 + index, userId: ids.anna!, sentAt: new Date(), text, replyToMsgId: null, isForward: false, forwardSource: null, mediaType: null });
+      }
+      const claude = fakeClaude();
+      const { bot: answering, assistant } = answeringBot(claude, { memberPerHour: 1 });
+      const askHere = (question: string) => inGroup(RU, anna, `${MENTION} ${question}`, { entities: [{ type: "mention", offset: 0, length: MENTION.length }] });
+      for (const question of ["кто здесь знает Rust?", "а кто знает Go?", "а Python кто?"]) {
+        await answering.handleUpdate(askHere(question) as never);
+        await assistant.idle();
+      }
+      expect(claude.requests).toHaveLength(1);
+      expect(sent().filter((text) => text.includes("вопросов хватит"))).toHaveLength(1);
+      expect(sent().some((text) => text.includes("plenty of questions"))).toBe(false);
     });
 
     it("answers nothing over its own monthly cap or in a paused chat, and says why once", async () => {

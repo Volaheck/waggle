@@ -3,7 +3,7 @@ import { signInitData, validateInitData } from "../src/api/init-data.js";
 import { catchupHtml, clampTelegram } from "../src/bot/format.js";
 import { extractUrls, hasForbiddenTopic, messageLink, nameKey, normalizeUrl, normalizeValue, slugify, truncate } from "../src/core/text.js";
 import { rankCards } from "../src/core/merge.js";
-import { replyEffort, replySystemPrompt } from "../src/bot/assistant.js";
+import { assistantNote, replyEffort, replySystemPrompt } from "../src/bot/assistant.js";
 import { buildExtractionPrompt, EXTRACTION_SYSTEM_PROMPT, isPassDue } from "../src/worker/extract.js";
 import { CONSOLIDATION_SYSTEM_PROMPT } from "../src/worker/consolidate.js";
 import { factCore, isNearDuplicate, isSameFact } from "../src/core/facts.js";
@@ -346,5 +346,12 @@ describe("answer prompt", () => {
       expect(replySystemPrompt(model)).not.toContain("${");
     }
     expect([replyEffort("claude-haiku-5-5"), replyEffort("claude-sonnet-5-5"), replyEffort("claude-opus-5-5")]).toEqual(["high", "high", "medium"]);
+  });
+
+  it("speaks Russian in a Russian-speaking chat and English anywhere else", () => {
+    expect(assistantNote("Russian", "memberBusy")).toContain("передышка");
+    expect(assistantNote("English", "memberBusy")).toContain("breather");
+    expect(assistantNote(null, "refused")).toBe("🐝 I'll pass on this one.");
+    expect(assistantNote("Ukrainian", "busy")).toContain("ask me again");
   });
 });

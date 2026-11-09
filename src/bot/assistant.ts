@@ -5,6 +5,7 @@ import { getChat } from "../core/chats.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
 import { FACT_KINDS, MIN_VISIBLE_CONFIDENCE } from "../core/facts.js";
+import { detectLanguage } from "../core/language.js";
 import { assertBudget, BudgetExceededError, memberEndUserId, recordUsage, textOf } from "../core/llm.js";
 import { maskPersonalData } from "../core/privacy.js";
 import { listProjects } from "../core/projects.js";
@@ -77,9 +78,10 @@ const MAX_OUTPUT_TOKENS = 4096;
 const REQUEST_TIMEOUT_MS = 60_000;
 /** One person, one answer per this interval: what they write meanwhile waits and is answered together after it. */
 const PER_MEMBER_GAP_MS = 4_000;
-const PER_CHAT_PER_HOUR = 20;
+/** Generous on purpose: banter runs fast, and REPLIES_MONTHLY_BUDGET_USD is what bounds the spending. */
+const PER_CHAT_PER_HOUR = 500;
 /** One member cannot take the whole chat's hour. */
-const PER_MEMBER_PER_HOUR = 6;
+const PER_MEMBER_PER_HOUR = 100;
 /** Refusals for different members in one chat within an hour: the cause is in the shared context, so the chat waits. */
 const CHAT_REFUSALS_BEFORE_SILENCE = 2;
 /** After the model refused someone, their mentions are ignored for this long. */
@@ -97,22 +99,42 @@ const MAX_PROJECTS = 60;
 
 const HOUR_MS = 60 * 60_000;
 
-const GREETING =
-  "🐝 Hi! Ask me about the people here, their projects, the rating or what the chat discussed: mention me or reply to my message.";
-const BUDGET_NOTE = "🐝 I've used up this month's budget for answers, so I'll be quiet until next month. The chronicle and the cards keep working.";
-const PAUSED_NOTE = "⏸ I'm paused in this chat until a bot owner resumes me.";
-const REFUSED_NOTE = "🐝 I'll pass on this one.";
-const FAILED_NOTE = "🐝 Something went wrong on my side; try again a bit later.";
-const BUSY_NOTE = "🐝 I've answered a lot here this hour; ask me again a little later.";
-const MEMBER_BUSY_NOTE = "🐝 That's plenty of questions from you for this hour; the hive needs a breather.";
-const CHAT_BUDGET_NOTE = "🐝 This chat's AI budget is used up for this month, so I'll be quiet until next month.";
+export type NoteKey = "greeting" | "budget" | "chatBudget" | "paused" | "refused" | "failed" | "busy" | "memberBusy";
+
+/** The bot's own short lines in a group: Russian in a Russian-speaking chat, English anywhere else. */
+const NOTES: Record<"English" | "Russian", Record<NoteKey, string>> = {
+  English: {
+    greeting: "🐝 Hi! Ask me about the people here, their projects, the rating or what the chat discussed: mention me or reply to my message.",
+    budget: "🐝 I've used up this month's budget for answers, so I'll be quiet until next month. The chronicle and the cards keep working.",
+    chatBudget: "🐝 This chat's AI budget is used up for this month, so I'll be quiet until next month.",
+    paused: "⏸ I'm paused in this chat until a bot owner resumes me.",
+    refused: "🐝 I'll pass on this one.",
+    failed: "🐝 Something went wrong on my side; try again a bit later.",
+    busy: "🐝 I've answered a lot here this hour; ask me again a little later.",
+    memberBusy: "🐝 That's plenty of questions from you for this hour; the hive needs a breather.",
+  },
+  Russian: {
+    greeting: "🐝 Привет! Спроси меня про людей в чате, их проекты, рейтинг или о чём здесь говорили: упомяни меня или ответь на моё сообщение.",
+    budget: "🐝 Бюджет на ответы в этом месяце кончился, так что до следующего месяца я молчу. Летопись и карточки работают как обычно.",
+    chatBudget: "🐝 Бюджет этого чата на ИИ в этом месяце кончился, так что до следующего месяца я молчу.",
+    paused: "⏸ В этом чате я на паузе, пока владелец бота меня не включит.",
+    refused: "🐝 Это я пропущу.",
+    failed: "🐝 У меня что-то сломалось, спроси чуть позже.",
+    busy: "🐝 За этот час я здесь наотвечался, спросите чуть позже.",
+    memberBusy: "🐝 С тебя на этот час вопросов хватит, улью нужна передышка.",
+  },
+};
+
+export function assistantNote(chatLanguage: string | null, key: NoteKey): string {
+  return NOTES[chatLanguage === "Russian" ? "Russian" : "English"][key];
+}
 
 export interface AssistantDeps {
   sql: Sql;
   anthropic: Anthropic;
   config: Pick<Config, "BOT_TOKEN" | "REPLY_MODEL" | "REPLIES_MONTHLY_BUDGET_USD" | "MONTHLY_LLM_BUDGET_USD" | "CHAT_MONTHLY_BUDGET_USD" | "DISPLAY_TIMEZONE">;
   /** Tests shorten these. */
-  limits?: Partial<{ memberGapMs: number; chatPerHour: number }>;
+  limits?: Partial<{ memberGapMs: number; chatPerHour: number; memberPerHour: number }>;
   log?: (line: string) => void;
 }
 
@@ -278,6 +300,20 @@ export function createAssistant(deps: AssistantDeps): Assistant {
 
   const memberGapMs = deps.limits?.memberGapMs ?? PER_MEMBER_GAP_MS;
   const chatPerHour = deps.limits?.chatPerHour ?? PER_CHAT_PER_HOUR;
+  const memberPerHour = deps.limits?.memberPerHour ?? PER_MEMBER_PER_HOUR;
+
+  /** The language the chat writes in, from its latest messages; re-measured at most once an hour. */
+  const chatLanguages = new Map<number, { language: string | null; at: number }>();
+  const chatLanguage = async (chatId: number): Promise<string | null> => {
+    const known = chatLanguages.get(chatId);
+    if (known && Date.now() - known.at < HOUR_MS) return known.language;
+    const rows = await sql<{ text: string }[]>`
+      SELECT text FROM messages WHERE chat_id = ${chatId} AND NOT is_forward AND btrim(text) <> ''
+      ORDER BY msg_id DESC LIMIT 200`;
+    const language = detectLanguage(rows.map((row) => row.text));
+    chatLanguages.set(chatId, { language, at: Date.now() });
+    return language;
+  };
   /** Per member: the answer under way, and the latest question that came in meanwhile. */
   const queues = new Map<string, Promise<void>>();
   const waiting = new Map<string, Question>();
@@ -287,7 +323,7 @@ export function createAssistant(deps: AssistantDeps): Assistant {
     const now = Date.now();
     if ((refusedUntil.get(memberKey) ?? 0) > now || (refusedUntil.get(`chat:${chatId}`) ?? 0) > now) return "refused";
     const mine = (memberAnswers.get(memberKey) ?? []).filter((at) => now - at < HOUR_MS);
-    if (mine.length >= PER_MEMBER_PER_HOUR) return "member-busy";
+    if (mine.length >= memberPerHour) return "member-busy";
     const recent = (chatAnswers.get(chatId) ?? []).filter((at) => now - at < HOUR_MS);
     if (recent.length >= chatPerHour) return "busy";
     recent.push(now);
@@ -318,32 +354,33 @@ export function createAssistant(deps: AssistantDeps): Assistant {
         reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
         link_preview_options: { is_disabled: true },
       });
+    const note = async (key: NoteKey) => send(assistantNote(await chatLanguage(chatId), key));
 
     const chat = await getChat(sql, chatId);
     if (!chat || chat.status !== "approved") return;
     if (chat.chronicle_paused_at) {
-      if (noteOnce(`paused:${chatId}`, PAUSED_NOTE_INTERVAL_MS)) await send(PAUSED_NOTE);
+      if (noteOnce(`paused:${chatId}`, PAUSED_NOTE_INTERVAL_MS)) await note("paused");
       return;
     }
     if (!questionText(message, me)) {
       // Only a bare mention is greeted, once an hour per member; a sticker or a GIF in reply to the bot is not a question.
-      if (!realReply(message) && noteOnce(`greet:${memberKey}`, HOUR_MS)) await send(GREETING);
+      if (!realReply(message) && noteOnce(`greet:${memberKey}`, HOUR_MS)) await note("greeting");
       return;
     }
     const slot = takeSlot(chatId, memberKey);
     // A member the model refused gets silence; a busy chat or a member who asked a lot hears once why they wait.
-    if (slot === "busy" && noteOnce(`busy:${chatId}`, HOUR_MS)) await send(BUSY_NOTE);
-    if (slot === "member-busy" && noteOnce(`member-busy:${memberKey}`, HOUR_MS)) await send(MEMBER_BUSY_NOTE);
+    if (slot === "busy" && noteOnce(`busy:${chatId}`, HOUR_MS)) await note("busy");
+    if (slot === "member-busy" && noteOnce(`member-busy:${memberKey}`, HOUR_MS)) await note("memberBusy");
     if (slot !== "ok") return;
     if ((await repliesSpendUsd(sql)) >= config.REPLIES_MONTHLY_BUDGET_USD) {
-      if (noteOnce(`budget:${chatId}`, NOTE_INTERVAL_MS)) await send(BUDGET_NOTE);
+      if (noteOnce(`budget:${chatId}`, NOTE_INTERVAL_MS)) await note("budget");
       return;
     }
     try {
       await assertBudget(sql, config.MONTHLY_LLM_BUDGET_USD, { id: chatId, limitUsd: chatBudgetUsd(chat, config.CHAT_MONTHLY_BUDGET_USD) });
     } catch (error) {
       if (!(error instanceof BudgetExceededError)) throw error;
-      if (noteOnce(`budget:${chatId}`, NOTE_INTERVAL_MS)) await send(CHAT_BUDGET_NOTE);
+      if (noteOnce(`budget:${chatId}`, NOTE_INTERVAL_MS)) await note("chatBudget");
       return;
     }
 
@@ -364,11 +401,11 @@ export function createAssistant(deps: AssistantDeps): Assistant {
     if (response.stop_reason === "refusal") {
       noteRefusal(chatId, memberKey);
       log(`[reply] ${chat.title ?? chatId}: the model refused (msg ${message.message_id})`);
-      await send(REFUSED_NOTE);
+      await note("refused");
       return;
     }
     const text = textOf(response.content);
-    if (!text) return void (await send(FAILED_NOTE));
+    if (!text) return void (await note("failed"));
     await send(truncate(text, 3900));
     const answers = [...(answersIn.get(chatId) ?? []), { to: from.first_name, text }].slice(-RECENT_ANSWERS);
     answersIn.set(chatId, answers);
@@ -379,8 +416,9 @@ export function createAssistant(deps: AssistantDeps): Assistant {
       log(`[reply] chat ${question.chatId}: ${error instanceof Error ? error.message : String(error)}`);
       const { message } = question;
       const thread = message.is_topic_message && message.message_thread_id ? { message_thread_id: message.message_thread_id } : {};
+      const language = await chatLanguage(question.chatId).catch(() => null);
       await api
-        .sendMessage(question.chatId, FAILED_NOTE, { ...thread, reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true } })
+        .sendMessage(question.chatId, assistantNote(language, "failed"), { ...thread, reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true } })
         .catch(() => {});
     });
 
