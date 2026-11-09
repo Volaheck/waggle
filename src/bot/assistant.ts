@@ -71,7 +71,8 @@ export const INSULT_MOTIFS = [
 ];
 
 /** The bot never receives its own messages, so it keeps its latest answers per chat to stay consistent with itself. */
-const RECENT_ANSWERS = 6;
+/** The bot's latest answers in the chat go into every prompt, so a conversation carries over when the model changes. */
+const RECENT_ANSWERS = 12;
 
 /** Room for the high-effort thinking (about 400–800 tokens measured) as well as the answer. */
 const MAX_OUTPUT_TOKENS = 4096;
@@ -132,7 +133,18 @@ export function assistantNote(chatLanguage: string | null, key: NoteKey): string
 export interface AssistantDeps {
   sql: Sql;
   anthropic: Anthropic;
-  config: Pick<Config, "BOT_TOKEN" | "REPLY_MODEL" | "REPLIES_MONTHLY_BUDGET_USD" | "MONTHLY_LLM_BUDGET_USD" | "CHAT_MONTHLY_BUDGET_USD" | "DISPLAY_TIMEZONE">;
+  config: Pick<
+    Config,
+    | "BOT_TOKEN"
+    | "REPLY_MODEL"
+    | "REPLIES_MONTHLY_BUDGET_USD"
+    | "REPLY_PREMIUM_MODEL"
+    | "REPLY_PREMIUM_PER_MEMBER_PER_HOUR"
+    | "REPLY_PREMIUM_MONTHLY_BUDGET_USD"
+    | "MONTHLY_LLM_BUDGET_USD"
+    | "CHAT_MONTHLY_BUDGET_USD"
+    | "DISPLAY_TIMEZONE"
+  >;
   /** Tests shorten these. */
   limits?: Partial<{ memberGapMs: number; chatPerHour: number; memberPerHour: number }>;
   log?: (line: string) => void;
@@ -273,9 +285,12 @@ export async function buildReplyContext(sql: Sql, question: Question, timezone: 
 }
 
 /** Spending on answers this month, across all chats. */
-export async function repliesSpendUsd(sql: Sql): Promise<number> {
+/** Usage of the stronger answering model is recorded apart, so each model has its own monthly cap. */
+export const PREMIUM_REPLY_PURPOSE = "reply_premium";
+
+export async function repliesSpendUsd(sql: Sql, purpose: "reply" | typeof PREMIUM_REPLY_PURPOSE = "reply"): Promise<number> {
   const [row] = await sql<{ total: string | null }[]>`
-    SELECT sum(cost_usd)::text AS total FROM llm_usage WHERE purpose = 'reply' AND at >= date_trunc('month', now())`;
+    SELECT sum(cost_usd)::text AS total FROM llm_usage WHERE purpose = ${purpose} AND at >= date_trunc('month', now())`;
   return Number(row?.total ?? 0);
 }
 
@@ -289,6 +304,7 @@ export function createAssistant(deps: AssistantDeps): Assistant {
   const lastNoteAt = new Map<string, number>();
   const answersIn = new Map<number, RecentAnswer[]>();
   const memberAnswers = new Map<string, number[]>();
+  const memberPremiumAnswers = new Map<string, number[]>();
   const chatRefusals = new Map<number, number[]>();
 
   const noteOnce = (key: string, interval: number) => {
@@ -372,7 +388,14 @@ export function createAssistant(deps: AssistantDeps): Assistant {
     if (slot === "busy" && noteOnce(`busy:${chatId}`, HOUR_MS)) await note("busy");
     if (slot === "member-busy" && noteOnce(`member-busy:${memberKey}`, HOUR_MS)) await note("memberBusy");
     if (slot !== "ok") return;
-    if ((await repliesSpendUsd(sql)) >= config.REPLIES_MONTHLY_BUDGET_USD) {
+    // A member's first answers in an hour come from the stronger model while its cap lasts; each model keeps its own cap.
+    const now = Date.now();
+    const premiumThisHour = (memberPremiumAnswers.get(memberKey) ?? []).filter((at) => now - at < HOUR_MS);
+    const premium =
+      config.REPLY_PREMIUM_MONTHLY_BUDGET_USD > 0 &&
+      premiumThisHour.length < config.REPLY_PREMIUM_PER_MEMBER_PER_HOUR &&
+      (await repliesSpendUsd(sql, PREMIUM_REPLY_PURPOSE)) < config.REPLY_PREMIUM_MONTHLY_BUDGET_USD;
+    if (!premium && (await repliesSpendUsd(sql)) >= config.REPLIES_MONTHLY_BUDGET_USD) {
       if (noteOnce(`budget:${chatId}`, NOTE_INTERVAL_MS)) await note("budget");
       return;
     }
@@ -384,23 +407,26 @@ export function createAssistant(deps: AssistantDeps): Assistant {
       return;
     }
 
+    if (premium) memberPremiumAnswers.set(memberKey, [...premiumThisHour, now]);
+    const model = premium ? config.REPLY_PREMIUM_MODEL : config.REPLY_MODEL;
     await api.sendChatAction(chatId, "typing", thread).catch(() => {});
+    // Both models get the same context: the chat's latest messages, the bot's latest answers there and the replied-to message.
     const context = await buildReplyContext(sql, question, config.DISPLAY_TIMEZONE, answersIn.get(chatId) ?? []);
     const response = await anthropic.messages.create(
       {
-        model: config.REPLY_MODEL,
+        model,
         max_tokens: MAX_OUTPUT_TOKENS,
-        system: replySystemPrompt(config.REPLY_MODEL),
+        system: replySystemPrompt(model),
         messages: [{ role: "user", content: context }],
-        output_config: { effort: replyEffort(config.REPLY_MODEL) },
+        output_config: { effort: replyEffort(model) },
         metadata: { user_id: memberEndUserId(config.BOT_TOKEN, chatId, from.id) },
       },
       { timeout: REQUEST_TIMEOUT_MS },
     );
-    await recordUsage(sql, "reply", config.REPLY_MODEL, response.usage, chatId);
+    await recordUsage(sql, premium ? PREMIUM_REPLY_PURPOSE : "reply", model, response.usage, chatId);
     if (response.stop_reason === "refusal") {
       noteRefusal(chatId, memberKey);
-      log(`[reply] ${chat.title ?? chatId}: the model refused (msg ${message.message_id})`);
+      log(`[reply] ${chat.title ?? chatId}: ${model} refused (msg ${message.message_id})`);
       await note("refused");
       return;
     }

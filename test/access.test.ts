@@ -631,10 +631,14 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       };
       return { client: client as unknown as Anthropic, requests, answerWith: (next: typeof answer) => void (answer = next) };
     };
-    const answeringBot = (claude: ReturnType<typeof fakeClaude>, limits: { memberGapMs?: number; chatPerHour?: number; memberPerHour?: number } = {}) => {
+    const answeringBot = (
+      claude: ReturnType<typeof fakeClaude>,
+      limits: { memberGapMs?: number; chatPerHour?: number; memberPerHour?: number } = {},
+      overrides: Partial<Config> = {},
+    ) => {
       const made = createBot({
         sql,
-        config: { ...config([OWNER]), REPLY_MODEL: "claude-haiku-5-5", REPLIES_MONTHLY_BUDGET_USD: 10 } as Config,
+        config: { ...config([OWNER]), REPLY_MODEL: "claude-haiku-5-5", REPLIES_MONTHLY_BUDGET_USD: 10, REPLY_PREMIUM_MONTHLY_BUDGET_USD: 0, ...overrides } as Config,
         anthropic: claude.client,
         answerLimits: { memberGapMs: 50, ...limits },
       });
@@ -762,6 +766,39 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       await assistant.idle();
       expect(claude.requests).toHaveLength(1);
       expect(sent().filter((text) => text.includes("answered a lot here this hour"))).toHaveLength(1);
+    });
+
+    it("gives a member's first answers in an hour to the stronger model and the rest to the base one, with the same context", async () => {
+      const claude = fakeClaude();
+      const premium = { REPLY_PREMIUM_MODEL: "claude-opus-5-5", REPLY_PREMIUM_PER_MEMBER_PER_HOUR: 2, REPLY_PREMIUM_MONTHLY_BUDGET_USD: 20 };
+      const { bot: answering, assistant } = answeringBot(claude, {}, premium);
+      for (const question of ["who knows Rust?", "and Go?", "and Python?"]) {
+        await answering.handleUpdate(ask(alice, question) as never);
+        await assistant.idle();
+      }
+      expect(claude.requests.map((request) => request.model)).toEqual(["claude-opus-5-5", "claude-opus-5-5", "claude-haiku-5-5"]);
+      expect(claude.requests.map((request) => request.effort)).toEqual(["medium", "medium", "high"]);
+      // The base model sees what the stronger one answered a moment ago.
+      expect(claude.requests[2]!.content).toContain("Alice knows Rust");
+      // Another member starts the hour with the stronger model.
+      await answering.handleUpdate(ask(bob, "what about projects?") as never);
+      await assistant.idle();
+      expect(claude.requests.at(-1)!.model).toBe("claude-opus-5-5");
+      const recorded = await sql<{ purpose: string; model: string }[]>`SELECT purpose, model FROM llm_usage ORDER BY id DESC LIMIT 4`;
+      expect(recorded.map((row) => row.purpose)).toEqual(["reply_premium", "reply", "reply_premium", "reply_premium"]);
+
+      // Once the stronger model's monthly cap is used up, answers carry on with the base model, with no note.
+      const [usage] = await sql<{ id: number }[]>`
+        INSERT INTO llm_usage (purpose, model, input_tokens, output_tokens, cost_usd) VALUES ('reply_premium', 'claude-opus-5-5', 0, 0, 20) RETURNING id`;
+      try {
+        const before = sent().length;
+        await answering.handleUpdate(ask(dave, "what's new?") as never);
+        await assistant.idle();
+        expect(claude.requests.at(-1)!.model).toBe("claude-haiku-5-5");
+        expect(sent().slice(before)).toEqual(["Alice knows Rust 🐝"]);
+      } finally {
+        await sql`DELETE FROM llm_usage WHERE id = ${usage!.id}`;
+      }
     });
 
     it("tells a member who asked a lot once, in the chat's own language", async () => {

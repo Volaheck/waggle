@@ -35,6 +35,11 @@ const EnvSchema = z.object({
   REPLY_MODEL: z.string().default("claude-haiku-5-5"),
   /** Cap for those answers across all chats, on top of the caps above; 0 turns them off. */
   REPLIES_MONTHLY_BUDGET_USD: z.coerce.number().min(0).default(10),
+  /** A member's first answers in an hour come from this stronger model while its own cap lasts; the rest from REPLY_MODEL. */
+  REPLY_PREMIUM_MODEL: z.string().default("claude-opus-5-5"),
+  REPLY_PREMIUM_PER_MEMBER_PER_HOUR: z.coerce.number().int().min(0).default(10),
+  /** Cap for the stronger model's answers across all chats, on top of REPLIES_MONTHLY_BUDGET_USD; 0 keeps every answer on REPLY_MODEL. */
+  REPLY_PREMIUM_MONTHLY_BUDGET_USD: z.coerce.number().min(0).default(0),
   WEB_DIST_DIR: z.string().default("web/dist"),
   /** Local development only: open the Mini App in a plain browser via a secret link printed at startup. */
   DEV_BROWSER_LOGIN: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),

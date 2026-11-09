@@ -48,7 +48,11 @@ if (interrupted.length) console.warn(`[extract] ${interrupted.length} pass(es) w
 const relinked = await relinkForeignTopics(sql);
 if (relinked) console.log(`[extract] relinked ${relinked} chronicle topic(s) that pointed to another chat's project`);
 
-for (const [name, model] of [["EXTRACTION_MODEL", config.EXTRACTION_MODEL], ["REPLY_MODEL", config.REPLY_MODEL]] as const) {
+for (const [name, model] of [
+  ["EXTRACTION_MODEL", config.EXTRACTION_MODEL],
+  ["REPLY_MODEL", config.REPLY_MODEL],
+  ["REPLY_PREMIUM_MODEL", config.REPLY_PREMIUM_MODEL],
+] as const) {
   if (config.ANTHROPIC_API_KEY && !isPricedModel(model)) console.warn(`[llm] no price known for ${name} “${model}”: its calls are counted at the highest known rates`);
 }
 

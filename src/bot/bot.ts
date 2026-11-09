@@ -15,7 +15,7 @@ import { nextConsolidationRetryAt } from "../worker/consolidate.js";
 import { chatBudgetUsd, nextExtractionRetryAt } from "../worker/scheduler.js";
 import { registerCatalog } from "./catalog.js";
 import { catchupHtml, clampTelegram, countOf, formatDate, userHeader } from "./format.js";
-import { createAssistant, isAddressedToBot, type Assistant, type AssistantDeps } from "./assistant.js";
+import { createAssistant, isAddressedToBot, PREMIUM_REPLY_PURPOSE, repliesSpendUsd, type Assistant, type AssistantDeps } from "./assistant.js";
 import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
 import { isInChat, MembershipCache } from "./membership.js";
 import { registerProfile } from "./profile.js";
@@ -708,6 +708,12 @@ export function createBot(deps: BotDeps): {
       );
     }
     lines.push("", `Total AI spend this month: $${(await monthSpendUsd(sql)).toFixed(3)} of $${config.MONTHLY_LLM_BUDGET_USD}`);
+    const answers = [`Answers this month: ${config.REPLY_MODEL} $${(await repliesSpendUsd(sql)).toFixed(3)} of $${config.REPLIES_MONTHLY_BUDGET_USD}`];
+    if (config.REPLY_PREMIUM_MONTHLY_BUDGET_USD > 0) {
+      const premium = await repliesSpendUsd(sql, PREMIUM_REPLY_PURPOSE);
+      answers.push(`${config.REPLY_PREMIUM_MODEL} (a member's first ${config.REPLY_PREMIUM_PER_MEMBER_PER_HOUR} an hour) $${premium.toFixed(3)} of $${config.REPLY_PREMIUM_MONTHLY_BUDGET_USD}`);
+    }
+    lines.push(answers.join("; "));
     const pending = (await allChats(sql)).filter((chat) => chat.status === "pending").length;
     if (pending) lines.push(`⏳ Chats awaiting approval: ${pending} — /chats`);
     await kit.show(ctx, lines.join("\n"));
