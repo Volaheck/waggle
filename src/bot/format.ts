@@ -2,7 +2,7 @@ import { FACT_KIND_LABELS, type Fact, type FactKind } from "../core/facts.js";
 import type { Project, ProjectListItem } from "../core/projects.js";
 import type { CatchupData, ChronicleEntry } from "../core/chronicle.js";
 import { escapeHtml, messageLink, truncate } from "../core/text.js";
-import type { User } from "../core/users.js";
+import type { Person, User } from "../core/users.js";
 
 export const STATUS_EMOJI: Record<string, string> = {
   идея: "💡",
@@ -35,7 +35,7 @@ export function userHeader(user: Pick<User, "display_name" | "username">): strin
   return `<b>${escapeHtml(user.display_name)}</b>${user.username ? ` @${escapeHtml(user.username)}` : ""}`;
 }
 
-export function personCard(user: User, facts: Fact[], projects: Project[], options: { compact?: boolean } = {}): string {
+export function personCard(user: Pick<Person, "display_name" | "username" | "tagline" | "opted_out">, facts: Fact[], projects: Project[], options: { compact?: boolean } = {}): string {
   const lines = [userHeader(user)];
   if (user.opted_out) {
     lines.push("<i>Попросил(а) ничего о себе не собирать.</i>");

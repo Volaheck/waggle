@@ -99,7 +99,7 @@ describe("telegram formatting", () => {
     const html = catchupHtml(
       {
         from: new Date("2026-11-10T08:00:00Z"),
-        entries: [{ id: 1, title: "Спор <Claude> vs Codex", summary: "Решили & разошлись", kind: "discussion", msg_ids: [10], user_ids: [], heat: 5, period_from: new Date(), period_to: new Date() }],
+        entries: [{ id: 1, title: "Спор <Claude> vs Codex", summary: "Решили & разошлись", kind: "discussion", importance: 3, msg_ids: [10], user_ids: [], heat: 5, period_from: new Date(), period_to: new Date() }],
         totalMessages: 42,
         unprocessed: { count: 7, firstMsgId: 99 },
         lastRunAt: null,

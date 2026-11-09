@@ -13,8 +13,7 @@ const csvIds = z
 
 const EnvSchema = z.object({
   BOT_TOKEN: z.string().min(10),
-  /** 0 = setup mode: the bot stays in any group and tells its ID instead of working. */
-  CHAT_ID: z.coerce.number().int().default(0),
+  /** Bot owners: they approve new chats and get alerts. */
   ADMIN_TG_IDS: csvIds,
   DATABASE_URL: z.string().url(),
   ANTHROPIC_API_KEY: z.string().optional(),
@@ -26,7 +25,10 @@ const EnvSchema = z.object({
   EXTRACTION_MODEL: z.string().default("claude-haiku-5-5"),
   EXTRACTION_INTERVAL_HOURS: z.coerce.number().positive().default(6),
   DISPLAY_TIMEZONE: z.string().default("UTC"),
+  /** Cap for the whole bot, across all chats. */
   MONTHLY_LLM_BUDGET_USD: z.coerce.number().default(5),
+  /** Default cap per chat; an owner can set another one for a chat. */
+  CHAT_MONTHLY_BUDGET_USD: z.coerce.number().default(2),
   WEB_DIST_DIR: z.string().default("web/dist"),
   /** Local development only: open the Mini App in a plain browser via a secret link printed at startup. */
   DEV_BROWSER_LOGIN: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),

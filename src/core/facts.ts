@@ -21,6 +21,7 @@ export const MIN_VISIBLE_CONFIDENCE = 0.6;
 
 export interface Fact {
   id: number;
+  chat_id: number;
   user_id: number;
   kind: FactKind;
   value: string;
@@ -33,6 +34,7 @@ export interface Fact {
 export type FactSource = "llm" | "user" | "admin" | "seed";
 
 export interface ProposedFact {
+  chatId: number;
   userId: number;
   kind: FactKind;
   value: string;
@@ -102,19 +104,20 @@ export async function proposeFact(sql: Sql, fact: ProposedFact): Promise<Propose
   if (fact.source !== "user" && hasForbiddenTopic(value)) return "skipped_forbidden";
 
   return sql.begin(async (tx) => {
-    const [owner] = await tx<{ opted_out: boolean }[]>`SELECT opted_out FROM users WHERE id = ${fact.userId} FOR UPDATE`;
+    const [owner] = await tx<{ opted_out: boolean }[]>`
+      SELECT opted_out FROM members WHERE chat_id = ${fact.chatId} AND user_id = ${fact.userId} FOR UPDATE`;
     if (!owner || owner.opted_out) return "skipped_opted_out";
 
     if (fact.source !== "user") {
       const rejected = await tx<{ value_norm: string }[]>`
-        SELECT value_norm FROM rejected_facts WHERE user_id = ${fact.userId} AND kind = ${fact.kind}`;
+        SELECT value_norm FROM rejected_facts WHERE chat_id = ${fact.chatId} AND user_id = ${fact.userId} AND kind = ${fact.kind}`;
       if (rejected.some((row) => isSameFact(fact.kind, row.value_norm, value))) return "skipped_rejected";
     }
 
     if (fact.kind === "link") {
       const url = normalizeUrl(value)?.norm;
       const projectLinks = await tx<{ links: { repo?: string | null; site?: string | null; other?: string[] } }[]>`
-        SELECT p.links FROM projects p JOIN project_members pm ON pm.project_id = p.id WHERE pm.user_id = ${fact.userId}`;
+        SELECT p.links FROM projects p JOIN project_members pm ON pm.project_id = p.id WHERE p.chat_id = ${fact.chatId} AND pm.user_id = ${fact.userId}`;
       const own = projectLinks.flatMap(({ links }) => [links.repo, links.site, ...(links.other ?? [])]).filter((link): link is string => Boolean(link));
       if (url && own.some((link) => normalizeUrl(link)?.norm === url)) return "skipped_existing";
     }
@@ -122,9 +125,9 @@ export async function proposeFact(sql: Sql, fact: ProposedFact): Promise<Propose
     const status = fact.source === "user" ? "manual" : "auto";
     const confidence = fact.source === "user" ? 1 : Math.min(Math.max(fact.confidence, 0), 1);
     const sameKind = await tx<Fact[]>`
-      SELECT * FROM facts WHERE user_id = ${fact.userId} AND kind = ${fact.kind} AND status <> 'deprecated'`;
+      SELECT * FROM facts WHERE chat_id = ${fact.chatId} AND user_id = ${fact.userId} AND kind = ${fact.kind} AND status <> 'deprecated'`;
     const [existing] =
-      (await tx<Fact[]>`SELECT * FROM facts WHERE user_id = ${fact.userId} AND kind = ${fact.kind} AND value_norm = ${valueNorm}`).concat(
+      (await tx<Fact[]>`SELECT * FROM facts WHERE chat_id = ${fact.chatId} AND user_id = ${fact.userId} AND kind = ${fact.kind} AND value_norm = ${valueNorm}`).concat(
         sameKind.filter((candidate) => isSameFact(fact.kind, candidate.value, value)),
       );
 
@@ -144,29 +147,29 @@ export async function proposeFact(sql: Sql, fact: ProposedFact): Promise<Propose
     }
 
     const [created] = await tx<{ id: number }[]>`
-      INSERT INTO facts (user_id, kind, value, value_norm, confidence, status, source_msg_ids)
-      VALUES (${fact.userId}, ${fact.kind}, ${value}, ${valueNorm}, ${confidence}, ${status}, ${fact.sourceMsgIds})
+      INSERT INTO facts (chat_id, user_id, kind, value, value_norm, confidence, status, source_msg_ids)
+      VALUES (${fact.chatId}, ${fact.userId}, ${fact.kind}, ${value}, ${valueNorm}, ${confidence}, ${status}, ${fact.sourceMsgIds})
       RETURNING id`;
     await tx`
       INSERT INTO change_log (entity, entity_id, op, after, source, actor_user_id, source_msg_ids)
-      VALUES ('fact', ${created!.id}, 'add', ${tx.json({ user_id: fact.userId, kind: fact.kind, value, confidence })},
+      VALUES ('fact', ${created!.id}, 'add', ${tx.json({ chat_id: fact.chatId, user_id: fact.userId, kind: fact.kind, value, confidence })},
               ${fact.source}, ${fact.actorUserId ?? null}, ${fact.sourceMsgIds})`;
     return "added";
   });
 }
 
-export async function visibleFacts(sql: Sql, userId: number): Promise<Fact[]> {
+export async function visibleFacts(sql: Sql, chatId: number, userId: number): Promise<Fact[]> {
   return sql<Fact[]>`
     SELECT * FROM facts
-    WHERE user_id = ${userId}
+    WHERE chat_id = ${chatId} AND user_id = ${userId}
       AND (status = 'manual' OR (status = 'auto' AND confidence >= ${MIN_VISIBLE_CONFIDENCE}))
     ORDER BY array_position(${[...FACT_KINDS]}::text[], kind), status = 'manual' DESC, confidence DESC, id`;
 }
 
-export async function ownFacts(sql: Sql, userId: number): Promise<Fact[]> {
+export async function ownFacts(sql: Sql, chatId: number, userId: number): Promise<Fact[]> {
   return sql<Fact[]>`
     SELECT * FROM facts
-    WHERE user_id = ${userId} AND status <> 'deprecated'
+    WHERE chat_id = ${chatId} AND user_id = ${userId} AND status <> 'deprecated'
     ORDER BY array_position(${[...FACT_KINDS]}::text[], kind), confidence DESC, id`;
 }
 
@@ -181,7 +184,7 @@ export async function rejectFact(sql: Sql, factId: number, actorUserId: number, 
     const [fact] = await tx<(Fact & { value_norm: string })[]>`DELETE FROM facts WHERE id = ${factId} RETURNING *`;
     if (!fact) return false;
     await tx`
-      INSERT INTO rejected_facts (user_id, kind, value_norm) VALUES (${fact.user_id}, ${fact.kind}, ${fact.value_norm})
+      INSERT INTO rejected_facts (chat_id, user_id, kind, value_norm) VALUES (${fact.chat_id}, ${fact.user_id}, ${fact.kind}, ${fact.value_norm})
       ON CONFLICT DO NOTHING`;
     await tx`
       INSERT INTO change_log (entity, entity_id, op, before, source, actor_user_id)
@@ -222,7 +225,7 @@ export interface ExpertHit {
 }
 
 /** «Кто шарит в X»: members whose visible facts mention the topic (Russian stemming). */
-export async function whoKnows(sql: Sql, topic: string, limit = 8): Promise<ExpertHit[]> {
+export async function whoKnows(sql: Sql, chatId: number, topic: string, limit = 8): Promise<ExpertHit[]> {
   const words = topic.trim();
   if (!words) return [];
   return sql<ExpertHit[]>`
@@ -231,12 +234,12 @@ export async function whoKnows(sql: Sql, topic: string, limit = 8): Promise<Expe
       FROM (SELECT DISTINCT unnest(tsvector_to_array(to_tsvector('russian', ${words})))) AS t(lexeme)
     )
     SELECT u.id AS user_id, u.display_name, u.username, array_agg(f.value ORDER BY f.confidence DESC) AS matches
-    FROM facts f JOIN users u ON u.id = f.user_id, q
-    WHERE q.query IS NOT NULL
+    FROM facts f JOIN users u ON u.id = f.user_id JOIN members m ON m.chat_id = f.chat_id AND m.user_id = f.user_id, q
+    WHERE f.chat_id = ${chatId} AND q.query IS NOT NULL
       AND (to_tsvector('russian', f.value) @@ q.query OR f.value ILIKE '%' || ${words} || '%')
       AND f.kind IN ('stack', 'expertise', 'role', 'interest', 'can_help', 'project')
       AND (f.status = 'manual' OR (f.status = 'auto' AND f.confidence >= ${MIN_VISIBLE_CONFIDENCE}))
-      AND NOT u.opted_out AND u.left_at IS NULL
+      AND NOT m.opted_out AND m.left_at IS NULL
     GROUP BY u.id
     ORDER BY count(*) DESC, max(f.confidence) DESC
     LIMIT ${limit}`;
@@ -252,7 +255,7 @@ export async function rewriteFact(sql: Sql, factId: number, value: string, sourc
     const [fact] = await tx<(Fact & { value_norm: string })[]>`SELECT * FROM facts WHERE id = ${factId} FOR UPDATE`;
     if (!fact || fact.status !== "auto" || fact.value_norm === nextNorm) return false;
     const [clash] = await tx<{ id: number }[]>`
-      SELECT id FROM facts WHERE user_id = ${fact.user_id} AND kind = ${fact.kind} AND value_norm = ${nextNorm} AND id <> ${factId}`;
+      SELECT id FROM facts WHERE chat_id = ${fact.chat_id} AND user_id = ${fact.user_id} AND kind = ${fact.kind} AND value_norm = ${nextNorm} AND id <> ${factId}`;
     if (clash) {
       await tx`DELETE FROM facts WHERE id = ${factId}`;
     } else {
@@ -278,7 +281,7 @@ export async function mergeFacts(sql: Sql, factIds: number[], value: string, sou
   if (factIds.length === 0) return false;
   return sql.begin(async (tx) => {
     const facts = await tx<(Fact & { value_norm: string })[]>`SELECT * FROM facts WHERE id = ANY(${factIds}) FOR UPDATE`;
-    if (facts.length === 0 || new Set(facts.map((fact) => fact.user_id)).size > 1) return false;
+    if (facts.length === 0 || new Set(facts.map((fact) => `${fact.chat_id}:${fact.user_id}`)).size > 1) return false;
     const manual = facts.find((fact) => fact.status === "manual");
     const keeper = manual ?? facts.find((fact) => fact.id === factIds[0]) ?? facts[0]!;
     const others = facts.filter((fact) => fact.id !== keeper.id && fact.status !== "manual");
@@ -288,7 +291,7 @@ export async function mergeFacts(sql: Sql, factIds: number[], value: string, sou
     const next = manual ? manual.value : (keeper.kind === "stack" ? canonicalStackValue(value) : value.trim()).slice(0, 160);
     const nextNorm = normalizeValue(next);
     const [clash] = await tx<{ id: number }[]>`
-      SELECT id FROM facts WHERE user_id = ${keeper.user_id} AND kind = ${keeper.kind} AND value_norm = ${nextNorm} AND id <> ${keeper.id}`;
+      SELECT id FROM facts WHERE chat_id = ${keeper.chat_id} AND user_id = ${keeper.user_id} AND kind = ${keeper.kind} AND value_norm = ${nextNorm} AND id <> ${keeper.id}`;
     if (clash) {
       await tx`DELETE FROM facts WHERE id = ${keeper.id} AND status <> 'manual'`;
     } else {
@@ -315,26 +318,27 @@ export async function dropFact(sql: Sql, factId: number, source: FactSource): Pr
  * Deterministic clean-up of stacks: splits «A, B» facts and folds tools of one family
  * («GPT-6», «ChatGPT», «Codex») into a single fact. Runs before every LLM clean-up.
  */
-export async function normalizeStacks(sql: Sql): Promise<{ split: number; merged: number }> {
+export async function normalizeStacks(sql: Sql, chatId?: number): Promise<{ split: number; merged: number }> {
+  const scope = chatId ?? null;
   let split = 0;
   let merged = 0;
-  const combined = await sql<Fact[]>`SELECT * FROM facts WHERE kind = 'stack' AND status IN ('auto', 'manual', 'hidden')`;
+  const combined = await sql<Fact[]>`SELECT * FROM facts WHERE kind = 'stack' AND status IN ('auto', 'manual', 'hidden') AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
   for (const fact of combined) {
     const parts = splitStackValue(fact.value);
     if (parts.length < 2) continue;
     // Remove the combined fact first, or each part would be folded back into it.
     await sql`DELETE FROM facts WHERE id = ${fact.id}`;
     for (const part of parts) {
-      await proposeFact(sql, { userId: fact.user_id, kind: "stack", value: part, confidence: fact.confidence, sourceMsgIds: fact.source_msg_ids, source: fact.status === "manual" ? "user" : "llm" });
+      await proposeFact(sql, { chatId: fact.chat_id, userId: fact.user_id, kind: "stack", value: part, confidence: fact.confidence, sourceMsgIds: fact.source_msg_ids, source: fact.status === "manual" ? "user" : "llm" });
     }
     split += 1;
   }
-  const facts = await sql<Fact[]>`SELECT * FROM facts WHERE kind = 'stack' AND status IN ('auto', 'manual', 'hidden') ORDER BY user_id, status = 'manual' DESC, confidence DESC, id`;
+  const facts = await sql<Fact[]>`SELECT * FROM facts WHERE kind = 'stack' AND status IN ('auto', 'manual', 'hidden') AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint) ORDER BY chat_id, user_id, status = 'manual' DESC, confidence DESC, id`;
   const groups = new Map<string, Fact[]>();
   for (const fact of facts) {
     const family = stackFamily(fact.value);
     if (!family) continue;
-    const key = `${fact.user_id}:${family.key}`;
+    const key = `${fact.chat_id}:${fact.user_id}:${family.key}`;
     groups.set(key, [...(groups.get(key) ?? []), fact]);
   }
   for (const group of groups.values()) {

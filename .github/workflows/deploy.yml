@@ -1,0 +1,95 @@
+name: Deploy
+
+# Runs after CI passes on main (or by hand). Does nothing in forks without deploy secrets.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+# Never run two deploys at once; let an in-flight one finish.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        run: echo "enabled=${{ secrets.DEPLOY_HOST != '' && secrets.DEPLOY_SSH_KEY != '' }}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: gate
+    if: >-
+      needs.gate.outputs.enabled == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'))
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR || 'waggle' }}
+      TARGET: ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      # The server owns .env (database password, public URL), docker-compose.override.yml (how the
+      # server's reverse proxy reaches the bot), backups and private data — never overwrite them.
+      - name: Sync code to server
+        run: |
+          rsync -az --delete \
+            --exclude '.git' --exclude 'node_modules' --exclude 'web/node_modules' \
+            --exclude 'dist' --exclude 'web/dist' --exclude '.env' \
+            --exclude 'backups' --exclude 'private' --exclude 'docker-compose.override.yml' \
+            ./ "$TARGET:$DEPLOY_DIR/"
+
+      # Secrets live in GitHub and are written into the server's .env on every deploy,
+      # so rotating one in GitHub takes effect with the next deploy. Other keys stay as they are.
+      - name: Write secrets into the server .env
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ADMIN_TG_IDS: ${{ secrets.ADMIN_TG_IDS }}
+        run: |
+          put() {
+            name="$1"; value="$2"; required="$3"
+            if [ -z "$value" ]; then
+              if [ "$required" = "required" ]; then
+                echo "::error::$name GitHub secret is empty — add it in Settings → Secrets and variables → Actions."
+                exit 1
+              fi
+              echo "::warning::$name GitHub secret is empty — keeping the value already on the server."
+              return 0
+            fi
+            printf '%s=%s\n' "$name" "$value" | ssh "$TARGET" \
+              "set -e; cd $DEPLOY_DIR; umask 077; touch .env; \
+               tmp=\$(mktemp .env.tmp.XXXXXX); \
+               { grep -v '^$name=' .env || true; cat; } > \"\$tmp\"; \
+               mv \"\$tmp\" .env"
+          }
+          put BOT_TOKEN "$BOT_TOKEN" required
+          put ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY" required
+          put ADMIN_TG_IDS "$ADMIN_TG_IDS" optional
+
+      - name: Build and restart
+        run: |
+          ssh "$TARGET" "
+            set -euo pipefail
+            cd $DEPLOY_DIR
+            grep -q '^POSTGRES_PASSWORD=.' .env || { echo 'POSTGRES_PASSWORD is missing in the server .env'; exit 1; }
+            # docker compose picks up docker-compose.override.yml by itself when it exists.
+            docker compose up -d --build --wait --remove-orphans
+            docker compose ps
+            docker image prune -f >/dev/null
+          "

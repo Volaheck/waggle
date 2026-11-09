@@ -17,7 +17,7 @@ if (applied.length) console.log(`[db] applied migrations: ${applied.join(", ")}`
 
 const { bot, membership } = createBot({ sql, config });
 await bot.init();
-await registerCommands(bot).catch((error) => console.warn("[bot] could not register commands:", error));
+await registerCommands(bot, config.ADMIN_TG_IDS).catch((error) => console.warn("[bot] could not register commands:", error));
 
 // Derived from the bot token so the link survives dev-server restarts, yet stays as secret as the token itself.
 const devLogin = config.DEV_BROWSER_LOGIN
@@ -27,9 +27,8 @@ const devLogin = config.DEV_BROWSER_LOGIN
 const app = createApi({
   sql,
   botToken: config.BOT_TOKEN,
-  chatId: config.CHAT_ID,
   adminTgIds: config.ADMIN_TG_IDS,
-  isMember: (tgUserId) => membership.isMember(tgUserId),
+  isMember: (chatId, tgUserId) => membership.isMember(chatId, tgUserId),
   webDistDir: config.WEB_DIST_DIR,
   devLogin,
 });
@@ -60,12 +59,12 @@ const stopScheduler = config.ANTHROPIC_API_KEY
       sql,
       anthropic: createAnthropic(config.ANTHROPIC_API_KEY),
       config,
-      intervalHours: config.EXTRACTION_INTERVAL_HOURS,
       notifyAdmins: (text) => notifyAdmins(bot, sql, config.ADMIN_TG_IDS, text),
     })
   : (console.warn("[extract] ANTHROPIC_API_KEY is not set — the chronicler is off; the bot still serves the archive and manual data"), () => {});
 
-const stopNameSync = config.CHAT_ID !== 0 ? startNameSync(bot.api, sql, config.CHAT_ID, config.ADMIN_TG_IDS) : () => {};
+const stopNameSync = startNameSync(bot.api, sql, config.ADMIN_TG_IDS);
+if (config.ADMIN_TG_IDS.length === 0) console.warn("[bot] ADMIN_TG_IDS is empty — nobody can approve new chats. Message the bot to learn your Telegram ID.");
 
 const shutdown = async (signal: string) => {
   console.log(`[main] ${signal}, shutting down`);

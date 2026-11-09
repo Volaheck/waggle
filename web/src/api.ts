@@ -32,7 +32,7 @@ export class ApiError extends Error {
   }
 }
 
-const DEV_KEY = "chaynaya-dev-login";
+const DEV_KEY = "waggle-dev-login";
 
 /** Local development: `/app/?dev=<secret>` from the server log lets a plain browser in. */
 function devLoginToken(): string | null {
@@ -47,9 +47,32 @@ function devLoginToken(): string | null {
 
 const devToken = tg?.initData ? null : devLoginToken();
 
+/** The chat a screen is about: «c100123» from the start param (t.me/bot/app?startapp=c100123_me) or ?chat= in DM links. */
+export function chatFromLaunch(): string | null {
+  const fromStart = /^(c\d+)(?:_|$)/.exec(tg?.initDataUnsafe.start_param ?? "")?.[1];
+  return fromStart ?? new URLSearchParams(window.location.search).get("chat");
+}
+
+/** Start param without the chat prefix: «c100123_p_atlas» → «p_atlas». */
+export function screenFromLaunch(): string | undefined {
+  return tg?.initDataUnsafe.start_param?.replace(/^c\d+_?/, "") || undefined;
+}
+
+let currentChat: string | null = chatFromLaunch();
+
+export function setCurrentChat(key: string | null): void {
+  currentChat = key;
+}
+
+export interface ChatInfo {
+  key: string;
+  title: string | null;
+}
+
 export async function api<T>(path: string, init: { method?: string; body?: unknown } = {}): Promise<T> {
   const headers: Record<string, string> = { authorization: `tma ${tg?.initData ?? ""}`, "content-type": "application/json" };
   if (devToken) headers["x-dev-login"] = devToken;
+  if (currentChat && path !== "/chats") headers["x-chat-id"] = currentChat;
   const response = await fetch(`/api${path}`, {
     method: init.method ?? "GET",
     headers,

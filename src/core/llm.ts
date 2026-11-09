@@ -27,28 +27,39 @@ export function estimateCostUsd(model: string, usage: UsageLike): number {
   );
 }
 
-export async function recordUsage(sql: Sql, purpose: string, model: string, usage: UsageLike): Promise<void> {
+export async function recordUsage(sql: Sql, purpose: string, model: string, usage: UsageLike, chatId: number | null = null): Promise<void> {
   await sql`
-    INSERT INTO llm_usage (purpose, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-    VALUES (${purpose}, ${model}, ${usage.input_tokens}, ${usage.output_tokens},
+    INSERT INTO llm_usage (chat_id, purpose, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+    VALUES (${chatId}, ${purpose}, ${model}, ${usage.input_tokens}, ${usage.output_tokens},
             ${usage.cache_read_input_tokens ?? 0}, ${usage.cache_creation_input_tokens ?? 0}, ${estimateCostUsd(model, usage)})`;
 }
 
-export async function monthSpendUsd(sql: Sql): Promise<number> {
+export async function monthSpendUsd(sql: Sql, chatId?: number): Promise<number> {
+  const scope = chatId ?? null;
   const [row] = await sql<{ total: string | null }[]>`
-    SELECT sum(cost_usd)::text AS total FROM llm_usage WHERE at >= date_trunc('month', now())`;
+    SELECT sum(cost_usd)::text AS total FROM llm_usage
+    WHERE at >= date_trunc('month', now()) AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
   return Number(row?.total ?? 0);
 }
 
 export class BudgetExceededError extends Error {
-  constructor(spent: number, limit: number) {
-    super(`Месячный бюджет на LLM исчерпан: $${spent.toFixed(2)} из $${limit.toFixed(2)}`);
+  constructor(
+    spent: number,
+    limit: number,
+    readonly chatId?: number,
+  ) {
+    super(`${chatId === undefined ? "Общий месячный бюджет" : "Месячный лимит этого чата"} на нейронку исчерпан: $${spent.toFixed(2)} из $${limit.toFixed(2)}`);
   }
 }
 
-export async function assertBudget(sql: Sql, limitUsd: number): Promise<void> {
+/** Checks the bot-wide monthly cap and, for a chat, that chat's own cap. */
+export async function assertBudget(sql: Sql, limitUsd: number, chat?: { id: number; limitUsd: number }): Promise<void> {
   const spent = await monthSpendUsd(sql);
   if (spent >= limitUsd) throw new BudgetExceededError(spent, limitUsd);
+  if (chat) {
+    const chatSpent = await monthSpendUsd(sql, chat.id);
+    if (chatSpent >= chat.limitUsd) throw new BudgetExceededError(chatSpent, chat.limitUsd, chat.id);
+  }
 }
 
 export function createAnthropic(apiKey?: string): Anthropic {

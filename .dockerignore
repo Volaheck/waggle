@@ -4,4 +4,8 @@ dist
 web/dist
 .env
 backups
+private
+.git
 *.log
+seed/*.json
+!seed/example-*.json

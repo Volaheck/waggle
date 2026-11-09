@@ -13,6 +13,7 @@ export interface ProjectLinks {
 
 export interface Project {
   id: number;
+  chat_id: number;
   slug: string;
   name: string;
   tagline: string | null;
@@ -58,7 +59,7 @@ const RATING = {
   abandonedMultiplier: 0.3,
 } as const;
 
-export async function listProjects(sql: Sql, options: { sort?: ProjectSort; viewerUserId?: number; limit?: number } = {}): Promise<ProjectListItem[]> {
+export async function listProjects(sql: Sql, chatId: number, options: { sort?: ProjectSort; viewerUserId?: number; limit?: number } = {}): Promise<ProjectListItem[]> {
   const sort = options.sort ?? "top";
   const viewer = options.viewerUserId ?? 0;
   const limit = options.limit ?? 200;
@@ -97,7 +98,7 @@ export async function listProjects(sql: Sql, options: { sort?: ProjectSort; view
     FROM projects p
     LEFT JOIN s ON s.project_id = p.id
     LEFT JOIN v ON v.project_id = p.id
-    WHERE NOT p.hidden
+    WHERE p.chat_id = ${chatId} AND NOT p.hidden
     ORDER BY ${orderBy}
     LIMIT ${limit}`;
 }
@@ -110,29 +111,30 @@ export const RATING_EXPLANATION = [
   "Голоса 👍 участников тоже учитываются. Свежее весит больше старого, а накрутить рейтинг повторными упоминаниями не получится.",
 ].join("\n");
 
-export async function getProjectBySlug(sql: Sql, slug: string, viewerUserId?: number): Promise<ProjectListItem | undefined> {
-  const all = await listProjects(sql, { viewerUserId });
+export async function getProjectBySlug(sql: Sql, chatId: number, slug: string, viewerUserId?: number): Promise<ProjectListItem | undefined> {
+  const all = await listProjects(sql, chatId, { viewerUserId });
   return all.find((project) => project.slug === slug.toLowerCase());
 }
 
-export async function findProject(sql: Sql, query: string): Promise<Project | undefined> {
+export async function findProject(sql: Sql, chatId: number, query: string): Promise<Project | undefined> {
   const needle = query.trim();
   const [project] = await sql<Project[]>`
     SELECT * FROM projects
-    WHERE NOT hidden AND (slug = ${slugify(needle)} OR lower(name) = lower(${needle}) OR name ILIKE '%' || ${needle} || '%')
+    WHERE chat_id = ${chatId} AND NOT hidden AND (slug = ${slugify(needle)} OR lower(name) = lower(${needle}) OR name ILIKE '%' || ${needle} || '%')
     ORDER BY (lower(name) = lower(${needle})) DESC, length(name)
     LIMIT 1`;
   return project;
 }
 
-export async function projectsOfUser(sql: Sql, userId: number): Promise<Project[]> {
+export async function projectsOfUser(sql: Sql, chatId: number, userId: number): Promise<Project[]> {
   return sql<Project[]>`
     SELECT p.* FROM projects p JOIN project_members pm ON pm.project_id = p.id
-    WHERE pm.user_id = ${userId} AND NOT p.hidden
+    WHERE p.chat_id = ${chatId} AND pm.user_id = ${userId} AND NOT p.hidden
     ORDER BY p.last_activity_at DESC NULLS LAST`;
 }
 
 export interface ProjectUpsert {
+  chatId: number;
   slug?: string;
   name: string;
   tagline?: string | null;
@@ -161,6 +163,7 @@ async function findExisting(sql: Sql, upsert: ProjectUpsert, slug: string): Prom
   const candidates = await sql<(Project & { author_ids: number[] })[]>`
     SELECT p.*, coalesce(array_agg(pm.user_id) FILTER (WHERE pm.user_id IS NOT NULL), '{}') AS author_ids
     FROM projects p LEFT JOIN project_members pm ON pm.project_id = p.id
+    WHERE p.chat_id = ${upsert.chatId}
     GROUP BY p.id`;
   const name = upsert.name.toLowerCase();
   return (
@@ -184,10 +187,10 @@ export async function upsertProject(sql: Sql, upsert: ProjectUpsert): Promise<{ 
     let project: Project;
     let created = false;
     if (!existing) {
-      const uniqueSlug = await freeSlug(tx, slug);
+      const uniqueSlug = await freeSlug(tx, upsert.chatId, slug);
       const [inserted] = await tx<Project[]>`
-        INSERT INTO projects (slug, name, tagline, status, stack, links, confidence, first_seen_msg_id, last_activity_at, source_msg_ids)
-        VALUES (${uniqueSlug}, ${upsert.name}, ${upsert.tagline ?? null}, ${upsert.status ?? "в работе"}, ${upsert.stack ?? []},
+        INSERT INTO projects (chat_id, slug, name, tagline, status, stack, links, confidence, first_seen_msg_id, last_activity_at, source_msg_ids)
+        VALUES (${upsert.chatId}, ${uniqueSlug}, ${upsert.name}, ${upsert.tagline ?? null}, ${upsert.status ?? "в работе"}, ${upsert.stack ?? []},
                 ${tx.json(cleanLinks(upsert.links))}, ${upsert.confidence ?? 1}, ${upsert.firstSeenMsgId ?? upsert.sourceMsgIds[0] ?? null},
                 ${upsert.activityAt ?? null}, ${upsert.sourceMsgIds})
         RETURNING *`;
@@ -249,9 +252,9 @@ function cleanLinks(links: ProjectLinks | undefined): ProjectLinks {
   return result;
 }
 
-async function freeSlug(sql: Queryable, base: string): Promise<string> {
+async function freeSlug(sql: Queryable, chatId: number, base: string): Promise<string> {
   const taken = new Set(
-    (await sql<{ slug: string }[]>`SELECT slug FROM projects WHERE slug = ${base} OR slug LIKE ${`${base}-%`}`).map((row) => row.slug),
+    (await sql<{ slug: string }[]>`SELECT slug FROM projects WHERE chat_id = ${chatId} AND (slug = ${base} OR slug LIKE ${`${base}-%`})`).map((row) => row.slug),
   );
   if (!taken.has(base)) return base;
   for (let suffix = 2; ; suffix += 1) {
@@ -288,11 +291,11 @@ export async function setMemberRole(sql: Sql, projectId: number, userId: number,
 }
 
 /** Folds duplicate catalog entries into one: authors, votes, signals and links move over, the rest is hidden. */
-export async function mergeProjects(sql: Sql, intoSlug: string, fromSlugs: string[]): Promise<number> {
+export async function mergeProjects(sql: Sql, chatId: number, intoSlug: string, fromSlugs: string[]): Promise<number> {
   return sql.begin(async (tx) => {
-    const [into] = await tx<Project[]>`SELECT * FROM projects WHERE slug = ${intoSlug} AND NOT hidden FOR UPDATE`;
+    const [into] = await tx<Project[]>`SELECT * FROM projects WHERE chat_id = ${chatId} AND slug = ${intoSlug} AND NOT hidden FOR UPDATE`;
     if (!into) return 0;
-    const from = await tx<Project[]>`SELECT * FROM projects WHERE slug = ANY(${fromSlugs}) AND slug <> ${intoSlug} AND NOT hidden FOR UPDATE`;
+    const from = await tx<Project[]>`SELECT * FROM projects WHERE chat_id = ${chatId} AND slug = ANY(${fromSlugs}) AND slug <> ${intoSlug} AND NOT hidden FOR UPDATE`;
     for (const project of from) {
       await tx`
         INSERT INTO project_members (project_id, user_id, role)

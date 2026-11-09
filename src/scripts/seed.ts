@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import { LEGACY_CHAT_ID } from "../core/chats.js";
 import { createSql, migrate, type Sql } from "../core/db.js";
 import { FACT_KINDS, proposeFact } from "../core/facts.js";
 import { PROJECT_STATUSES, setMemberRole, upsertProject } from "../core/projects.js";
@@ -36,40 +37,46 @@ const ProjectSchema = z.object({
 export type SeedPerson = z.infer<typeof PersonSchema>;
 export type SeedProject = z.infer<typeof ProjectSchema>;
 
-async function upsertSeedUser(sql: Sql, person: SeedPerson): Promise<number> {
+/** A seeded person is matched by @username anywhere, or by name among the chat's members. */
+async function upsertSeedUser(sql: Sql, chatId: number, person: SeedPerson): Promise<number> {
   const username = person.username?.replace(/^@/, "") || null;
   const [existing] = await sql<{ id: number }[]>`
-    SELECT id FROM users
-    WHERE (${username}::text IS NOT NULL AND lower(username) = lower(${username}::text)) OR lower(display_name) = lower(${person.display_name})
-    ORDER BY tg_id IS NOT NULL DESC
+    SELECT u.id FROM users u
+    WHERE (${username}::text IS NOT NULL AND lower(u.username) = lower(${username}::text))
+       OR (lower(u.display_name) = lower(${person.display_name})
+           AND EXISTS (SELECT 1 FROM members m WHERE m.user_id = u.id AND m.chat_id = ${chatId}))
+    ORDER BY u.tg_id IS NOT NULL DESC
     LIMIT 1`;
-  if (existing) {
-    await sql`
-      UPDATE users SET tagline = coalesce(tagline, ${person.tagline ?? null}), username = coalesce(username, ${username})
-      WHERE id = ${existing.id}`;
-    return existing.id;
+  let userId = existing?.id;
+  if (userId !== undefined) {
+    await sql`UPDATE users SET username = coalesce(username, ${username}) WHERE id = ${userId}`;
+  } else {
+    const [created] = await sql<{ id: number }[]>`
+      INSERT INTO users (username, display_name) VALUES (${username}, ${person.display_name})
+      RETURNING id`;
+    userId = created!.id;
   }
-  const [created] = await sql<{ id: number }[]>`
-    INSERT INTO users (username, display_name, tagline) VALUES (${username}, ${person.display_name}, ${person.tagline ?? null})
-    RETURNING id`;
-  return created!.id;
+  await sql`
+    INSERT INTO members (chat_id, user_id, tagline) VALUES (${chatId}, ${userId}, ${person.tagline ?? null})
+    ON CONFLICT (chat_id, user_id) DO UPDATE SET tagline = coalesce(members.tagline, excluded.tagline)`;
+  return userId;
 }
 
-export async function importSeed(sql: Sql, people: SeedPerson[], projects: SeedProject[]): Promise<{ users: number; facts: number; projects: number }> {
+export async function importSeed(sql: Sql, chatId: number, people: SeedPerson[], projects: SeedProject[]): Promise<{ users: number; facts: number; projects: number }> {
   const ids = new Map<string, number>();
   let facts = 0;
   for (const person of people) {
-    const userId = await upsertSeedUser(sql, person);
+    const userId = await upsertSeedUser(sql, chatId, person);
     ids.set(person.display_name.toLowerCase(), userId);
     for (const fact of person.facts) {
-      const result = await proposeFact(sql, { userId, kind: fact.kind, value: fact.value, confidence: fact.confidence, sourceMsgIds: fact.source_msg_ids, source: "seed" });
+      const result = await proposeFact(sql, { chatId, userId, kind: fact.kind, value: fact.value, confidence: fact.confidence, sourceMsgIds: fact.source_msg_ids, source: "seed" });
       if (result === "added") facts += 1;
     }
   }
   for (const project of projects) {
     const authorIds = project.authors.map((name) => ids.get(name.toLowerCase())).filter((id): id is number => id !== undefined);
     // The seed only fills gaps: whatever the chronicler or people changed since then stays.
-    const [present] = await sql<{ id: number }[]>`SELECT id FROM projects WHERE slug = ${project.slug}`;
+    const [present] = await sql<{ id: number }[]>`SELECT id FROM projects WHERE chat_id = ${chatId} AND slug = ${project.slug}`;
     if (present) {
       for (const authorId of authorIds) {
         await sql`INSERT INTO project_members (project_id, user_id) VALUES (${present.id}, ${authorId}) ON CONFLICT DO NOTHING`;
@@ -81,6 +88,7 @@ export async function importSeed(sql: Sql, people: SeedPerson[], projects: SeedP
       continue;
     }
     const { project: stored } = await upsertProject(sql, {
+      chatId,
       slug: project.slug,
       name: project.name,
       tagline: project.tagline ?? null,
@@ -108,9 +116,12 @@ if (isMain) {
   const [peopleFile = "seed/people.json", projectsFile = "seed/projects.json"] = process.argv.slice(2);
   const people = z.array(PersonSchema).parse(JSON.parse(await readFile(peopleFile, "utf8")));
   const projects = z.array(ProjectSchema).parse(JSON.parse(await readFile(projectsFile, "utf8")));
+  // Without SEED_CHAT_ID the cards wait as imported history until a bot owner attaches them to a chat.
+  const chatId = Number(process.env.SEED_CHAT_ID ?? LEGACY_CHAT_ID);
+  if (!Number.isInteger(chatId)) throw new Error("SEED_CHAT_ID must be a Telegram chat id");
   const sql = createSql(databaseUrl);
   await migrate(sql);
-  const result = await importSeed(sql, people, projects);
+  const result = await importSeed(sql, chatId, people, projects);
   console.log(`Done: ${result.users} members, ${result.facts} new facts, ${result.projects} projects`);
   await sql.end();
 }

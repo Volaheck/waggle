@@ -1,19 +1,30 @@
 import type { Sql } from "./db.js";
 
+/** A Telegram account. What the bot knows about the person lives per chat (see Member). */
 export interface User {
   id: number;
   tg_id: number | null;
   username: string | null;
   display_name: string;
+  is_admin: boolean;
+  dm_started: boolean;
+  current_chat_id: number | null;
+}
+
+/** A person's presence in one chat: their card there is independent from other chats. */
+export interface Member {
+  chat_id: number;
+  user_id: number;
   tagline: string | null;
   tagline_manual: boolean;
-  is_admin: boolean;
   opted_out: boolean;
-  dm_started: boolean;
   first_seen_at: Date | null;
   last_message_at: Date | null;
   left_at: Date | null;
 }
+
+/** A user as seen from one chat. */
+export type Person = User & Member;
 
 export interface TelegramIdentity {
   id: number;
@@ -26,66 +37,88 @@ export function fullName(identity: TelegramIdentity): string {
   return [identity.first_name, identity.last_name].filter(Boolean).join(" ").trim();
 }
 
+const PERSON_COLUMNS = `u.id, u.tg_id, u.username, u.display_name, u.is_admin, u.dm_started, u.current_chat_id,
+  m.chat_id, m.user_id, m.tagline, m.tagline_manual, m.opted_out, m.first_seen_at, m.last_message_at, m.left_at`;
+
 /**
- * Finds the user for a Telegram account, linking a seeded (tg_id-less) user by
- * username or exact display name the first time that account shows up.
+ * Finds the user for a Telegram account. A seeded card (no account yet) is linked by
+ * @username, or by exact name among the members of the chat the person showed up in.
+ * With a chat id the person also becomes (again) a member of that chat.
  */
-export async function resolveUser(sql: Sql, identity: TelegramIdentity, adminTgIds: number[]): Promise<User> {
+export async function resolveUser(sql: Sql, identity: TelegramIdentity, adminTgIds: number[], chatId?: number): Promise<User> {
   const name = fullName(identity) || identity.username || `user${identity.id}`;
   const username = identity.username ?? null;
   const isAdmin = adminTgIds.includes(identity.id);
+  let user: User | undefined;
 
   const [existing] = await sql<User[]>`SELECT * FROM users WHERE tg_id = ${identity.id}`;
   if (existing) {
     if (username && username.toLowerCase() !== existing.username?.toLowerCase()) {
       await sql`UPDATE users SET username = NULL WHERE lower(username) = lower(${username}) AND id <> ${existing.id}`;
     }
-    const [updated] = await sql<User[]>`
-      UPDATE users
-      SET username = ${username}, display_name = ${name}, is_admin = is_admin OR ${isAdmin}, left_at = NULL
+    [user] = await sql<User[]>`
+      UPDATE users SET username = ${username}, display_name = ${name}, is_admin = is_admin OR ${isAdmin}
       WHERE id = ${existing.id}
       RETURNING *`;
-    return updated!;
+  } else {
+    const [seeded] = await sql<User[]>`
+      SELECT u.* FROM users u
+      WHERE u.tg_id IS NULL
+        AND ((${username}::text IS NOT NULL AND lower(u.username) = lower(${username}::text))
+             OR (${chatId ?? null}::bigint IS NOT NULL AND lower(u.display_name) = lower(${name})
+                 AND EXISTS (SELECT 1 FROM members m WHERE m.user_id = u.id AND m.chat_id = ${chatId ?? null}::bigint)))
+      ORDER BY (lower(u.username) = lower(${username}::text)) DESC NULLS LAST
+      LIMIT 1`;
+    if (seeded) {
+      // Seed names come from someone's contact list; from now on the person's own Telegram name wins.
+      [user] = await sql<User[]>`
+        UPDATE users SET tg_id = ${identity.id}, username = coalesce(${username}, username), display_name = ${name}, is_admin = is_admin OR ${isAdmin}
+        WHERE id = ${seeded.id}
+        RETURNING *`;
+    } else {
+      if (username) {
+        await sql`UPDATE users SET username = NULL WHERE lower(username) = lower(${username}) AND tg_id IS DISTINCT FROM ${identity.id}`;
+      }
+      [user] = await sql<User[]>`
+        INSERT INTO users (tg_id, username, display_name, is_admin) VALUES (${identity.id}, ${username}, ${name}, ${isAdmin})
+        RETURNING *`;
+    }
   }
-
-  const [seeded] = await sql<User[]>`
-    SELECT * FROM users
-    WHERE tg_id IS NULL
-      AND ((${username}::text IS NOT NULL AND lower(username) = lower(${username}::text)) OR lower(display_name) = lower(${name}))
-    ORDER BY (lower(username) = lower(${username}::text)) DESC NULLS LAST
-    LIMIT 1`;
-  if (seeded) {
-    // The seed carries names from someone's contact list; from now on the person's own Telegram name wins.
-    const [linked] = await sql<User[]>`
-      UPDATE users
-      SET tg_id = ${identity.id}, username = coalesce(${username}, username), display_name = ${name},
-          is_admin = is_admin OR ${isAdmin}, left_at = NULL
-      WHERE id = ${seeded.id}
-      RETURNING *`;
-    return linked!;
-  }
-
-  if (username) {
-    await sql`UPDATE users SET username = NULL WHERE lower(username) = lower(${username}) AND tg_id IS DISTINCT FROM ${identity.id}`;
-  }
-  const [created] = await sql<User[]>`
-    INSERT INTO users (tg_id, username, display_name, is_admin)
-    VALUES (${identity.id}, ${username}, ${name}, ${isAdmin})
-    RETURNING *`;
-  return created!;
+  if (!user) throw new Error("Could not resolve the Telegram user");
+  if (chatId !== undefined) await ensureMember(sql, chatId, user.id);
+  return user;
 }
 
-export async function findUserByRef(sql: Sql, ref: string): Promise<User | undefined> {
+export async function ensureMember(sql: Sql, chatId: number, userId: number): Promise<void> {
+  await sql`
+    INSERT INTO members (chat_id, user_id) VALUES (${chatId}, ${userId})
+    ON CONFLICT (chat_id, user_id) DO UPDATE SET left_at = NULL`;
+}
+
+export async function getPerson(sql: Sql, chatId: number, userId: number): Promise<Person | undefined> {
+  const [person] = await sql<Person[]>`
+    SELECT ${sql.unsafe(PERSON_COLUMNS)} FROM users u JOIN members m ON m.user_id = u.id
+    WHERE m.chat_id = ${chatId} AND u.id = ${userId}`;
+  return person;
+}
+
+export async function peopleOfChat(sql: Sql, chatId: number, options: { includeLeft?: boolean } = {}): Promise<Person[]> {
+  return sql<Person[]>`
+    SELECT ${sql.unsafe(PERSON_COLUMNS)} FROM users u JOIN members m ON m.user_id = u.id
+    WHERE m.chat_id = ${chatId} AND (${options.includeLeft ?? false} OR m.left_at IS NULL)
+    ORDER BY m.last_message_at DESC NULLS LAST, u.display_name`;
+}
+
+export async function findPersonByRef(sql: Sql, chatId: number, ref: string): Promise<Person | undefined> {
   const cleaned = ref.trim().replace(/^@/, "");
   if (!cleaned) return undefined;
-  const [byUsername] = await sql<User[]>`SELECT * FROM users WHERE lower(username) = lower(${cleaned})`;
-  if (byUsername) return byUsername;
-  const [byName] = await sql<User[]>`
-    SELECT * FROM users
-    WHERE lower(display_name) = lower(${cleaned}) OR lower(display_name) LIKE lower(${cleaned}) || ' %'
-    ORDER BY last_message_at DESC NULLS LAST
+  const [person] = await sql<Person[]>`
+    SELECT ${sql.unsafe(PERSON_COLUMNS)} FROM users u JOIN members m ON m.user_id = u.id
+    WHERE m.chat_id = ${chatId}
+      AND (lower(u.username) = lower(${cleaned}) OR lower(u.display_name) = lower(${cleaned}) OR lower(u.display_name) LIKE lower(${cleaned}) || ' %')
+    ORDER BY lower(u.username) = lower(${cleaned}) DESC NULLS LAST, m.last_message_at DESC NULLS LAST
     LIMIT 1`;
-  return byName;
+  return person;
 }
 
 export async function getUser(sql: Sql, id: number): Promise<User | undefined> {
@@ -98,26 +131,33 @@ export async function getUserByTgId(sql: Sql, tgId: number): Promise<User | unde
   return user;
 }
 
-export async function setOptOut(sql: Sql, userId: number, optedOut: boolean): Promise<void> {
+/** Opting out removes the person's card in one chat — or, without a chat id, in every chat. */
+export async function setOptOut(sql: Sql, userId: number, optedOut: boolean, chatId?: number): Promise<void> {
+  const scope = chatId ?? null;
   await sql.begin(async (tx) => {
-    await tx`UPDATE users SET opted_out = ${optedOut}, tagline = CASE WHEN ${optedOut} THEN NULL ELSE tagline END WHERE id = ${userId}`;
+    await tx`
+      UPDATE members SET opted_out = ${optedOut}, tagline = CASE WHEN ${optedOut} THEN NULL ELSE tagline END,
+             tagline_manual = CASE WHEN ${optedOut} THEN false ELSE tagline_manual END
+      WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     if (optedOut) {
-      await tx`DELETE FROM facts WHERE user_id = ${userId}`;
-      await tx`DELETE FROM rejected_facts WHERE user_id = ${userId}`;
+      await tx`DELETE FROM facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
+      await tx`DELETE FROM rejected_facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     }
     await tx`
       INSERT INTO change_log (entity, entity_id, op, after, source, actor_user_id)
-      VALUES ('user', ${userId}, ${optedOut ? "opt_out" : "opt_in"}, ${tx.json({ opted_out: optedOut })}, 'user', ${userId})`;
+      VALUES ('user', ${userId}, ${optedOut ? "opt_out" : "opt_in"}, ${tx.json({ opted_out: optedOut, chat_id: scope })}, 'user', ${userId})`;
   });
 }
 
-export async function setTagline(sql: Sql, userId: number, tagline: string | null, actorUserId: number): Promise<void> {
-  await sql`UPDATE users SET tagline = ${tagline}, tagline_manual = ${tagline !== null} WHERE id = ${userId}`;
+export async function setTagline(sql: Sql, chatId: number, userId: number, tagline: string | null, actorUserId: number): Promise<void> {
+  await sql`UPDATE members SET tagline = ${tagline}, tagline_manual = ${tagline !== null} WHERE chat_id = ${chatId} AND user_id = ${userId}`;
   await sql`
     INSERT INTO change_log (entity, entity_id, op, after, source, actor_user_id)
-    VALUES ('user', ${userId}, 'set_tagline', ${sql.json({ tagline })}, 'user', ${actorUserId})`;
+    VALUES ('user', ${userId}, 'set_tagline', ${sql.json({ tagline, chat_id: chatId })}, 'user', ${actorUserId})`;
 }
 
-export async function markLeft(sql: Sql, tgId: number): Promise<void> {
-  await sql`UPDATE users SET left_at = now() WHERE tg_id = ${tgId}`;
+export async function markLeft(sql: Sql, chatId: number, tgId: number): Promise<void> {
+  await sql`
+    UPDATE members SET left_at = now()
+    WHERE chat_id = ${chatId} AND user_id = (SELECT id FROM users WHERE tg_id = ${tgId})`;
 }

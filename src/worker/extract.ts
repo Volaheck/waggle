@@ -8,7 +8,7 @@ import { assertBudget, recordUsage } from "../core/llm.js";
 import type { StoredMessage } from "../core/messages.js";
 import { PROJECT_STATUSES, upsertProject } from "../core/projects.js";
 import { hasForbiddenTopic, slugify, truncate } from "../core/text.js";
-import type { User } from "../core/users.js";
+import { peopleOfChat, type Person } from "../core/users.js";
 
 /** Projects are not facts: they live only in the catalog, so cards never repeat them. */
 export const EXTRACTABLE_KINDS = ["role", "stack", "expertise", "interest", "link", "timezone"] as const;
@@ -146,10 +146,11 @@ export const EXTRACTION_SYSTEM_PROMPT = `Ты — летописец закры�
 
 Пустые массивы — нормальный результат, если нового нет.`;
 
-interface BatchData {
+export interface BatchData {
+  chatId: number;
   batch: StoredMessage[];
   context: StoredMessage[];
-  users: User[];
+  users: Person[];
   facts: Fact[];
   projects: { slug: string; name: string; status: string; authors: string[] }[];
   recentTopics?: { title: string; period_to: Date }[];
@@ -168,8 +169,8 @@ export async function pendingStats(sql: Sql, chatId: number): Promise<PendingSta
   return row ?? { count: 0, oldest: null };
 }
 
-export async function lastSuccessfulRunAt(sql: Sql): Promise<Date | null> {
-  const [row] = await sql<{ at: Date | null }[]>`SELECT max(finished_at) AS at FROM extraction_runs WHERE status = 'done'`;
+export async function lastSuccessfulRunAt(sql: Sql, chatId: number): Promise<Date | null> {
+  const [row] = await sql<{ at: Date | null }[]>`SELECT max(finished_at) AS at FROM extraction_runs WHERE chat_id = ${chatId} AND status = 'done'`;
   return row?.at ?? null;
 }
 
@@ -198,27 +199,27 @@ async function loadBatch(sql: Sql, chatId: number, limit: number): Promise<Batch
   ).reverse();
 
   const authorIds = [...new Set(batch.map((message) => message.user_id).filter((id): id is number => id !== null))];
-  const users = await sql<User[]>`SELECT * FROM users WHERE left_at IS NULL OR id = ANY(${authorIds})`;
+  const users = (await peopleOfChat(sql, chatId, { includeLeft: true })).filter((person) => person.left_at === null || authorIds.includes(person.id));
   const involved = involvedUserIds(batch, [...context, ...batch], users);
   const facts = involved.length
-    ? await sql<Fact[]>`SELECT * FROM facts WHERE user_id = ANY(${involved}) AND status IN ('auto', 'manual') ORDER BY user_id, kind, id`
+    ? await sql<Fact[]>`SELECT * FROM facts WHERE chat_id = ${chatId} AND user_id = ANY(${involved}) AND status IN ('auto', 'manual') ORDER BY user_id, kind, id`
     : [];
   const projects = await sql<{ slug: string; name: string; status: string; authors: string[] }[]>`
     SELECT p.slug, p.name, p.status,
            coalesce(array_agg('u' || pm.user_id) FILTER (WHERE pm.user_id IS NOT NULL), '{}') AS authors
     FROM projects p LEFT JOIN project_members pm ON pm.project_id = p.id
-    WHERE NOT p.hidden
+    WHERE p.chat_id = ${chatId} AND NOT p.hidden
     GROUP BY p.id
     ORDER BY p.name`;
   const recentTopics = await sql<{ title: string; period_to: Date }[]>`
     SELECT title, period_to FROM chronicle
-    WHERE period_to > ${batch[0]!.sent_at}::timestamptz - interval '3 days'
+    WHERE chat_id = ${chatId} AND period_to > ${batch[0]!.sent_at}::timestamptz - interval '3 days'
     ORDER BY period_to DESC
     LIMIT 25`;
-  return { batch, context, users, facts, projects, recentTopics };
+  return { chatId, batch, context, users, facts, projects, recentTopics };
 }
 
-function involvedUserIds(batch: StoredMessage[], all: StoredMessage[], users: User[]): number[] {
+function involvedUserIds(batch: StoredMessage[], all: StoredMessage[], users: Person[]): number[] {
   const ids = new Set<number>();
   const byMsgId = new Map(all.map((message) => [message.msg_id, message]));
   for (const message of batch) {
@@ -233,7 +234,7 @@ function involvedUserIds(batch: StoredMessage[], all: StoredMessage[], users: Us
   return [...ids];
 }
 
-function formatMessage(message: StoredMessage, users: Map<number, User>): string {
+function formatMessage(message: StoredMessage, users: Map<number, Person>): string {
   const author = message.user_id ? users.get(message.user_id) : undefined;
   const who = author ? `${author.display_name} (u${author.id})` : "неизвестный";
   const reply = message.reply_to_msg_id ? ` ↩${message.reply_to_msg_id}` : "";
@@ -315,8 +316,8 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
     const [linked] = topic.project ? await sql<{ id: number }[]>`SELECT id FROM projects WHERE slug = ${slugify(topic.project)} AND NOT hidden` : [];
     const heat = data.batch.filter((message) => message.msg_id >= first && message.msg_id <= last && !message.is_forward).length + msgIds.length;
     await sql`
-      INSERT INTO chronicle (run_id, period_from, period_to, title, summary, kind, msg_ids, user_ids, heat, importance, project_id)
-      VALUES (${runId}, ${periodFrom}, ${periodTo}, ${truncate(topic.title.trim(), 120)}, ${truncate(topic.summary.trim(), 600)},
+      INSERT INTO chronicle (chat_id, run_id, period_from, period_to, title, summary, kind, msg_ids, user_ids, heat, importance, project_id)
+      VALUES (${data.chatId}, ${runId}, ${periodFrom}, ${periodTo}, ${truncate(topic.title.trim(), 120)}, ${truncate(topic.summary.trim(), 600)},
               ${topic.kind}, ${msgIds}, ${userIds}, ${heat}, ${Math.min(5, Math.max(1, Math.round(topic.importance)))}, ${linked?.id ?? null})`;
     stats.topics += 1;
   }
@@ -328,7 +329,7 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
       stats.factsSkipped += 1;
       continue;
     }
-    const outcome = await proposeFact(sql, { userId, kind: item.kind, value: item.value, confidence: item.confidence, sourceMsgIds: sources, source: "llm" });
+    const outcome = await proposeFact(sql, { chatId: data.chatId, userId, kind: item.kind, value: item.value, confidence: item.confidence, sourceMsgIds: sources, source: "llm" });
     if (outcome === "added") stats.factsAdded += 1;
     else if (outcome === "reinforced") stats.factsReinforced += 1;
     else stats.factsSkipped += 1;
@@ -356,6 +357,7 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
       .filter((date): date is Date => Boolean(date))
       .sort((a, b) => b.getTime() - a.getTime())[0];
     const { created } = await upsertProject(sql, {
+      chatId: data.chatId,
       slug: item.slug,
       name: item.name,
       tagline: item.tagline,
@@ -372,13 +374,15 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
     else stats.projectsUpdated += 1;
   }
 
-  stats.signals += await applySignals(sql, runId, result, batchById, users);
+  stats.signals += await applySignals(sql, data.chatId, runId, result, batchById, users);
 
   for (const item of result.taglines) {
     const userId = parseRef(item.person);
     const user = userId !== null ? users.get(userId) : undefined;
     if (!user || user.opted_out || user.tagline_manual || user.tagline || hasForbiddenTopic(item.tagline)) continue;
-    await sql`UPDATE users SET tagline = ${truncate(item.tagline.trim(), 90)} WHERE id = ${user.id} AND tagline IS NULL AND NOT tagline_manual`;
+    await sql`
+      UPDATE members SET tagline = ${truncate(item.tagline.trim(), 90)}
+      WHERE chat_id = ${data.chatId} AND user_id = ${user.id} AND tagline IS NULL AND NOT tagline_manual`;
     stats.taglines += 1;
   }
 
@@ -389,10 +393,11 @@ const SIGNAL_DEDUPE_DAYS = 7;
 
 async function applySignals(
   sql: Sql,
+  chatId: number,
   runId: number,
   result: ExtractionResult,
   batchById: Map<number, StoredMessage>,
-  users: Map<number, User>,
+  users: Map<number, Person>,
 ): Promise<number> {
   let applied = 0;
   const seen = new Set<string>();
@@ -403,7 +408,7 @@ async function applySignals(
     if (hasForbiddenTopic(signal.note)) continue;
     const [project] = await sql<{ id: number; is_author: boolean }[]>`
       SELECT p.id, EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = p.id AND pm.user_id = ${userId}) AS is_author
-      FROM projects p WHERE p.slug = ${slugify(signal.project)} AND NOT p.hidden`;
+      FROM projects p WHERE p.chat_id = ${chatId} AND p.slug = ${slugify(signal.project)} AND NOT p.hidden`;
     if (!project) continue;
     if (project.is_author !== (signal.kind === "milestone")) continue;
     const key = `${project.id}:${userId}:${signal.kind}`;
@@ -447,13 +452,16 @@ export async function callExtractor(anthropic: Anthropic, model: string, prompt:
 export interface ExtractorDeps {
   sql: Sql;
   anthropic: Anthropic;
-  config: Pick<Config, "CHAT_ID" | "EXTRACTION_MODEL" | "MONTHLY_LLM_BUDGET_USD">;
+  chatId: number;
+  /** Monthly cap for this chat. */
+  chatBudgetUsd: number;
+  config: Pick<Config, "EXTRACTION_MODEL" | "MONTHLY_LLM_BUDGET_USD">;
 }
 
 /** One pass = everything pending since the previous pass, normally in a single LLM call. */
 export async function runExtractionPass(deps: ExtractorDeps): Promise<ApplyStats & { calls: number; messages: number }> {
   const { sql, anthropic, config } = deps;
-  const [run] = await sql<{ id: number }[]>`INSERT INTO extraction_runs DEFAULT VALUES RETURNING id`;
+  const [run] = await sql<{ id: number }[]>`INSERT INTO extraction_runs (chat_id) VALUES (${deps.chatId}) RETURNING id`;
   const runId = run!.id;
   const total = { ...emptyStats(), calls: 0, messages: 0 };
   let firstMsgId: number | null = null;
@@ -461,7 +469,7 @@ export async function runExtractionPass(deps: ExtractorDeps): Promise<ApplyStats
 
   try {
     for (let call = 0; call < MAX_CALLS_PER_PASS; call += 1) {
-      const data = await loadBatch(sql, config.CHAT_ID, MAX_MESSAGES_PER_CALL);
+      const data = await loadBatch(sql, deps.chatId, MAX_MESSAGES_PER_CALL);
       if (!data) break;
       const batchIds = data.batch.map((message) => message.msg_id);
       firstMsgId ??= batchIds[0]!;
@@ -470,14 +478,14 @@ export async function runExtractionPass(deps: ExtractorDeps): Promise<ApplyStats
 
       const meaningful = data.batch.some((message) => !message.is_forward && message.text.trim().length >= 3);
       if (meaningful) {
-        await assertBudget(sql, config.MONTHLY_LLM_BUDGET_USD);
+        await assertBudget(sql, config.MONTHLY_LLM_BUDGET_USD, { id: deps.chatId, limitUsd: deps.chatBudgetUsd });
         const { result, usage } = await callExtractor(anthropic, config.EXTRACTION_MODEL, buildExtractionPrompt(data));
-        await recordUsage(sql, "extract", config.EXTRACTION_MODEL, usage);
+        await recordUsage(sql, "extract", config.EXTRACTION_MODEL, usage, deps.chatId);
         total.calls += 1;
         const stats = await applyExtraction(sql, runId, data, result);
         for (const key of Object.keys(stats) as (keyof ApplyStats)[]) total[key] += stats[key];
       }
-      await sql`UPDATE messages SET extracted_at = now() WHERE chat_id = ${config.CHAT_ID} AND msg_id = ANY(${batchIds})`;
+      await sql`UPDATE messages SET extracted_at = now() WHERE chat_id = ${deps.chatId} AND msg_id = ANY(${batchIds})`;
     }
     await sql`
       UPDATE extraction_runs

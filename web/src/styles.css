@@ -200,3 +200,10 @@ button { font: inherit; color: inherit; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ---------- chat switcher (only when the person is in several chats) ---------- */
+.chat-switcher { position: relative; z-index: 2; margin: 4px 0 12px; }
+.chat-current { font: inherit; font-weight: 600; background: none; border: 0; color: var(--text); padding: 6px 0; cursor: pointer; }
+.chat-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.chat-list .chip { border: 0; cursor: pointer; font-family: inherit; }
+.chat-list .chip.active { background: var(--accent-soft); color: var(--accent); }

@@ -33,10 +33,12 @@ export async function saveMessage(sql: Sql, message: IncomingMessage): Promise<v
     ON CONFLICT (chat_id, msg_id) DO NOTHING`;
   if (message.userId !== null) {
     await sql`
-      UPDATE users
-      SET last_message_at = greatest(coalesce(last_message_at, ${message.sentAt}), ${message.sentAt}),
-          first_seen_at = least(coalesce(first_seen_at, ${message.sentAt}), ${message.sentAt})
-      WHERE id = ${message.userId}`;
+      INSERT INTO members (chat_id, user_id, first_seen_at, last_message_at)
+      VALUES (${message.chatId}, ${message.userId}, ${message.sentAt}, ${message.sentAt})
+      ON CONFLICT (chat_id, user_id) DO UPDATE
+      SET last_message_at = greatest(coalesce(members.last_message_at, excluded.last_message_at), excluded.last_message_at),
+          first_seen_at = least(coalesce(members.first_seen_at, excluded.first_seen_at), excluded.first_seen_at),
+          left_at = NULL`;
   }
   await recordLinks(sql, message);
 }
@@ -53,10 +55,10 @@ async function recordLinks(sql: Sql, message: IncomingMessage): Promise<void> {
     if (!normalized || normalized.domain === "t.me") continue;
     const context = truncate(message.text.replace(url, " ").replace(/\s+/g, " ").trim(), 280) || null;
     await sql`
-      INSERT INTO links (url_norm, url, domain, first_user_id, first_msg_id, last_msg_id, from_forward, context, first_seen_at)
-      VALUES (${normalized.norm}, ${url}, ${normalized.domain}, ${message.userId}, ${message.msgId}, ${message.msgId},
+      INSERT INTO links (chat_id, url_norm, url, domain, first_user_id, first_msg_id, last_msg_id, from_forward, context, first_seen_at)
+      VALUES (${message.chatId}, ${normalized.norm}, ${url}, ${normalized.domain}, ${message.userId}, ${message.msgId}, ${message.msgId},
               ${message.isForward}, ${context}, ${message.sentAt})
-      ON CONFLICT (url_norm) DO UPDATE
+      ON CONFLICT (chat_id, url_norm) DO UPDATE
       SET share_count = links.share_count + 1,
           last_msg_id = greatest(links.last_msg_id, excluded.last_msg_id),
           context = coalesce(links.context, excluded.context)`;

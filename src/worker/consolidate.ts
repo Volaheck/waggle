@@ -36,20 +36,23 @@ export const CONSOLIDATION_SYSTEM_PROMPT = `Ты — редактор карто
 Если чистить нечего — верни пустые массивы.`;
 
 export interface ConsolidationInput {
+  chatId: number;
   users: { id: number; display_name: string }[];
   facts: Fact[];
   projects: { slug: string; name: string; tagline: string | null; status: string; links: Record<string, unknown>; authors: string[] }[];
 }
 
-export async function loadConsolidationInput(sql: Sql): Promise<ConsolidationInput> {
-  const users = await sql<{ id: number; display_name: string }[]>`SELECT id, display_name FROM users WHERE NOT opted_out ORDER BY id`;
-  const facts = await sql<Fact[]>`SELECT * FROM facts WHERE status IN ('auto', 'manual', 'hidden') ORDER BY user_id, kind, id`;
+export async function loadConsolidationInput(sql: Sql, chatId: number): Promise<ConsolidationInput> {
+  const users = await sql<{ id: number; display_name: string }[]>`
+    SELECT u.id, u.display_name FROM users u JOIN members m ON m.user_id = u.id
+    WHERE m.chat_id = ${chatId} AND NOT m.opted_out ORDER BY u.id`;
+  const facts = await sql<Fact[]>`SELECT * FROM facts WHERE chat_id = ${chatId} AND status IN ('auto', 'manual', 'hidden') ORDER BY user_id, kind, id`;
   const projects = await sql<ConsolidationInput["projects"]>`
     SELECT p.slug, p.name, p.tagline, p.status, p.links,
            coalesce(array_agg('u' || pm.user_id) FILTER (WHERE pm.user_id IS NOT NULL), '{}') AS authors
     FROM projects p LEFT JOIN project_members pm ON pm.project_id = p.id
-    WHERE NOT p.hidden GROUP BY p.id ORDER BY p.slug`;
-  return { users, facts, projects };
+    WHERE p.chat_id = ${chatId} AND NOT p.hidden GROUP BY p.id ORDER BY p.slug`;
+  return { chatId, users, facts, projects };
 }
 
 export function buildConsolidationPrompt(input: ConsolidationInput): string {
@@ -98,16 +101,16 @@ export async function applyConsolidation(sql: Sql, input: ConsolidationInput, re
   const slugs = new Set(input.projects.map((project) => project.slug));
   for (const merge of result.project_merges) {
     if (!slugs.has(merge.into)) continue;
-    stats.projectsMerged += await mergeProjects(sql, merge.into, merge.from.filter((slug) => slugs.has(slug)));
+    stats.projectsMerged += await mergeProjects(sql, input.chatId, merge.into, merge.from.filter((slug) => slugs.has(slug)));
   }
   for (const update of result.project_updates) {
     const project = input.projects.find((candidate) => candidate.slug === update.slug);
     if (!project || (!update.tagline && !update.status)) continue;
-    await upsertProject(sql, { slug: project.slug, name: project.name, tagline: update.tagline, status: update.status, authorIds: [], sourceMsgIds: [], source: "llm" });
+    await upsertProject(sql, { chatId: input.chatId, slug: project.slug, name: project.name, tagline: update.tagline, status: update.status, authorIds: [], sourceMsgIds: [], source: "llm" });
     stats.projectsUpdated += 1;
   }
   await sql`
-    INSERT INTO app_state (key, value) VALUES ('last_consolidation', ${sql.json({ at: new Date().toISOString(), stats: { ...stats } })})
+    INSERT INTO app_state (key, value) VALUES (${stateKey(input.chatId)}, ${sql.json({ at: new Date().toISOString(), stats: { ...stats } })})
     ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()`;
   return stats;
 }
@@ -115,19 +118,27 @@ export async function applyConsolidation(sql: Sql, input: ConsolidationInput, re
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Weekly, and only when cards or the catalog changed since the previous clean-up. */
-export async function isConsolidationDue(sql: Sql, now = new Date()): Promise<boolean> {
-  const [state] = await sql<{ updated_at: Date }[]>`SELECT updated_at FROM app_state WHERE key = 'last_consolidation'`;
+const stateKey = (chatId: number) => `last_consolidation:${chatId}`;
+
+export async function isConsolidationDue(sql: Sql, chatId: number, now = new Date()): Promise<boolean> {
+  const [state] = await sql<{ updated_at: Date }[]>`SELECT updated_at FROM app_state WHERE key = ${stateKey(chatId)}`;
   if (state && now.getTime() - state.updated_at.getTime() < WEEK_MS) return false;
   const since = state?.updated_at ?? new Date(0);
   const [changed] = await sql<{ changed: boolean }[]>`
-    SELECT EXISTS (SELECT 1 FROM facts WHERE updated_at > ${since}) OR EXISTS (SELECT 1 FROM projects WHERE updated_at > ${since}) AS changed`;
+    SELECT EXISTS (SELECT 1 FROM facts WHERE chat_id = ${chatId} AND updated_at > ${since})
+        OR EXISTS (SELECT 1 FROM projects WHERE chat_id = ${chatId} AND updated_at > ${since}) AS changed`;
   return Boolean(changed?.changed);
 }
 
-export async function runConsolidation(sql: Sql, anthropic: Anthropic, model: string, budgetUsd: number): Promise<ConsolidationStats> {
-  await assertBudget(sql, budgetUsd);
-  await normalizeStacks(sql);
-  const input = await loadConsolidationInput(sql);
+export async function runConsolidation(
+  sql: Sql,
+  anthropic: Anthropic,
+  model: string,
+  budget: { totalUsd: number; chatId: number; chatUsd: number },
+): Promise<ConsolidationStats> {
+  await assertBudget(sql, budget.totalUsd, { id: budget.chatId, limitUsd: budget.chatUsd });
+  await normalizeStacks(sql, budget.chatId);
+  const input = await loadConsolidationInput(sql, budget.chatId);
   const response = await anthropic.messages
     .stream({
       model,
@@ -137,7 +148,7 @@ export async function runConsolidation(sql: Sql, anthropic: Anthropic, model: st
       messages: [{ role: "user", content: buildConsolidationPrompt(input) }],
     })
     .finalMessage();
-  await recordUsage(sql, "consolidate", model, response.usage);
+  await recordUsage(sql, "consolidate", model, response.usage, budget.chatId);
   if (response.stop_reason === "refusal" || response.stop_reason === "max_tokens") throw new Error(`Card clean-up stopped: ${response.stop_reason}`);
   const text = response.content.map((block) => (block.type === "text" ? block.text : "")).join("");
   const parsed = ConsolidationSchema.safeParse(JSON.parse(text));

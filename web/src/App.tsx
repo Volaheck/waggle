@@ -2,6 +2,10 @@ import { useCallback, useEffect, useState, type MouseEvent, type ReactNode } fro
 import {
   api,
   ApiError,
+  chatFromLaunch,
+  screenFromLaunch,
+  setCurrentChat,
+  type ChatInfo,
   FACT_LABELS,
   haptic,
   openTelegram,
@@ -63,7 +67,8 @@ function useLoad<T>(path: string | null): { data: T | null; error: string | null
 
 const ERROR_TEXT: Record<string, string> = {
   unauthorized: "Открой приложение из Telegram — через бота чата.",
-  not_a_member: "Приложение только для участников чата 🐝",
+  not_a_member: "Приложение только для участников чатов, где живёт Waggle 🐝",
+  choose_chat: "Выбери чат сверху 👆",
   network: "Нет связи с сервером. Попробуй ещё раз.",
 };
 
@@ -810,17 +815,64 @@ const TABS: [string, string, string][] = [
   ["/me", "👤", "Я"],
 ];
 
+function ChatSwitcher({ chats, current, onPick }: { chats: ChatInfo[]; current: string | null; onPick: (key: string) => void }) {
+  const [open, setOpen] = useState(current === null);
+  const active = chats.find((chat) => chat.key === current);
+  if (chats.length < 2) return null;
+  return (
+    <div className="chat-switcher">
+      <button
+        className="chat-current"
+        onClick={() => {
+          haptic();
+          setOpen((value) => !value);
+        }}
+      >
+        💬 {active?.title ?? "Выбери чат"} <span className="muted">{open ? "▴" : "▾"}</span>
+      </button>
+      {open && (
+        <div className="chat-list">
+          {chats.map((chat) => (
+            <button
+              key={chat.key}
+              className={`chip ${chat.key === current ? "active" : ""}`}
+              onClick={() => {
+                haptic();
+                setOpen(false);
+                onPick(chat.key);
+              }}
+            >
+              {chat.title ?? chat.key}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function App() {
   const [route, go] = useRoute();
   useTelegramTheme();
+  const chats = useLoad<{ chats: ChatInfo[]; current: string | null }>("/chats");
+  const [chat, setChat] = useState<string | null>(chatFromLaunch());
 
   useEffect(() => {
     tg?.ready();
     tg?.expand();
     if (tg) document.documentElement.dataset.tg = "1";
-    const start = routeFromStartParam(tg?.initDataUnsafe.start_param);
+    const start = routeFromStartParam(screenFromLaunch());
     if (start && !window.location.hash.startsWith("#/")) go(start);
   }, [go]);
+
+  // A chat from the launch link wins if the person is in it; else the one picked last time.
+  useEffect(() => {
+    if (!chats.data) return;
+    const known = chats.data.chats.some((candidate) => candidate.key === chat);
+    const next = known ? chat : chats.data.current;
+    setCurrentChat(next);
+    if (next !== chat) setChat(next);
+  }, [chats.data, chat]);
 
   const [path] = route.split("?");
   const depth = path!.split("/").filter(Boolean).length;
@@ -836,7 +888,11 @@ export function App() {
 
   let screen: ReactNode;
   const [, section, param] = path!.split("/");
-  if (section === "u" && param) screen = <PersonScreen id={param} go={go} />;
+  const ready = chats.data !== null && chat !== null && chats.data.chats.some((candidate) => candidate.key === chat);
+  if (!ready) {
+    const error = chats.error ?? (chats.data && chats.data.chats.length === 0 ? "not_a_member" : chats.data ? "choose_chat" : null);
+    screen = <Status error={error} loading={!chats.data && !chats.error} />;
+  } else if (section === "u" && param) screen = <PersonScreen id={param} go={go} />;
   else if (section === "p" && param) screen = <ProjectScreen slug={decodeURIComponent(param)} go={go} />;
   else if (section === "projects") screen = <ProjectsScreen go={go} />;
   else if (section === "chronicle") screen = <ChronicleScreen />;
@@ -847,7 +903,18 @@ export function App() {
   return (
     <div className="app">
       <Backdrop />
-      <div key={path}>{screen}</div>
+      {chats.data && (
+        <ChatSwitcher
+          chats={chats.data.chats}
+          current={chat}
+          onPick={(key) => {
+            setCurrentChat(key);
+            setChat(key);
+            go("/people");
+          }}
+        />
+      )}
+      <div key={`${chat}:${path}`}>{screen}</div>
       <nav className="tabs">
         {TABS.map(([to, icon, label]) => (
           <button

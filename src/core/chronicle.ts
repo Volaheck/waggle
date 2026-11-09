@@ -1,6 +1,6 @@
 import type { Sql } from "./db.js";
 import type { StoredMessage } from "./messages.js";
-import type { User } from "./users.js";
+import type { Person } from "./users.js";
 
 /** Reads the chronicle the extractor wrote. Plain SQL: bot commands never call the LLM. */
 export interface ChronicleEntry {
@@ -25,11 +25,11 @@ export function topLimitFor(days: number): number {
 }
 
 /** The most important events since a moment: the chronicler's importance first, then how lively the thread was. */
-export async function topChronicle(sql: Sql, since: Date, limit: number): Promise<ChronicleEntry[]> {
+export async function topChronicle(sql: Sql, chatId: number, since: Date, limit: number): Promise<ChronicleEntry[]> {
   return sql<ChronicleEntry[]>`
     SELECT id, title, summary, kind, msg_ids, user_ids, heat, importance, period_from, period_to
     FROM chronicle
-    WHERE period_to > ${since} AND importance >= 2
+    WHERE chat_id = ${chatId} AND period_to > ${since} AND importance >= 2
     ORDER BY importance DESC, heat DESC, period_to DESC
     LIMIT ${limit}`;
 }
@@ -48,7 +48,7 @@ const FALLBACK_HOURS = 24;
 const MAX_LOOKBACK_HOURS = 7 * 24;
 
 /** Builds «что я пропустил» purely from stored chronicle entries. */
-export async function catchupFor(sql: Sql, chatId: number, user: User, sinceHours?: number): Promise<CatchupData> {
+export async function catchupFor(sql: Sql, chatId: number, user: Person, sinceHours?: number): Promise<CatchupData> {
   const now = Date.now();
   const floor = new Date(now - MAX_LOOKBACK_HOURS * 3_600_000);
   let from = sinceHours !== undefined ? new Date(now - sinceHours * 3_600_000) : user.last_message_at ?? new Date(now - FALLBACK_HOURS * 3_600_000);
@@ -63,11 +63,11 @@ export async function catchupFor(sql: Sql, chatId: number, user: User, sinceHour
   }
 
   const [entries, unprocessedRows, lastRunRows, mentions] = await Promise.all([
-    topChronicle(sql, from, 8),
+    topChronicle(sql, chatId, from, 8),
     sql<{ count: number; first: number | null }[]>`
       SELECT count(*)::int AS count, min(msg_id) AS first FROM messages
       WHERE chat_id = ${chatId} AND extracted_at IS NULL AND sent_at > ${from}`,
-    sql<{ at: Date | null }[]>`SELECT max(finished_at) AS at FROM extraction_runs WHERE status = 'done'`,
+    sql<{ at: Date | null }[]>`SELECT max(finished_at) AS at FROM extraction_runs WHERE chat_id = ${chatId} AND status = 'done'`,
     sql<StoredMessage[]>`
       SELECT m.chat_id, m.msg_id, m.user_id, m.sent_at, m.text, m.reply_to_msg_id, m.is_forward, m.forward_source, m.media_type
       FROM messages m
