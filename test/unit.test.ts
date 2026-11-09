@@ -287,7 +287,7 @@ describe("masking personal data before a prompt", () => {
       "Наша группа https://t.me/+5bX9kLmN2pQrStUv и чат по номеру не публикуем",
       "Релиз 2026-11-20 18:00, лог 2026-11-09 10:36:05, считаем 1 2 3 4 5 6 7 8 9 10, бюджет 15 000 000 000",
       "Главный ключ: JavaScript и TypeScript, token: Ethereum, хэштег 3dprintingenthusiastsforever",
-      "https://medium.com/@author/post, v1.2.3, 3.14159265358979, 10.0.19045.1234",
+      "https://medium.com/@author/post, v1.2.3, 3.14159265358979, 10.0.19045.1234, claude-sonnet-4-5-20250929",
     ]) {
       expect(maskPersonalData(text)).toBe(text);
     }

@@ -45,9 +45,10 @@ const IBAN = /\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b/gu;
 /**
  * A run of digits, or digit groups joined by single spaces, dashes or brackets, with an optional leading +.
  * Dots, colons and commas do not join groups, so dates, times, versions and decimals are left alone. A run right
- * after a letter or a slash is part of a word or a path, and after «1.» part of a decimal; after «тел.» it is not.
+ * after a letter or a slash is part of a word or a path, after «1.» part of a decimal and after «sonnet-» part of an
+ * identifier (claude-sonnet-4-5-20250929); after «тел.» it is not.
  */
-const DIGIT_RUN = /(?<![\p{L}\p{N}_@#/])(?<!\d\.)\+?(?:\(\d+\)|\d+)(?:[   -]?(?:\(\d+\)|\d+))*/gu;
+const DIGIT_RUN = /(?<![\p{L}\p{N}_@#/])(?<!\d\.)(?<!\p{L}-)\+?(?:\(\d+\)|\d+)(?:[   -]?(?:\(\d+\)|\d+))*/gu;
 
 /** Shorter numbers are amounts, counts, years and local extensions: nothing to protect, and the chronicle may need them. */
 const LONG_NUMBER_DIGITS = 10;

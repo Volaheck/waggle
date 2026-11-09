@@ -14,6 +14,8 @@ import { startExtractionScheduler, startMessageRetention } from "./worker/schedu
 
 // A stop waits this long for work already under way; all of it together stays below stop_grace_period in docker-compose.yml.
 const PASS_WAIT_MS = 40_000;
+/** How long a stop waits for answers to mentions under way (a Haiku call takes a few seconds). */
+const REPLIES_WAIT_MS = 10_000;
 /** After PASS_WAIT_MS the chronicler call under way is cancelled; this is how long winding it down may take. */
 const CANCEL_WAIT_MS = 5_000;
 const POLLING_STOP_WAIT_MS = 5_000;
@@ -46,11 +48,12 @@ if (interrupted.length) console.warn(`[extract] ${interrupted.length} pass(es) w
 const relinked = await relinkForeignTopics(sql);
 if (relinked) console.log(`[extract] relinked ${relinked} chronicle topic(s) that pointed to another chat's project`);
 
-if (config.ANTHROPIC_API_KEY && !isPricedModel(config.EXTRACTION_MODEL)) {
-  console.warn(`[llm] no price known for EXTRACTION_MODEL “${config.EXTRACTION_MODEL}”: its calls are counted at the highest known rates`);
+for (const [name, model] of [["EXTRACTION_MODEL", config.EXTRACTION_MODEL], ["REPLY_MODEL", config.REPLY_MODEL]] as const) {
+  if (config.ANTHROPIC_API_KEY && !isPricedModel(model)) console.warn(`[llm] no price known for ${name} “${model}”: its calls are counted at the highest known rates`);
 }
 
-const { bot, membership } = createBot({ sql, config });
+const anthropic = config.ANTHROPIC_API_KEY ? createAnthropic(config.ANTHROPIC_API_KEY) : undefined;
+const { bot, membership, assistant } = createBot({ sql, config, anthropic });
 await bot.init();
 // With sql, owners removed from ADMIN_TG_IDS also lose their owner command menu.
 await registerCommands(bot, config.ADMIN_TG_IDS, sql).catch((error) => console.warn("[bot] could not register commands:", error));
@@ -89,10 +92,10 @@ if (webhook) {
   void bot.start({ allowed_updates: [...ALLOWED_UPDATES], onStart: (info) => console.log(`[bot] @${info.username} is listening (long polling)`) });
 }
 
-const stopScheduler = config.ANTHROPIC_API_KEY
+const stopScheduler = anthropic
   ? startExtractionScheduler({
       sql,
-      anthropic: createAnthropic(config.ANTHROPIC_API_KEY),
+      anthropic,
       config,
       notifyAdmins: (text, offer) => notifyAdmins(bot, sql, config.ADMIN_TG_IDS, text, offer),
       endUserIdOf: (chatId) => chatEndUserId(config.BOT_TOKEN, chatId),
@@ -120,6 +123,8 @@ const shutdown = async (signal: string) => {
   }
   server.close();
   if (webhook && !(await settledWithin(WEBHOOK_UPDATES_WAIT_MS, [webhook.settle()]))) console.warn("[main] some updates are still being handled; stopping anyway");
+  // Answers to mentions already under way are sent before the database closes.
+  if (assistant && !(await settledWithin(REPLIES_WAIT_MS, [assistant.idle()]))) console.warn("[main] some answers to mentions did not finish; stopping anyway");
   await sql.end({ timeout: 5 });
   process.exit(0);
 };

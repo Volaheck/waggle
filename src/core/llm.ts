@@ -197,6 +197,11 @@ export function chatEndUserId(secret: string, chatId: number): string {
   return createHmac("sha256", secret).update(`waggle-chat:${chatId}`).digest("hex").slice(0, 32);
 }
 
+/** A member who asks the bot something, as Anthropic's end user: an HMAC of the chat and the member's Telegram id. */
+export function memberEndUserId(secret: string, chatId: number, telegramId: number): string {
+  return createHmac("sha256", secret).update(`waggle-member:${chatId}:${telegramId}`).digest("hex").slice(0, 32);
+}
+
 /**
  * One structured-output call. Transport errors are thrown (after the usage of a broken stream is
  * recorded); a refusal, a cut-off answer or an answer that does not fit the schema comes back as a

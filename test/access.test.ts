@@ -1,11 +1,12 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import type Anthropic from "@anthropic-ai/sdk";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApi } from "../src/api/server.js";
 import { signInitData } from "../src/api/init-data.js";
 import { createBot, registerCommands } from "../src/bot/bot.js";
 import { projectCard } from "../src/bot/format.js";
 import { syncMemberNames } from "../src/bot/names.js";
 import { migrateChat } from "../src/core/chat-migration.js";
-import { getChat, pauseChronicle, registerChat, setChatStatus } from "../src/core/chats.js";
+import { getChat, pauseChronicle, registerChat, resumeChronicle, setChatStatus } from "../src/core/chats.js";
 import type { Config } from "../src/core/config.js";
 import { createSql, migrate, type Sql } from "../src/core/db.js";
 import { proposeFact, visibleFacts } from "../src/core/facts.js";
@@ -608,6 +609,111 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       expect(chat.chronicle_resumed_at).not.toBeNull();
       await bot.handleUpdate(tap(owner, `chatresume:${key(A)}`) as never);
       expect(answers().at(-1)).toBe("It's running already");
+    });
+
+    const fakeClaude = () => {
+      const requests: { model: string; content: string; userId?: string; effort?: string }[] = [];
+      let answer = { stop_reason: "end_turn", text: "Alice knows Rust 🐝" };
+      const client = {
+        messages: {
+          create: async (params: { model: string; messages: { content: string }[]; metadata?: { user_id?: string }; output_config?: { effort?: string } }) => {
+            requests.push({ model: params.model, content: params.messages[0]!.content, userId: params.metadata?.user_id, effort: params.output_config?.effort });
+            return {
+              stop_reason: answer.stop_reason,
+              content: answer.text ? [{ type: "text", text: answer.text }] : [],
+              usage: { input_tokens: 1000, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+            };
+          },
+        },
+      };
+      return { client: client as unknown as Anthropic, requests, answerWith: (next: typeof answer) => void (answer = next) };
+    };
+    const answeringBot = (claude: ReturnType<typeof fakeClaude>) => {
+      const made = createBot({ sql, config: { ...config([OWNER]), REPLY_MODEL: "claude-haiku-5-5", REPLIES_MONTHLY_BUDGET_USD: 10 } as Config, anthropic: claude.client });
+      made.bot.botInfo = botInfo as typeof made.bot.botInfo;
+      made.bot.api.config.use(fakeApi as never);
+      return { bot: made.bot, assistant: made.assistant! };
+    };
+    const MENTION = "@waggle_test_bot";
+    const ask = (from: ReturnType<typeof tg>, question: string, extra: Record<string, unknown> = {}) =>
+      inGroup(A, from, `${MENTION} ${question}`, { entities: [{ type: "mention", offset: 0, length: MENTION.length }], ...extra });
+
+    it("answers a member who mentions it or replies to it, from the chat's cards, with private data masked and within its limits", async () => {
+      const claude = fakeClaude();
+      const { bot: answering, assistant } = answeringBot(claude);
+      await proposeFact(sql, { chatId: A, userId: ids.Alice!, kind: "stack", value: "Rust", confidence: 1, sourceMsgIds: [], source: "user" });
+
+      const question = ask(alice, "who knows Rust? call me +7 912 345-67-89");
+      await answering.handleUpdate(question as never);
+      await assistant.idle();
+      expect(claude.requests).toHaveLength(1);
+      const [first] = claude.requests;
+      expect(first).toMatchObject({ model: "claude-haiku-5-5", effort: "medium" });
+      expect(first!.userId).toMatch(/^[0-9a-f]{32}$/);
+      expect(first!.content).toContain("Rust");
+      expect(first!.content).toContain("call me [phone]");
+      expect(first!.content).toMatch(/<if_insulted motif="[^"]+" \/>/);
+      expect(first!.content).not.toContain("912");
+      const answer = calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === A).at(-1)!;
+      expect(answer.payload.text).toBe("Alice knows Rust 🐝");
+      expect(answer.payload.reply_parameters.message_id).toBe(question.message.message_id);
+
+      // Too soon for the same member; a plain message and a command are not questions.
+      await answering.handleUpdate(ask(alice, "and Go?") as never);
+      await answering.handleUpdate(inGroup(A, bob, "nice") as never);
+      await answering.handleUpdate(inGroup(A, bob, "/who@waggle_test_bot") as never);
+      await assistant.idle();
+      expect(claude.requests).toHaveLength(1);
+
+      // A reply to the bot's message is a question too, and the model sees what it answers.
+      const botMessage = { message_id: 7777, date: now(), chat: { id: A, type: "supergroup", title: "Alpha" }, from: botInfo, text: "Alice knows Rust 🐝" };
+      await answering.handleUpdate(inGroup(A, bob, "and who else?", { reply_to_message: botMessage }) as never);
+      await assistant.idle();
+      expect(claude.requests).toHaveLength(2);
+      expect(claude.requests[1]!.content).toContain("<your_message_they_reply_to>");
+      expect(claude.requests[1]!.content).toContain("<your_recent_answers>\n- to Alice: Alice knows Rust 🐝");
+
+      // After a refusal the member gets a short note and no answers for a while, though the 15 s gap has passed.
+      claude.answerWith({ stop_reason: "refusal", text: "" });
+      await answering.handleUpdate(ask(dave, "something the model refuses") as never);
+      await assistant.idle();
+      expect(sent().at(-1)).toContain("I'll pass on this one");
+      claude.answerWith({ stop_reason: "end_turn", text: "ok" });
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        vi.setSystemTime(Date.now() + 60_000);
+        await answering.handleUpdate(ask(dave, "hi again") as never);
+        await assistant.idle();
+        expect(claude.requests).toHaveLength(3);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("answers nothing over its own monthly cap or in a paused chat, and says why once", async () => {
+      const claude = fakeClaude();
+      const { bot: answering, assistant } = answeringBot(claude);
+      const [usage] = await sql<{ id: number }[]>`
+        INSERT INTO llm_usage (purpose, model, input_tokens, output_tokens, cost_usd, chat_id) VALUES ('reply', 'claude-haiku-5-5', 0, 0, 10, ${A}) RETURNING id`;
+      try {
+        await answering.handleUpdate(ask(alice, "anyone into Rust?") as never);
+        await answering.handleUpdate(ask(bob, "and Go?") as never);
+        await assistant.idle();
+        expect(claude.requests).toHaveLength(0);
+        expect(sent().filter((text) => text.includes("used up this month's budget"))).toHaveLength(1);
+      } finally {
+        await sql`DELETE FROM llm_usage WHERE id = ${usage!.id}`;
+      }
+
+      await pauseChronicle(sql, A, "Claude refused messages from this chat");
+      try {
+        await answering.handleUpdate(ask(dave, "what's new?") as never);
+        await assistant.idle();
+        expect(claude.requests).toHaveLength(0);
+        expect(sent().at(-1)).toContain("I'm paused in this chat");
+      } finally {
+        await resumeChronicle(sql, A);
+      }
     });
 
     it("a rejection survives the bot leaving, and only configured owners decide", async () => {

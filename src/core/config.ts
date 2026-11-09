@@ -31,6 +31,10 @@ const EnvSchema = z.object({
   MONTHLY_LLM_BUDGET_USD: z.coerce.number().default(60),
   /** Default cap per chat; an owner can set another one for a chat. */
   CHAT_MONTHLY_BUDGET_USD: z.coerce.number().default(20),
+  /** The model that answers members who mention the bot or reply to it. */
+  REPLY_MODEL: z.string().default("claude-haiku-5-5"),
+  /** Cap for those answers across all chats, on top of the caps above; 0 turns them off. */
+  REPLIES_MONTHLY_BUDGET_USD: z.coerce.number().min(0).default(10),
   WEB_DIST_DIR: z.string().default("web/dist"),
   /** Local development only: open the Mini App in a plain browser via a secret link printed at startup. */
   DEV_BROWSER_LOGIN: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),

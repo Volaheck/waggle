@@ -1,3 +1,4 @@
+import type Anthropic from "@anthropic-ai/sdk";
 import { Bot, GrammyError, InlineKeyboard } from "grammy";
 import type { Message, User as TelegramUser } from "grammy/types";
 import { migrateChat } from "../core/chat-migration.js";
@@ -14,6 +15,7 @@ import { nextConsolidationRetryAt } from "../worker/consolidate.js";
 import { chatBudgetUsd, nextExtractionRetryAt } from "../worker/scheduler.js";
 import { registerCatalog } from "./catalog.js";
 import { catchupHtml, clampTelegram, countOf, formatDate, userHeader } from "./format.js";
+import { createAssistant, isAddressedToBot, type Assistant } from "./assistant.js";
 import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
 import { isInChat, MembershipCache } from "./membership.js";
 import { registerProfile } from "./profile.js";
@@ -21,6 +23,8 @@ import { registerProfile } from "./profile.js";
 export interface BotDeps {
   sql: Sql;
   config: Config;
+  /** Without it the bot does not answer mentions (no ANTHROPIC_API_KEY). */
+  anthropic?: Anthropic;
 }
 
 const GROUP_COMMANDS = [
@@ -49,7 +53,7 @@ const PRIVATE_COMMANDS = [
 const HELP_TEXT = [
   "🐝 <b>Waggle — the chat's chronicler</b>",
   "",
-  "I read the chat and keep a chronicle, member cards and a project catalog. In the group I stay quiet until someone calls me.",
+  "I read the chat and keep a chronicle, member cards and a project catalog. In the group I stay quiet until someone calls me: mention me or reply to my message and ask about the people here, their projects or what the chat discussed.",
   "",
   "<b>People</b>",
   "/me — your card: fix, add, hide",
@@ -123,8 +127,9 @@ function upgradeOf(error: unknown, fallbackChatId?: number): { from: number; to:
   return from === undefined ? undefined : { from, to: error.parameters.migrate_to_chat_id };
 }
 
-export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: MembershipCache } {
+export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: MembershipCache; assistant?: Assistant } {
   const { sql, config } = deps;
+  const assistant = deps.anthropic ? createAssistant({ sql, anthropic: deps.anthropic, config }) : undefined;
   const bot = new Bot<BotContext>(config.BOT_TOKEN);
   const membership = new MembershipCache(bot.api);
   const kit = createKit(bot, sql, config, membership);
@@ -144,7 +149,7 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
   }
 
   const greeting = () =>
-    `🐝 Hi! I'm Waggle, the chat's chronicler. Every ${config.EXTRACTION_INTERVAL_HOURS} h I go through new messages and keep a chronicle, member cards and a project catalog. In the group I stay quiet until someone calls me. Commands — /help`;
+    `🐝 Hi! I'm Waggle, the chat's chronicler. Every ${config.EXTRACTION_INTERVAL_HOURS} h I go through new messages and keep a chronicle, member cards and a project catalog. In the group I stay quiet until someone calls me: mention me or reply to my message to ask about the people here, their projects or what the chat discussed. Commands — /help`;
 
   async function greetApproved(chatId: number) {
     await bot.api
@@ -381,6 +386,10 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
             forwardSource: forwardSourceOf(message),
             mediaType: mediaTypeOf(message),
           });
+          // A member who mentions the bot or replies to it gets an answer, in the background (see assistant.ts).
+          if (assistant && person && !message.forward_origin && isAddressedToBot(message, ctx.me)) {
+            assistant.answer(ctx.api, { chatId, chatTitle: ctx.chat.title ?? null, message, from: person, me: ctx.me });
+          }
         }
       }
     }
@@ -594,7 +603,7 @@ export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: Me
     if (error.ctx.callbackQuery) void error.ctx.answerCallbackQuery({ text: "Something went wrong 😕" }).catch(() => {});
   });
 
-  return { bot, membership };
+  return { bot, membership, assistant };
 }
 
 const OWNER_COMMANDS = [

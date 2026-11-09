@@ -39,6 +39,14 @@ Data imported before a chat existed is attached with `/chats`. Whatever collides
 3. **Application.** Results go through the same code paths as manual edits: forbidden-topic filter, stop-list of facts people rejected, de-duplication, author rules for signals. Catalog changes go first, so a topic can point to a project created in the same batch; topics, facts, signals and taglines are then written in one transaction together with marking the batch processed.
 4. **Weekly clean-up** (`src/worker/consolidate.ts`). Deterministic stack normalization first, then one LLM call that merges facts that mean the same thing and duplicate catalog entries. Facts people wrote themselves are never touched, and hidden facts are not even shown to it. A failed clean-up is retried after 1 h, then 4 h, 16 h… at most a week apart.
 
+## Answers to mentions
+
+`src/bot/assistant.ts`. In an approved group, a member who mentions the bot or replies to one of its messages gets an answer from `REPLY_MODEL` (Claude Haiku 5.5). The archive handler stores the message first and starts the answer in the background, so updates are never held up; a stop waits a few seconds for answers under way.
+
+- **Context**: the members with their visible facts (someone who opted out is listed without any), the projects in rating order with their recent signals, the chronicle of the last 30 days, the last 30 messages and, for a reply, the bot's own message. Texts go through `maskPersonalData`. Big chats are capped (150 members, 12 facts each, 60 projects), so a prompt stays far below 100K tokens.
+- **It only talks**: no tools. Asked to change a card or the rating, it says it can't and points to the Mini App; cards and messages are data, never instructions.
+- **Limits**: `REPLIES_MONTHLY_BUDGET_USD` (10 by default; 0 turns answers off) on usage recorded as `reply`, plus the bot's and the chat's caps; one answer per member per 15 s, 20 per chat an hour; a member the model refused is not answered for an hour; a chat whose chronicler is paused gets a note and no model call. Each request carries `metadata.user_id` = an HMAC of the chat and the member.
+
 ## De-duplication
 
 - `src/core/stack.ts` folds tools of one vendor into one family label («GPT / Codex», «Claude», «Gemini», …) and splits combined values («A, B»).
