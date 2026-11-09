@@ -628,8 +628,13 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       };
       return { client: client as unknown as Anthropic, requests, answerWith: (next: typeof answer) => void (answer = next) };
     };
-    const answeringBot = (claude: ReturnType<typeof fakeClaude>) => {
-      const made = createBot({ sql, config: { ...config([OWNER]), REPLY_MODEL: "claude-haiku-5-5", REPLIES_MONTHLY_BUDGET_USD: 10 } as Config, anthropic: claude.client });
+    const answeringBot = (claude: ReturnType<typeof fakeClaude>, limits: { memberGapMs?: number; chatPerHour?: number } = {}) => {
+      const made = createBot({
+        sql,
+        config: { ...config([OWNER]), REPLY_MODEL: "claude-haiku-5-5", REPLIES_MONTHLY_BUDGET_USD: 10 } as Config,
+        anthropic: claude.client,
+        answerLimits: { memberGapMs: 50, ...limits },
+      });
       made.bot.botInfo = botInfo as typeof made.bot.botInfo;
       made.bot.api.config.use(fakeApi as never);
       return { bot: made.bot, assistant: made.assistant! };
@@ -640,7 +645,7 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
 
     it("answers a member who mentions it or replies to it, from the chat's cards, with private data masked and within its limits", async () => {
       const claude = fakeClaude();
-      const { bot: answering, assistant } = answeringBot(claude);
+      const { bot: answering, assistant } = answeringBot(claude, { memberGapMs: 300 });
       await proposeFact(sql, { chatId: A, userId: ids.Alice!, kind: "stack", value: "Rust", confidence: 1, sourceMsgIds: [], source: "user" });
 
       const question = ask(alice, "who knows Rust? call me +7 912 345-67-89");
@@ -658,36 +663,56 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       expect(answer.payload.text).toBe("Alice knows Rust 🐝");
       expect(answer.payload.reply_parameters.message_id).toBe(question.message.message_id);
 
-      // Too soon for the same member; a plain message and a command are not questions.
-      await answering.handleUpdate(ask(alice, "and Go?") as never);
+      // A plain message and a command are not questions.
       await answering.handleUpdate(inGroup(A, bob, "nice") as never);
       await answering.handleUpdate(inGroup(A, bob, "/who@waggle_test_bot") as never);
       await assistant.idle();
       expect(claude.requests).toHaveLength(1);
 
+      // Three questions in a burst: the first is answered at once, the rest wait for the gap and get one answer,
+      // to the latest message, with the earlier ones among the recent messages. Nothing is dropped.
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      await answering.handleUpdate(ask(alice, "and Go?") as never);
+      await answering.handleUpdate(ask(alice, "and Kotlin?") as never);
+      const latest = ask(alice, "and Swift?");
+      await answering.handleUpdate(latest as never);
+      await assistant.idle();
+      expect(claude.requests).toHaveLength(3);
+      expect(claude.requests[1]!.content).toContain("and Go?");
+      expect(claude.requests[2]!.content).toContain("and Kotlin?");
+      expect(claude.requests[2]!.content).toMatch(/<question from="Alice">\nand Swift\?/);
+      const toLatest = calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === A).at(-1)!;
+      expect(toLatest.payload.reply_parameters.message_id).toBe(latest.message.message_id);
+
       // A reply to the bot's message is a question too, and the model sees what it answers.
       const botMessage = { message_id: 7777, date: now(), chat: { id: A, type: "supergroup", title: "Alpha" }, from: botInfo, text: "Alice knows Rust 🐝" };
       await answering.handleUpdate(inGroup(A, bob, "and who else?", { reply_to_message: botMessage }) as never);
       await assistant.idle();
-      expect(claude.requests).toHaveLength(2);
-      expect(claude.requests[1]!.content).toContain("<your_message_they_reply_to>");
-      expect(claude.requests[1]!.content).toContain("<your_recent_answers>\n- to Alice: Alice knows Rust 🐝");
+      expect(claude.requests).toHaveLength(4);
+      expect(claude.requests[3]!.content).toContain("<your_message_they_reply_to>");
+      expect(claude.requests[3]!.content).toContain("<your_recent_answers>\n- to Alice: Alice knows Rust 🐝");
 
-      // After a refusal the member gets a short note and no answers for a while, though the 15 s gap has passed.
+      // After a refusal the member gets a short note and then silence for a while, though the gap has long passed.
       claude.answerWith({ stop_reason: "refusal", text: "" });
       await answering.handleUpdate(ask(dave, "something the model refuses") as never);
       await assistant.idle();
       expect(sent().at(-1)).toContain("I'll pass on this one");
       claude.answerWith({ stop_reason: "end_turn", text: "ok" });
-      vi.useFakeTimers({ toFake: ["Date"] });
-      try {
-        vi.setSystemTime(Date.now() + 60_000);
-        await answering.handleUpdate(ask(dave, "hi again") as never);
-        await assistant.idle();
-        expect(claude.requests).toHaveLength(3);
-      } finally {
-        vi.useRealTimers();
-      }
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      await answering.handleUpdate(ask(dave, "hi again") as never);
+      await assistant.idle();
+      expect(claude.requests).toHaveLength(5);
+    });
+
+    it("tells a busy chat once that it will answer later, instead of going quiet", async () => {
+      const claude = fakeClaude();
+      const { bot: answering, assistant } = answeringBot(claude, { chatPerHour: 1 });
+      await answering.handleUpdate(ask(alice, "who is new here?") as never);
+      await answering.handleUpdate(ask(bob, "and what about projects?") as never);
+      await answering.handleUpdate(ask(dave, "and the chronicle?") as never);
+      await assistant.idle();
+      expect(claude.requests).toHaveLength(1);
+      expect(sent().filter((text) => text.includes("answered a lot here this hour"))).toHaveLength(1);
     });
 
     it("answers nothing over its own monthly cap or in a paused chat, and says why once", async () => {

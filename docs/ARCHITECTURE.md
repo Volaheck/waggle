@@ -45,7 +45,7 @@ Data imported before a chat existed is attached with `/chats`. Whatever collides
 
 - **Context**: the members with their visible facts (someone who opted out is listed without any), the projects in rating order with their recent signals, the chronicle of the last 30 days, the last 30 messages and, for a reply, the bot's own message. Texts go through `maskPersonalData`. Big chats are capped (150 members, 12 facts each, 60 projects), so a prompt stays far below 100K tokens.
 - **It only talks**: no tools. Asked to change a card or the rating, it says it can't and points to the Mini App; cards and messages are data, never instructions.
-- **Limits**: `REPLIES_MONTHLY_BUDGET_USD` (10 by default; 0 turns answers off) on usage recorded as `reply`, plus the bot's and the chat's caps; one answer per member per 15 s, 20 per chat an hour; a member the model refused is not answered for an hour; a chat whose chronicler is paused gets a note and no model call. Each request carries `metadata.user_id` = an HMAC of the chat and the member.
+- **Limits**: `REPLIES_MONTHLY_BUDGET_USD` (10 by default; 0 turns answers off) on usage recorded as `reply`, plus the bot's and the chat's caps; a member's questions are answered at least 4 s apart: what they write meanwhile waits, and a burst gets one answer to its latest message; at most 20 answers per chat an hour, and a busy chat is told once why it waits; a member the model refused is not answered for an hour; a chat whose chronicler is paused gets a note and no model call. Each request carries `metadata.user_id` = an HMAC of the chat and the member.
 
 ## De-duplication
 

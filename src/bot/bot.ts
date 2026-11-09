@@ -15,7 +15,7 @@ import { nextConsolidationRetryAt } from "../worker/consolidate.js";
 import { chatBudgetUsd, nextExtractionRetryAt } from "../worker/scheduler.js";
 import { registerCatalog } from "./catalog.js";
 import { catchupHtml, clampTelegram, countOf, formatDate, userHeader } from "./format.js";
-import { createAssistant, isAddressedToBot, type Assistant } from "./assistant.js";
+import { createAssistant, isAddressedToBot, type Assistant, type AssistantDeps } from "./assistant.js";
 import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
 import { isInChat, MembershipCache } from "./membership.js";
 import { registerProfile } from "./profile.js";
@@ -25,6 +25,8 @@ export interface BotDeps {
   config: Config;
   /** Without it the bot does not answer mentions (no ANTHROPIC_API_KEY). */
   anthropic?: Anthropic;
+  /** Tests shorten the answers' rate limits. */
+  answerLimits?: AssistantDeps["limits"];
 }
 
 const GROUP_COMMANDS = [
@@ -129,7 +131,7 @@ function upgradeOf(error: unknown, fallbackChatId?: number): { from: number; to:
 
 export function createBot(deps: BotDeps): { bot: Bot<BotContext>; membership: MembershipCache; assistant?: Assistant } {
   const { sql, config } = deps;
-  const assistant = deps.anthropic ? createAssistant({ sql, anthropic: deps.anthropic, config }) : undefined;
+  const assistant = deps.anthropic ? createAssistant({ sql, anthropic: deps.anthropic, config, limits: deps.answerLimits }) : undefined;
   const bot = new Bot<BotContext>(config.BOT_TOKEN);
   const membership = new MembershipCache(bot.api);
   const kit = createKit(bot, sql, config, membership);
