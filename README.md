@@ -35,7 +35,7 @@ Bot commands never call the LLM — they read the database. Only a mention of th
 | `/chronicle`, `/today`, `/week` | the chronicle |
 | `/whatyouknow`, `/forgetme` | privacy |
 | `/chats` | owner: approve or reject chats, attach imported history |
-| `/botstatus`, `/link @username Name` | owner: status per chat; link an imported card to an account (or `/link Name` as a reply to their message) |
+| `/botstatus`, `/link @username Name` | owner: status per chat (asked in a group, it comes to the owner's DM); link an imported card to an account (or `/link Name` as a reply to their message) |
 
 In DM the bot works with one chat at a time; if you are in several, it asks which one and remembers the choice (🔁 switches).
 

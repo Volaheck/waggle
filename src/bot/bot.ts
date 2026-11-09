@@ -660,8 +660,9 @@ export function createBot(deps: BotDeps): {
     await kit.show(ctx, `Linked the card “${escapeHtml(card.display_name)}” to ${userHeader(into)} ✅`);
   });
 
+  /** It names every chat and its spending, so it only ever goes to the owner's DM, wherever it was asked. */
   bot.command("botstatus", async (ctx) => {
-    if (!ctx.from || !kit.isPrivate(ctx)) return;
+    if (!ctx.from) return;
     const user = await kit.identity(ctx.from);
     if (!kit.isOwner(user)) return;
     const lines = ["<b>Status</b>", `Chronicler: every ${config.EXTRACTION_INTERVAL_HOURS} h`];
@@ -716,7 +717,16 @@ export function createBot(deps: BotDeps): {
     lines.push(answers.join("; "));
     const pending = (await allChats(sql)).filter((chat) => chat.status === "pending").length;
     if (pending) lines.push(`⏳ Chats awaiting approval: ${pending} — /chats`);
-    await kit.show(ctx, lines.join("\n"));
+    const status = lines.join("\n");
+    if (kit.isPrivate(ctx)) return void (await kit.show(ctx, status));
+    try {
+      await ctx.api.sendMessage(user.tg_id!, clampTelegram(status), { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+      await ctx.react("👌").catch(() => {});
+    } catch (error) {
+      if (!(error instanceof GrammyError && error.error_code === 403)) throw error;
+      await sql`UPDATE users SET dm_started = false WHERE id = ${user.id}`;
+      await kit.show(ctx, "The status goes to your DM, and I can't message you there yet — open the bot 👇", new InlineKeyboard().url("Open the bot", `https://t.me/${bot.botInfo.username}`));
+    }
   });
 
   // Plain text in DM is the answer to a question the bot asked; otherwise show the menu. Mentions in a group get help.

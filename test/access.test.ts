@@ -374,6 +374,8 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
     type Answer = { status: string; is_member?: boolean } | { error: string; parameters?: Record<string, unknown> };
     const calls: { method: string; payload: Record<string, any> }[] = [];
     let membershipOf: (chatId: number, tgId: number) => Answer = () => ({ status: "member" });
+    /** People who never opened the bot: Telegram refuses to message them. */
+    const dmClosed = new Set<number>();
     /** Basic groups that became supergroups: Telegram refuses every call to the old id and names the new one. */
     const upgraded = new Map<number, number>();
     let updateId = 1;
@@ -394,6 +396,9 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
         const answer = membershipOf(payload.chat_id, payload.user_id);
         if ("error" in answer) return { ok: false, error_code: 400, description: answer.error, parameters: answer.parameters };
         return { ok: true, result: { ...answer, user: { id: payload.user_id, is_bot: false, first_name: "X" } } };
+      }
+      if (method === "sendMessage" && dmClosed.has(payload.chat_id)) {
+        return { ok: false, error_code: 403, description: "Forbidden: bot can't initiate conversation with a user" };
       }
       if (method === "sendMessage" || method === "editMessageText") {
         return { ok: true, result: { message_id: ++msgId, date: 0, chat: { id: payload.chat_id ?? 0, type: "private", first_name: "x" }, text: payload.text } };
@@ -879,6 +884,30 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       await registerCommands(formerOwnerBot, [], sql);
       expect(calls.some((call) => call.method === "deleteMyCommands" && call.payload.scope?.chat_id === OWNER)).toBe(true);
       expect((await sql<{ is_admin: boolean }[]>`SELECT is_admin FROM users WHERE tg_id = ${OWNER}`)[0]!.is_admin).toBe(false);
+    });
+
+    it("/botstatus asked in a group goes to the owner's DM, and only for the owner", async () => {
+      const owner = tg(OWNER, "Owner");
+      const statuses = () => calls.filter((call) => call.method === "sendMessage" && String(call.payload.text).includes("<b>Status</b>"));
+      await bot.handleUpdate(inGroup(A, owner, "/botstatus") as never);
+      await offersSent.get(bot)!();
+      expect(statuses().map((call) => call.payload.chat_id)).toEqual([OWNER]);
+      expect(calls.some((call) => call.method === "sendMessage" && call.payload.chat_id === A)).toBe(false);
+      expect(calls.some((call) => call.method === "setMessageReaction" && call.payload.chat_id === A)).toBe(true);
+
+      calls.length = 0;
+      await bot.handleUpdate(inGroup(A, alice, "/botstatus") as never);
+      expect(statuses()).toHaveLength(0);
+
+      dmClosed.add(OWNER);
+      try {
+        await bot.handleUpdate(inGroup(A, owner, "/botstatus") as never);
+        const inGroupNote = calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === A).at(-1);
+        expect(String(inGroupNote?.payload.text)).toContain("open the bot");
+        expect(String(inGroupNote?.payload.text)).not.toContain("Status");
+      } finally {
+        dmClosed.delete(OWNER);
+      }
     });
 
     it("/botstatus tells the owner when a failed pass and a failed clean-up run again, and what was skipped", async () => {
