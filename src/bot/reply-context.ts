@@ -100,6 +100,9 @@ const FOCUS_TOPIC_DAYS = 60;
 /** How many of a person's private notes of each kind the focus shows, newest first. */
 const FOCUS_NOTES: Partial<Record<NoteKind, number>> = { claim: 4, prediction: 3, stance: 4, correction: 3, bout: 3, bait: 2, about_bot: 2 };
 const FOCUS_JOKES = 4;
+/** Statuses of a project standing still, and the words a tagline says it with. */
+const STILL_STATUSES = new Set(["paused", "abandoned"]);
+const STILL_WORDS = /(?<!\p{L})(?:на\s+паузе|пауз\p{L}*|заморож\p{L}*|заброш\p{L}*|paused|on hold|abandoned|frozen)(?!\p{L})/iu;
 /** A person's own notes in the focus, and a project's in its details: the newest this many. */
 const FOCUS_MEMOS = 5;
 const PROJECT_MEMOS = 5;
@@ -372,7 +375,7 @@ export function aboutYouBlock(input: {
     "<about_you>",
     `You are ${safe(me.first_name)} (@${me.username}), the chat's chronicler bot; this answer is written by ${input.model}.`,
     owners.length ? `Your ${owners.length > 1 ? "owners, who built you and pay" : "owner, who built you and pays"} for you: ${owners.join("; ")}.` : "",
-    "You read the chat and keep the members' cards, the project catalog with its rating and the chronicle, and you answer when someone mentions you or replies to you. You cannot change any data, vote, run code, browse the web or send images or widgets. People edit their cards in the Mini App (/app); /forgetme erases what you know about a person.",
+    "You read the chat and keep the members' cards, the project catalog with its rating and the chronicle, and you answer when someone mentions you or replies to you. A member changes their own card, tagline, names and notes (about themselves or on a project of theirs) by asking you plainly in the chat: you do it and post a receipt with ↩️ Undo, and ↪️ Redo after an Undo; the Mini App (/app) does the same. Nobody changes anyone else's data, a project's catalog entry, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets. /forgetme erases what you know about a person.",
     entry
       ? `In the catalog you are the project ${safe(entry.project.name)}: #${entry.rank} of ${entry.total}, ${entry.project.score} rating points, ${entry.project.votes} vote(s).`
       : "",
@@ -539,6 +542,7 @@ function projectDetailsBlock(input: {
   breakdown: Map<number, RatingBreakdown>;
   former: Map<number, FormerName[]>;
   memos: Map<number, ProjectMemo[]>;
+  statusSince: Map<number, Date>;
   clock: Clock;
 }): string {
   const { ranked, clock } = input;
@@ -571,7 +575,7 @@ function projectDetailsBlock(input: {
       .filter((entry) => !entry.merged)
       .map((entry) => `from ${safe(entry.name)} on ${dateLabel(entry.at, clock)}`);
     return [
-      `${safe(project.name)} (#${project.slug}): #${rank} of ${ranked.length}, ${project.score} rating points${standing ? `; ${standing}` : ""}. Status: ${STATUS_LABELS[project.status] ?? project.status}.`,
+      `${safe(project.name)} (#${project.slug}): #${rank} of ${ranked.length}, ${project.score} rating points${standing ? `; ${standing}` : ""}. Status: ${STATUS_LABELS[project.status] ?? project.status}${input.statusSince.has(project.id) ? ` since ${dateLabel(input.statusSince.get(project.id)!, clock)}` : ""}.`,
       `Votes: ${votes.length}${votes.length ? ` (${votes.map((at) => dateLabel(at, clock)).join(", ")})` : ""}.`,
       kinds.length ? `Signals counted now, in points: ${kinds.join("; ")}.` : "No other signals count now.",
       project.status === "abandoned" ? `Abandoned: the total is multiplied by ${ABANDONED_MULTIPLIER}.` : "",
@@ -583,6 +587,27 @@ function projectDetailsBlock(input: {
       .join("\n");
   });
   return sections.length ? `<project_details>\n${sections.join("\n\n")}\n</project_details>` : "";
+}
+
+/**
+ * When each project's status last changed: the first of the latest run of logged changes with that status (imports and
+ * the chronicler log what a project became, people what it was too), else when the project was made.
+ */
+async function statusDates(sql: Sql, projectIds: number[]): Promise<Map<number, Date>> {
+  if (projectIds.length === 0) return new Map();
+  const rows = await sql<{ id: number; since: Date }[]>`
+    SELECT p.id, coalesce(changed.at, p.created_at) AS since
+    FROM projects p
+    LEFT JOIN LATERAL (
+      SELECT at FROM (
+        SELECT c.at, c.after->>'status' AS status, lag(c.after->>'status') OVER (ORDER BY c.at, c.id) AS previous
+        FROM change_log c WHERE c.entity = 'project' AND c.entity_id = p.id AND c.after ? 'status'
+      ) AS logged
+      WHERE previous IS DISTINCT FROM status AND status = p.status
+      ORDER BY at DESC LIMIT 1
+    ) AS changed ON true
+    WHERE p.id = ANY(${projectIds}::int[])`;
+  return new Map(rows.map((row) => [row.id, row.since]));
 }
 
 /** Notes people wrote themselves, each with its date: their own word, current unless they say otherwise. */
@@ -851,14 +876,17 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     return `- ${who}${tagline}${card.length ? ` | ${card.join("; ")}` : ""}`;
   });
 
+  const statusSince = await statusDates(sql, projects.slice(0, MAX_PROJECTS).map((project) => project.id));
   const catalog = projects.slice(0, MAX_PROJECTS).map((project, index) => {
     const links = [project.links.repo, project.links.site, ...(project.links.other ?? [])].filter(Boolean).join(" ");
+    // A tagline written while a project stood still outlives its comeback: the status says where it is now.
+    const stale = project.tagline && !STILL_STATUSES.has(project.status) ? STILL_WORDS.exec(project.tagline) : null;
     const signals = project.recent_signals.map((signal) => signal.note).slice(0, 3);
     return safe(
       [
-        `${index + 1}. ${project.name} — ${project.status.replace("_", " ")}, ${project.score} rating points, ${project.votes} vote(s)`,
+        `${index + 1}. ${project.name} — ${project.status.replace("_", " ")}${statusSince.has(project.id) ? ` since ${dateLabel(statusSince.get(project.id)!, clock)}` : ""}, ${project.score} rating points, ${project.votes} vote(s)`,
         project.authors.length ? `by ${project.authors.map((author) => author.display_name).join(", ")}` : "",
-        project.tagline ? `“${project.tagline}”` : "",
+        project.tagline ? `“${project.tagline}”${stale ? ` (an old tagline: it says «${stale[0]}», but the status, ${project.status.replace("_", " ")}, is current)` : ""}` : "",
         project.stack.length ? `stack: ${project.stack.join(", ")}` : "",
         links ? `links: ${links}` : "",
         signals.length ? `recent: ${signals.join("; ")}` : "",
@@ -910,7 +938,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   ];
   const aboutQuestion = [
     earlier.length ? "</earlier_messages>" : "",
-    projectDetailsBlock({ ranked: projects, picked, breakdown, former: formerOf, memos: groupBy(pickedMemos, (memo) => memo.project_id!), clock }),
+    projectDetailsBlock({ ranked: projects, picked, breakdown, former: formerOf, memos: groupBy(pickedMemos, (memo) => memo.project_id!), statusSince, clock }),
     inFocusBlock({
       focus: focusPeople,
       facts: groupBy(focusFacts, (fact) => fact.user_id),

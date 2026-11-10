@@ -66,6 +66,7 @@ const CARD_REQUEST_TEXTS: Record<string, string> = {
   about_others: "[asked the bot to change another member's card; the bot refused]",
   fake_claim: "[asked the bot to say it changed someone's data; the bot refused]",
   unclear: "[asked the bot to change their card without saying what]",
+  redo: "[asked the bot to bring back a change of their own card they had undone]",
   parsing: "[a request to the bot about a card]",
 };
 

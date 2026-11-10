@@ -13,6 +13,7 @@ import { createSql, migrate, type Sql } from "../src/core/db.js";
 import { mergeSeedUser } from "../src/core/merge.js";
 import { saveBotMessage, saveMessage } from "../src/core/messages.js";
 import { CONSENT, dueDate, saveNote, type NoteInput } from "../src/core/notes.js";
+import { addUserProject } from "../src/core/projects.js";
 import { canonicalTerm, recurringThemes, termsOf, textTerms, themesMatching } from "../src/core/themes.js";
 import { hasForbiddenTopic } from "../src/core/text.js";
 import { forgetUser, resolveUser, setOptOut, setTagline, type User } from "../src/core/users.js";
@@ -810,6 +811,18 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       const asked = (index: number) => new Set(worded[index]!.map(({ term }) => term));
       expect(wornWords(worded.slice(0, 4), asked(4))).toEqual(["обещания", "2.5"]);
       expect(wornWords(worded.slice(0, 4), asked(5))).toEqual(["2.5"]);
+    });
+
+    it("marks a tagline that says a project stands still when its status says it moves", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      const project = (await addUserProject(sql, { chatId: chat, name: "Beacon", tagline: "Личный проект Кита, сейчас на паузе", actorUserId: kit.id })).project;
+      await sql`UPDATE projects SET status = 'in_progress' WHERE id = ${project.id}`;
+      const catalog = block(await contextFor(asking(chat, kit, "что с проектами?")), "projects")!;
+      expect(catalog).toContain("“Личный проект Кита, сейчас на паузе” (an old tagline: it says «на паузе», but the status, in progress, is current)");
+      expect(catalog).toMatch(/Beacon — in progress since \d{1,2} \w{3,4}/);
+      await sql`UPDATE projects SET status = 'paused' WHERE id = ${project.id}`;
+      expect(block(await contextFor(asking(chat, kit, "что с проектами?")), "projects")!).not.toContain("an old tagline");
     });
 
     it("shows the notes people wrote themselves in the focus, dated", async () => {

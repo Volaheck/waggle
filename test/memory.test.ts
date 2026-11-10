@@ -194,7 +194,8 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
       expect(about).toContain("You are Waggle (@waggle_test_bot)");
       expect(about).toContain("written by claude-opus-5-5");
       expect(about).toContain("Your owner, who built you and pays for you: Maestro (@maestro_owner), also called Капитан.");
-      expect(about).toContain("You cannot change any data, vote, run code, browse the web or send images or widgets.");
+      expect(about).toContain("by asking you plainly in the chat: you do it and post a receipt with ↩️ Undo");
+      expect(about).toContain("Nobody changes anyone else's data, a project's catalog entry, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets.");
       expect(about).toContain("/forgetme");
       expect(about).toContain("In the catalog you are the project Waggle: #2 of 2, 0 rating points, 0 vote(s).");
     });
@@ -333,7 +334,7 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
       await signal("milestone", 5, "first 1000 users", 400, kit.id);
 
       const details = block(await contextFor(asking(chat, dora, "почему у Atlas такой рейтинг?")), "project_details")!;
-      expect(details).toContain("Atlas (#atlas): #2 of 3, 19 rating points; the leader Nova has 25 (6 more). Status: in progress.");
+      expect(details).toMatch(/Atlas \(#atlas\): #2 of 3, 19 rating points; the leader Nova has 25 \(6 more\)\. Status: in progress since \d{1,2} \w{3,4}\./);
       expect(details).toMatch(/^Votes: 1 \(\d{1,2} \w{3,4}(?: \d{4})?\)\.$/m);
       expect(details).toContain("usage 11.2 (impact 4, ");
       expect(details).toContain("praise 3.2 (impact 2, ");

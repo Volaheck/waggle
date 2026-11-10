@@ -395,7 +395,7 @@ export function createBot(deps: BotDeps): {
 
   // Owners' own private chats, through Telegram Business: handled apart from everything below.
   registerBusiness(bot, { sql, config, remindersOn: businessRemindersOn(deps.anthropic, config) });
-  registerSelfEdits(bot, { sql });
+  registerSelfEdits(bot, { sql, botNames: () => [bot.botInfo.first_name, bot.botInfo.username] });
 
   bot.callbackQuery(/^seedok:(\d+)$/, async (ctx) => {
     const owner = await kit.identity(ctx.from);

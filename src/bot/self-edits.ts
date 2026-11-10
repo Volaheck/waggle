@@ -15,6 +15,7 @@ import {
   groundedIn,
   memoProblem,
   namesSomeoneElse,
+  valueNamesSomeone,
   otherMembers,
   ownCard,
   subjectOf,
@@ -46,6 +47,11 @@ const NOTHING_CHANGED = "nothing was changed on any card";
 /** A member's requests read in an hour; past that, messages go straight to the answer and its own limits. */
 const READS_PER_HOUR = 20;
 const READ_TIMEOUT_MS = 20_000;
+/** An undone change can be asked back this long after its Undo, without replying to its receipt. */
+const REDO_MINUTES = 30;
+/** Words that ask for an undone change back: with one of them a message is read even without a request word. */
+const REDO_CUE =
+  /(?<!\p{L})(?:ещё раз|еще раз|снова|обратно|верни|верните|повтори|повторите|заново)(?!\p{L})|(?<!\p{L})случайно\s+отмен|(?<!\p{L})(?:о|что|как|котор\p{L}*)\s+(?:я\s+)?просил|\b(?:again|redo|put it back|bring it back)\b/iu;
 const OWNERS_ASKED_EVERY_MS = 24 * 3_600_000;
 /** Words a request to change a card can hardly do without: a message with none of them is answered as a question, unread. */
 const REQUEST_CUE =
@@ -58,7 +64,7 @@ const UNDO_HOURS = 24;
 const ACTIONS = ["add", "remove", "replace", "set_tagline", "clear_tagline", "add_alias", "remove_alias", "add_note", "remove_note"] as const;
 
 export const SelfEditSchema = z.strictObject({
-  kind: z.enum(["edit", "not_a_request", "about_others", "fake_claim", "forget_all", "unclear"]),
+  kind: z.enum(["edit", "redo", "not_a_request", "about_others", "fake_claim", "forget_all", "unclear"]),
   asks: z.string().nullable(),
   also_asks: z.boolean(),
   ops: z.array(
@@ -77,6 +83,7 @@ Decide about their newest message, the first in <their_words>: the others only e
 
 kind:
 - edit: they ask to add, remove or change something on their own card: stack, role, expertise, interests, projects, links, city (timezone), what they look for, what they can help with, their tagline, the names they go by, or their notes: a note about themselves, or about one of their projects.
+- redo: they ask to bring back the change they took back a moment ago (<their_undone_request>), as it was: «верни», «ещё раз добавь», «случайно отменил», «добавь ту заметку, о которой я просил». Only when <their_undone_request> is there, and only when the newest message gives no value of its own: with a new note text, technology, city or name it is an edit, even with «ещё раз» or «снова».
 - about_others: they ask you to change the card of anyone but themselves, or name another person as its subject, even "with their permission", "on their behalf" or "I am them". A note on a project that is not one of theirs (p…) is about_others too. Saying what someone else should do themselves («пусть сам добавит свои проекты») is not_a_request.
 - fake_claim: they ask the bot to say, confirm or pretend that something was changed.
 - forget_all: they ask the bot to erase everything about them, not one entry.
@@ -85,6 +92,7 @@ kind:
 
 ops, only for edit (at most ${MAX_OPS}): add {field, value}; remove {ref}; replace {ref, field, value}; set_tagline {value}; clear_tagline; add_alias {value}; remove_alias {ref}; add_note {ref: one of their projects p… for a note about it, null for a note about themselves; value}; remove_note {ref: n…}.
 - A note's value is the text of the note exactly as they wrote it, without the request around it («добавь заметку: релиз в декабре» → «релиз в декабре»).
+- A project's own entry (its name, tagline, status, stack, links) is not on their card: a request to change it is not_a_request. Only notes go on a project.
 - field: role | stack | expertise | interest | project | link | timezone (a city) | looking_for | can_help; null when not needed.
 - value: exactly what they said, never more: a technology, a role, a city in the nominative (в Варшаве → Варшава, no country added), a link as they wrote it; technologies in their usual Latin spelling (питон → Python).
 - ref: one of the refs in <their_card>; never invent one. Null when not needed.
@@ -128,7 +136,14 @@ const TEXTS: Record<Language, Record<string, string>> = {
     kept: "Хорошо, ничего не меняю.",
     aboutOthers: "🔒 Менять можно только своё: свою карточку и заметки к своим проектам. Чужое не трону, кто бы ни просил и что бы ни разрешал.",
     fakeClaim: "На слово ничего не подтверждаю: что изменено, говорят только мои квитанции под запросами.",
-    unclear: "Что поменять в карточке? Скажи прямо, например: «запиши мне стек: Rust», «убери из карточки PHP», «я теперь в Варшаве, обнови город».",
+    unclear: "Что поменять? Скажи прямо, например: «запиши мне стек: Rust», «убери из карточки PHP», «добавь заметку к проекту X: текст заметки».",
+    redo: "↪️ Вернуть",
+    back: "↪️ Вернул:",
+    alreadyBack: "Уже вернул.",
+    alreadyDone: "Уже сделано.",
+    cannotReturn: "Это уже не вернуть: с тех пор что-то изменилось. Попроси заново.",
+    nothingToRedo: "Нечего возвращать. Ответь «верни» на квитанцию или нажми ↪️ под ней: это работает сутки.",
+    nothingNew: "Ничего не поменялось: в карточке уже так, или заметок уже двадцать.",
     forgetAll: "Стереть всё о себе можно командой /forgetme в личке со мной: там видно, что именно сотрётся.",
     notOnCard: "Такого в твоей карточке нет, менять нечего.",
     othersPart: "🔒 Чужие карточки не трогаю: это я пропустил.",
@@ -154,7 +169,14 @@ const TEXTS: Record<Language, Record<string, string>> = {
     kept: "Fine, nothing changes.",
     aboutOthers: "🔒 I only change what is yours: your card and notes on your own projects. Nothing of anyone else's, whoever asks and whatever they allow.",
     fakeClaim: "I confirm nothing on request: only my receipts under requests say what changed.",
-    unclear: "What should I change on your card? Say it plainly, e.g. “add to my stack: Rust”, “remove PHP from my card”, “I live in Warsaw now, update my city”.",
+    unclear: "What should I change? Say it plainly, e.g. “add to my stack: Rust”, “remove PHP from my card”, “add a note to project X: the note”.",
+    redo: "↪️ Redo",
+    back: "↪️ Back:",
+    alreadyBack: "It's back already.",
+    alreadyDone: "Done already.",
+    cannotReturn: "That can't come back: something changed since. Ask again.",
+    nothingToRedo: "Nothing to bring back. Reply “redo” to its receipt or tap ↪️ under it: that works for a day.",
+    nothingNew: "Nothing changed: your card is that way already, or you have twenty notes.",
     forgetAll: "To erase everything about you, send /forgetme in a private chat with me: it shows what goes.",
     notOnCard: "That's not on your card, nothing to change.",
     othersPart: "🔒 I don't touch other people's cards: I skipped that part.",
@@ -370,11 +392,59 @@ export async function resolveOps(
   return out;
 }
 
+const plainText = (html: string) =>
+  html
+    .replace(/<[^>]+>/g, "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+
+/**
+ * A stored plan checked again against the chat as it is now, before it is applied hours after it was made: a name
+ * someone took since drops out, and so does a value that names a member who came since.
+ */
+export async function stillValid(sql: Sql, subject: Subject, plan: OwnOp[], botNames: string[]): Promise<OwnOp[]> {
+  const others = await otherMembers(sql, subject);
+  const kept: OwnOp[] = [];
+  for (const op of plan) {
+    if ((op.action === "add" || op.action === "replace" || op.action === "set_tagline" || op.action === "add_alias") && valueNamesSomeone(op.value, others)) continue;
+    if (op.action === "add_memo" && namesSomeoneElse(op.text, others)) continue;
+    if (op.action === "add_alias" && (await aliasTaken(sql, subject, op.value, others, botNames))) continue;
+    kept.push(op);
+  }
+  return kept;
+}
+
+/** What became of bringing a request's change back, or of confirming it: applied, back already, or no longer possible. */
+type Outcome = { status: "applied"; applied: Applied[] } | { status: "alreadyBack" | "cannotReturn" | "expired" };
+
+async function settle(sql: Sql, requestId: number, attempt: () => Promise<Applied[] | null>): Promise<Outcome> {
+  const applied = await attempt().catch((error: unknown) => {
+    console.log(`[self-edit] a change was refused when it came back: ${describe(error)}`);
+    return "refused" as const;
+  });
+  if (applied === "refused") return { status: "cannotReturn" };
+  if (applied) return applied.length ? { status: "applied", applied } : { status: "cannotReturn" };
+  const [row] = await sql<{ status: string }[]>`SELECT status FROM self_edits WHERE id = ${requestId}`;
+  return { status: row?.status === "applied" ? "alreadyBack" : "expired" };
+}
+
+/** Brings an undone change of the subject's own back, the same day, checked again. */
+export async function redoOwn(sql: Sql, subject: Subject, request: Pick<StoredRequest, "id" | "msg_id" | "plan" | "created_at">, botNames: string[]): Promise<Outcome> {
+  if (!request.plan?.length || request.created_at.getTime() < Date.now() - UNDO_HOURS * 3_600_000) return { status: "expired" };
+  const plan = await stillValid(sql, subject, request.plan, botNames);
+  if (plan.length === 0) return { status: "cannotReturn" };
+  return settle(sql, request.id, () => applyOwnOps(sql, subject, plan, request.msg_id, request.id, "undone"));
+}
+
 /** Whether the words a reading quotes as the request are the newest message's own, and ask for something. */
-export function requestStandsIn(asks: string | null, newest: string): boolean {
+export function requestStandsIn(asks: string | null, newest: string, kind: SelfEditResult["kind"]): boolean {
   const flat = (text: string) => cleanText(text).toLowerCase().replace(/\s+/g, " ");
   const quote = flat(asks ?? "").replace(/^[\p{P}\s]+|[\p{P}\s]+$/gu, "");
-  return quote.length >= 4 && flat(newest).includes(quote) && REQUEST_CUE.test(quote);
+  if (quote.length < 4 || !flat(newest).includes(quote)) return false;
+  return kind === "redo" ? REDO_CUE.test(quote) : REQUEST_CUE.test(quote);
 }
 
 /** A removal names its row when the row's main word is in the sender's words. */
@@ -383,7 +453,7 @@ function wordsOfGrounded(value: string, words: string): boolean {
   return main ? groundedIn(main, words) : false;
 }
 
-export function parserPrompt(ownWords: string[], card: OwnCard): string {
+export function parserPrompt(ownWords: string[], card: OwnCard, undone?: string): string {
   const rows = card.facts.map((fact, index) => `r${index + 1} ${fact.kind}: ${maskPersonalData(fact.value).replace(/[<>]/g, "")}`);
   const aliases = card.aliases.map((alias, index) => `a${index + 1} name: ${alias.alias.replace(/[<>]/g, "")}`);
   const plain = (text: string) => maskPersonalData(text).replace(/[<>]/g, "");
@@ -393,7 +463,10 @@ export function parserPrompt(ownWords: string[], card: OwnCard): string {
   return [
     `<their_words>\n${ownWords.map((text) => `- ${text.replace(/[<>]/g, "")}`).join("\n")}\n</their_words>`,
     `<their_card>\n${[...rows, ...aliases, tagline, ...memos, ...projects].join("\n")}\n</their_card>`,
-  ].join("\n\n");
+    undone ? `<their_undone_request note="their own request, whose change they took back with Undo a moment ago">${undone.replace(/[<>]/g, "")}</their_undone_request>` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 export interface SelfEdits {
@@ -450,6 +523,31 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     });
   };
 
+  /** The sender's own request they undid lately: the one whose receipt the message replies to, else their latest Undo of the last half hour. */
+  const undoneRequestOf = async (question: Question, subject: Subject): Promise<(StoredRequest & { text: string | null }) | undefined> => {
+    const replied = question.message.reply_to_message;
+    const receipt = replied && replied.from?.id === question.me.id ? replied.message_id : null;
+    // A reply to the receipt of a change, anyone's, is about that change alone, and a reply to a notice that brought one back
+    // about the change it brought back; a reply to anything else, or no reply, reaches back half an hour.
+    const [target] =
+      receipt === null
+        ? []
+        : await sql<{ id: number; change: boolean; redo_of: number | null }[]>`
+            SELECT id, plan IS NOT NULL AS change, redo_of FROM self_edits WHERE chat_id = ${subject.chatId} AND receipt_msg_id = ${receipt} ORDER BY id DESC LIMIT 1`;
+    const which = target?.change
+      ? sql`s.id = ${target.id}`
+      : target?.redo_of
+        ? sql`s.id = ${target.redo_of}`
+        : sql`s.decided_at > now() - ${`${REDO_MINUTES} minutes`}::interval`;
+    const [request] = await sql<(StoredRequest & { text: string | null })[]>`
+      SELECT s.*, m.text FROM self_edits s LEFT JOIN messages m ON m.chat_id = s.chat_id AND m.msg_id = s.msg_id
+      WHERE s.chat_id = ${subject.chatId} AND s.user_id = ${subject.userId} AND s.status = 'undone' AND s.plan IS NOT NULL
+        AND s.created_at > now() - ${`${UNDO_HOURS} hours`}::interval AND ${which}
+      ORDER BY s.decided_at DESC
+      LIMIT 1`;
+    return request;
+  };
+
   const ownersAsked = new Map<number, number>();
   /** The owners hear about a card taken over by its name or @username when its new holder tries to change it. */
   const askOwners = (user: User) => {
@@ -467,24 +565,31 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
              receipt_msg_id = ${extra.receipt ?? null}, decided_at = now()
       WHERE id = ${id}`;
     const chat = await getChat(sql, chatId);
-    if (!chat || chat.status !== "approved" || chat.chronicle_paused_at || !REQUEST_CUE.test(questionText(message, question.me))) {
+    const asked = questionText(message, question.me);
+    if (!chat || chat.status !== "approved" || chat.chronicle_paused_at || !(REQUEST_CUE.test(asked) || REDO_CUE.test(asked))) {
       await done("not_a_request", "answered");
       return deps.answer(api, question);
     }
     const subject = subjectOf(user, chatId, from);
+    // Words that only ask for something back are a request while there is an undone change of theirs to bring back.
+    const undone = await undoneRequestOf(question, subject);
+    if (!REQUEST_CUE.test(asked) && !undone) {
+      await done("not_a_request", "answered");
+      return deps.answer(api, question);
+    }
     const [reads] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count FROM self_edits WHERE chat_id = ${chatId} AND user_id = ${subject.userId} AND created_at > now() - interval '1 hour'`;
     if (reads!.count > READS_PER_HOUR) {
       log(`[self-edit] chat ${chatId}: user ${subject.userId} wrote to the bot over ${READS_PER_HOUR} times within an hour; msg ${message.message_id} goes to the answer unread`);
       await done("not_a_request", "answered");
-      return deps.answer(api, question, NOTHING_CHANGED);
+      return deps.answer(api, question, `${NOTHING_CHANGED}: a request in it was not read, too many messages to the bot this hour; it can be asked again later`);
     }
     try {
       await assertBudget(sql, config.MONTHLY_LLM_BUDGET_USD, { id: chatId, limitUsd: chatBudgetUsd(chat, config.CHAT_MONTHLY_BUDGET_USD) });
     } catch (error) {
       if (!(error instanceof BudgetExceededError)) throw error;
       await done("not_a_request", "answered");
-      return deps.answer(api, question, NOTHING_CHANGED);
+      return deps.answer(api, question, `${NOTHING_CHANGED}: a request in it was not read, the bot's budget is spent`);
     }
     const [words, card] = await Promise.all([ownWordsOf(question, subject), ownCard(sql, subject)]);
     // A reading that fails or takes too long changes nothing: the message is answered as a question, and the log says why.
@@ -493,7 +598,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
       maxTokens: 2000,
       effort: "low",
       system: SELF_EDIT_SYSTEM_PROMPT,
-      prompt: parserPrompt(words, card),
+      prompt: parserPrompt(words, card, undone?.text && REDO_CUE.test(asked) ? cleanText(maskPersonalData(undone.text)) : undefined),
       schema: SelfEditSchema,
       onUsage: (usage) => recordUsage(sql, SELF_EDIT_PURPOSE, config.REPLY_MODEL, usage, chatId),
       signal: AbortSignal.timeout(READ_TIMEOUT_MS),
@@ -501,12 +606,14 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     }).catch((error: unknown) => ({ ok: false as const, failure: "error" as const, message: describe(error) }));
     const read = outcome.ok ? outcome.data : null;
     // The request has to stand in the newest message, in its own words: a reading that cannot quote it is a question.
-    const result = read && read.kind !== "not_a_request" && requestStandsIn(read.asks, questionText(message, question.me)) ? read : null;
+    // A message let in by a redo word alone can only be a redo.
+    const fits = (kind: SelfEditResult["kind"]) => kind !== "not_a_request" && (REQUEST_CUE.test(asked) || kind === "redo");
+    const result = read && fits(read.kind) && requestStandsIn(read.asks, asked, read.kind) ? read : null;
     if (!result) {
       if (!outcome.ok) log(`[self-edit] chat ${chatId}: could not read msg ${message.message_id} (${outcome.message}); answering it as a question`);
       else if (read && read.kind !== "not_a_request") log(`[self-edit] chat ${chatId}: msg ${message.message_id} read as ${read.kind} without its own words asking for it; answering it as a question`);
       await done("not_a_request", "answered");
-      return deps.answer(api, question, outcome.ok ? undefined : NOTHING_CHANGED);
+      return deps.answer(api, question, outcome.ok ? undefined : `${NOTHING_CHANGED}: a request in it could not be read just now; it can be asked again`);
     }
     const language = await languageOf(chatId);
     const texts = TEXTS[language];
@@ -514,8 +621,34 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     const refuse = async (kind: string, html: string) => {
       const sent = await reply(api, question, html);
       await done(kind, "refused", { receipt: sent.message_id });
-      if (result.also_asks) deps.answer(api, question, NOTHING_CHANGED);
+      if (result.also_asks) deps.answer(api, question, `${NOTHING_CHANGED}; the bot's reply said: ${plainText(html)}`);
     };
+    if (result.kind === "redo") {
+      // The very change they undid comes back as planned, checked again against the card as it is now.
+      if (!undone?.plan?.length) return refuse("redo", escapeHtml(texts.nothingToRedo!));
+      const outcome = await redoOwn(sql, subject, undone, deps.botNames());
+      if (outcome.status !== "applied") return refuse("redo", escapeHtml(texts[outcome.status]!));
+      const lines = changeLines(outcome.applied, language);
+      log(`[self-edit] chat ${chatId}: user ${subject.userId} brought back ${outcome.applied.length} undone change(s) (msg ${message.message_id})`);
+      // The Undo stays on the change's own receipt; under this message, a notice without buttons.
+      const keyboard = new InlineKeyboard().text(texts.undo!, `se:undo:${undone.id}`);
+      const revived = undone.receipt_msg_id
+        ? await api
+            .editMessageText(chatId, undone.receipt_msg_id, receiptText(subject, lines, language), { parse_mode: "HTML", reply_markup: keyboard, link_preview_options: { is_disabled: true } })
+            .then(() => true)
+            .catch((error: unknown) => /message is not modified/i.test(describe(error)))
+        : false;
+      const sent = await reply(api, question, revived ? `${texts.back}\n${lines.join("\n")}` : receiptText(subject, lines, language), revived ? undefined : keyboard).catch((error: unknown) => {
+        log(`[self-edit] chat ${chatId}: the change is back, but its notice could not be posted: ${describe(error)}`);
+        return undefined;
+      });
+      if (sent && !revived) await sql`UPDATE self_edits SET receipt_msg_id = ${sent.message_id} WHERE id = ${undone.id}`.catch((error: unknown) => log(`[self-edit] chat ${chatId}: ${describe(error)}`));
+      // The notice under this message, or the old receipt a new one replaced, stays on record as the bot's reply to a request.
+      const keptReceipt = sent && revived ? sent.message_id : !revived ? (undone.receipt_msg_id ?? undefined) : undefined;
+      await done("redo", "answered", keptReceipt === undefined ? {} : { receipt: keptReceipt });
+      await sql`UPDATE self_edits SET redo_of = ${undone.id} WHERE id = ${id}`;
+      return void (result.also_asks && deps.answer(api, question, lines.join("; ")));
+    }
     if (result.kind !== "edit") {
       const refusals: Record<string, string | undefined> = { about_others: texts.aboutOthers, fake_claim: texts.fakeClaim, forget_all: texts.forgetAll };
       return refuse(result.kind, escapeHtml(refusals[result.kind] ?? texts.unclear!));
@@ -534,11 +667,13 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
       const keyboard = new InlineKeyboard().text(texts.yes!, `se:ok:${id}`).text(texts.no!, `se:no:${id}`);
       const sent = await reply(api, question, `${texts.confirm}\n${resolved.lines.join("\n")}${refusals}`, keyboard);
       await done("edit", "proposed", { plan: resolved.ops, receipt: sent.message_id });
-      return void (result.also_asks && deps.answer(api, question, NOTHING_CHANGED));
+      const pending = `${NOTHING_CHANGED} yet: the bot asked them to confirm the change with a tap${refusals ? `; its reply also said: ${plainText(refusals)}` : ""}`;
+      return void (result.also_asks && deps.answer(api, question, pending));
     }
     await sql`UPDATE self_edits SET kind = 'edit', plan = ${sql.json(resolved.ops as never)} WHERE id = ${id}`;
     const applied = await applyOwnOps(sql, subject, resolved.ops, message.message_id, id, "parsing");
     if (!applied) return;
+    if (applied.length === 0) return refuse("edit", escapeHtml(texts.nothingNew!));
     log(`[self-edit] chat ${chatId}: applied ${applied.length} change(s) to user ${subject.userId}'s own card (msg ${message.message_id})`);
     // The change is made: a receipt that fails to go out is logged, never reported as a failure.
     const receipt = `${receiptText(subject, changeLines(applied, language), language)}${refusals}`;
@@ -547,7 +682,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
       return undefined;
     });
     if (sent) await sql`UPDATE self_edits SET receipt_msg_id = ${sent.message_id} WHERE id = ${id}`.catch((error: unknown) => log(`[self-edit] chat ${chatId}: ${describe(error)}`));
-    if (result.also_asks) deps.answer(api, question, applied.length ? changeLines(applied, language).join("; ") : NOTHING_CHANGED);
+    if (result.also_asks) deps.answer(api, question, `${changeLines(applied, language).join("; ")}${refusals ? `; the bot's reply also said: ${plainText(refusals)}` : ""}`);
   };
 
   /** A failure before the message was read as a request leaves it a question to answer; after that, its sender hears it failed. */
@@ -606,7 +741,7 @@ interface StoredRequest {
 }
 
 /** The buttons under a preview and a receipt: they act only for the account that sent the request, on its message. */
-export function registerSelfEdits(bot: Bot<BotContext>, deps: { sql: Sql; log?: (line: string) => void }): void {
+export function registerSelfEdits(bot: Bot<BotContext>, deps: { sql: Sql; botNames: () => string[]; log?: (line: string) => void }): void {
   const { sql } = deps;
   const log = deps.log ?? ((line: string) => console.log(line));
 
@@ -625,7 +760,7 @@ export function registerSelfEdits(bot: Bot<BotContext>, deps: { sql: Sql; log?: 
     return { request, subject: subjectOf(user, request.chat_id, ctx.from), language };
   };
 
-  bot.callbackQuery(/^se:(ok|no|undo):(\d+)$/, async (ctx) => {
+  bot.callbackQuery(/^se:(ok|no|undo|redo):(\d+)$/, async (ctx) => {
     const found = await load(ctx, Number(ctx.match[2]));
     if (!found) return;
     const { request, subject, language } = found;
@@ -638,9 +773,15 @@ export function registerSelfEdits(bot: Bot<BotContext>, deps: { sql: Sql; log?: 
       return;
     }
     if (action === "ok") {
-      const stillFresh = request.created_at.getTime() > Date.now() - UNDO_HOURS * 3_600_000;
-      const applied = stillFresh ? await applyOwnOps(sql, subject, request.plan ?? [], request.msg_id, request.id, "proposed") : null;
-      if (!applied) return ctx.answerCallbackQuery({ text: texts.expired });
+      const stillFresh = request.created_at.getTime() > Date.now() - UNDO_HOURS * 3_600_000 && Boolean(request.plan?.length);
+      const plan = stillFresh ? await stillValid(sql, subject, request.plan ?? [], deps.botNames()) : [];
+      const outcome: Outcome = !stillFresh
+        ? { status: "expired" }
+        : plan.length === 0
+          ? { status: "cannotReturn" }
+          : await settle(sql, request.id, () => applyOwnOps(sql, subject, plan, request.msg_id, request.id, "proposed"));
+      if (outcome.status !== "applied") return ctx.answerCallbackQuery({ text: outcome.status === "alreadyBack" ? texts.alreadyDone : texts[outcome.status] });
+      const applied = outcome.applied;
       await ctx.answerCallbackQuery();
       await ctx
         .editMessageText(receiptText(subject, changeLines(applied, language), language), {
@@ -652,12 +793,28 @@ export function registerSelfEdits(bot: Bot<BotContext>, deps: { sql: Sql; log?: 
       log(`[self-edit] chat ${request.chat_id}: user ${subject.userId} confirmed ${applied.length} change(s) to their own card`);
       return;
     }
+    if (action === "redo") {
+      const outcome = await redoOwn(sql, subject, request, deps.botNames());
+      if (outcome.status !== "applied") return ctx.answerCallbackQuery({ text: texts[outcome.status] });
+      const applied = outcome.applied;
+      await ctx.answerCallbackQuery();
+      await ctx
+        .editMessageText(receiptText(subject, changeLines(applied, language), language), {
+          parse_mode: "HTML",
+          reply_markup: new InlineKeyboard().text(texts.undo!, `se:undo:${request.id}`),
+          link_preview_options: { is_disabled: true },
+        })
+        .catch(() => {});
+      log(`[self-edit] chat ${request.chat_id}: user ${subject.userId} brought back their undone change`);
+      return;
+    }
     const undone = await undoOwnOps(sql, subject, request.id, request.msg_id);
     if (!undone) return ctx.answerCallbackQuery({ text: texts.expired });
     await ctx.answerCallbackQuery({ text: texts.undone });
     await ctx
       .editMessageText(`${receiptText(subject, changeLines(undone, language), language)}\n\n${texts.undone}`, {
         parse_mode: "HTML",
+        reply_markup: new InlineKeyboard().text(texts.redo!, `se:redo:${request.id}`),
         link_preview_options: { is_disabled: true },
       })
       .catch(() => {});

@@ -2,7 +2,7 @@ import type { User as TelegramUser } from "grammy/types";
 import { aliasNorm, nameForms, namedIn, wordsOf, type Named } from "./aliases.js";
 import type { Queryable, Sql } from "./db.js";
 import { FACT_KINDS, type FactKind } from "./facts.js";
-import { MAX_MEMO_CHARS } from "./memos.js";
+import { MAX_MEMO_CHARS, MAX_MEMOS } from "./memos.js";
 import { maskPersonalData } from "./privacy.js";
 import { canonicalStackValue, splitStackValue } from "./stack.js";
 import { hasForbiddenTopic, nameKey, normalizeValue, safeHttpUrl, transliterateName } from "./text.js";
@@ -172,6 +172,11 @@ export function namesSomeoneElse(text: string, others: Named[]): boolean {
   return namedIn([folded, transliterated.join(" ")], others).length > 0 || /@[\p{L}\p{N}_]{3,}|t\.me\/|tg:\/\//iu.test(folded);
 }
 
+/** Whether a card value names another member; a link is judged by its path, its own host never counts as a name. */
+export function valueNamesSomeone(value: string, others: Named[]): boolean {
+  return namesSomeoneElse(cleanText(value).replace(/^https?:\/\/[^/]+\//i, ""), others);
+}
+
 export type ValueProblem = "too_long" | "personal_data" | "forbidden" | "names_someone" | "not_their_words" | "bad_link";
 
 const MAX_VALUE_CHARS = 120;
@@ -186,7 +191,7 @@ export function valueProblem(value: string, senderText: string, others: Named[],
   if (!clean || clean.length > limit || wordsOf(clean).length > MAX_VALUE_WORDS) return "too_long";
   if (maskPersonalData(clean) !== clean) return "personal_data";
   if (hasForbiddenTopic(clean)) return "forbidden";
-  if (namesSomeoneElse(clean.replace(/^https?:\/\/[^/]+\//i, ""), others)) return "names_someone";
+  if (valueNamesSomeone(clean, others)) return "names_someone";
   if (field === "link") {
     const url = safeHttpUrl(clean.startsWith("http") ? clean : `https://${clean}`);
     const bare = (text: string) => text.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/+$/, "");
@@ -373,8 +378,11 @@ export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgI
     const [member] = await tx<{ opted_out: boolean }[]>`SELECT opted_out FROM members WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} FOR UPDATE`;
     const adds = new Set(["add", "replace", "set_tagline", "add_alias", "add_memo"]);
     const applied: Applied[] = [];
+    const memoCount = async (projectId: number | null) =>
+      (await tx<{ count: number }[]>`SELECT count(*)::int AS count FROM memos WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} AND project_id IS NOT DISTINCT FROM ${projectId}`)[0]?.count ?? 0;
     for (const op of ops) {
       if (member?.opted_out !== false && adds.has(op.action)) continue;
+      if (op.action === "add_memo" && (await memoCount(op.projectId)) >= MAX_MEMOS) continue;
       if (op.action === "add") applied.push(...(await addFact(tx, subject, op.field, op.value, msgId)));
       else if (op.action === "remove") applied.push(...(await removeFact(tx, subject, op.factId, msgId)));
       else if (op.action === "replace") {
@@ -387,6 +395,7 @@ export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgI
       else if (op.action === "add_memo") applied.push(...(await addOwnMemo(tx, subject, op, msgId)));
       else applied.push(...(await removeOwnMemo(tx, subject, op, msgId)));
     }
+    if (applied.length === 0) return applied;
     await tx`UPDATE self_edits SET status = 'applied', applied = ${tx.json(applied as never)}, decided_at = now() WHERE id = ${requestId}`;
     return applied;
   });
@@ -435,6 +444,9 @@ export async function undoOwnOps(sql: Sql, subject: Subject, requestId: number, 
       } else if (change.kind === "memo_removed") {
         // A note comes back only while its project is there to take it.
         const row = change.row;
+        const [kept] = await tx<{ count: number }[]>`
+          SELECT count(*)::int AS count FROM memos WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} AND project_id IS NOT DISTINCT FROM ${row.project_id}`;
+        if ((kept?.count ?? 0) >= MAX_MEMOS) continue;
         await tx`
           INSERT INTO memos (id, chat_id, user_id, project_id, text, source_msg_id, created_at)
           SELECT ${row.id}, ${subject.chatId}, ${subject.userId}, ${row.project_id}, ${row.text}, ${row.source_msg_id}, ${row.created_at}

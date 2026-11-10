@@ -1,14 +1,15 @@
 import type Anthropic from "@anthropic-ai/sdk";
-import type { Api } from "grammy";
+import type { Api, Bot } from "grammy";
 import type { Message, UserFromGetMe } from "grammy/types";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createSelfEdits, receiptText, SelfEditSchema, type SelfEditResult } from "../src/bot/self-edits.js";
+import type { BotContext } from "../src/bot/kit.js";
+import { createSelfEdits, receiptText, registerSelfEdits, SelfEditSchema, type SelfEditResult } from "../src/bot/self-edits.js";
 import { registerChat, setChatStatus } from "../src/core/chats.js";
 import { createSql, migrate, type Sql } from "../src/core/db.js";
 import { proposeFact } from "../src/core/facts.js";
 import { saveMessage } from "../src/core/messages.js";
 import { addUserProject } from "../src/core/projects.js";
-import { asSubject, cleanText, foldMixedScript, groundedIn, namesSomeoneElse, subjectOf, undoOwnOps } from "../src/core/own-card.js";
+import { applyOwnOps, asSubject, cleanText, foldMixedScript, groundedIn, namesSomeoneElse, subjectOf, undoOwnOps } from "../src/core/own-card.js";
 import { resolveUser, setOptOut, type User } from "../src/core/users.js";
 import { batchDataFor } from "../src/worker/batch.js";
 
@@ -100,22 +101,51 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     return { client, prompts };
   }
 
+  type Markup = { inline_keyboard: { callback_data?: string }[][] };
+  /** The bot's own message ids, unique across runs as in Telegram. */
+  let nextBotMsgId = 800_000;
+
   function fakeApi() {
-    const sent: { chatId: number; text: string; markup?: { inline_keyboard: { callback_data?: string }[][] } }[] = [];
+    const sent: { chatId: number; text: string; markup?: Markup }[] = [];
+    const edited: { messageId: number; text: string; markup?: Markup }[] = [];
     const api = {
       sendMessage: async (chatId: number, text: string, options: { reply_markup?: never } = {}) => {
         sent.push({ chatId, text, markup: options.reply_markup });
-        return { message_id: 800_000 + sent.length };
+        return { message_id: ++nextBotMsgId };
+      },
+      editMessageText: async (_chatId: number, messageId: number, text: string, options: { reply_markup?: never } = {}) => {
+        edited.push({ messageId, text, markup: options.reply_markup });
+        return true;
       },
     } as unknown as Api;
-    return { api, sent };
+    return { api, sent, edited };
+  }
+
+  /** The receipt buttons as Telegram would press them, through the real handler. */
+  function fakeButtons() {
+    let pattern: RegExp | undefined;
+    let handler: ((ctx: unknown) => Promise<unknown>) | undefined;
+    const bot = { callbackQuery: (re: RegExp, fn: (ctx: unknown) => Promise<unknown>) => ((pattern = re), (handler = fn)) } as unknown as Bot<BotContext>;
+    registerSelfEdits(bot, { sql, botNames: () => ["Waggle", "waggle_test_bot"], log: () => {} });
+    return async (from: { id: number }, data: string, chatId: number, messageId: number) => {
+      const toasts: (string | undefined)[] = [];
+      const edits: { text: string; markup?: Markup }[] = [];
+      await handler!({
+        match: pattern!.exec(data),
+        from,
+        callbackQuery: { data, message: { chat: { id: chatId }, message_id: messageId } },
+        answerCallbackQuery: async (options?: { text?: string }) => void toasts.push(options?.text),
+        editMessageText: async (text: string, options?: { reply_markup?: Markup }) => void edits.push({ text, markup: options?.reply_markup }),
+      });
+      return { toasts, edits };
+    };
   }
 
   const config = { BOT_TOKEN: "123456:TEST-TOKEN", REPLY_MODEL: "claude-haiku-5-5", MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50 };
 
-  async function run(chatId: number, asker: Awaited<ReturnType<typeof member>>, text: string, result: Reading | Error, onSeeded?: (user: User) => void) {
+  async function run(chatId: number, asker: Awaited<ReturnType<typeof member>>, text: string, result: Reading | Error, onSeeded?: (user: User) => void, extra: Partial<Message> = {}) {
     const parser = fakeParser(result, text);
-    const { api, sent } = fakeApi();
+    const { api, sent, edited } = fakeApi();
     const answered: string[] = [];
     const cardChanges: (string | undefined)[] = [];
     const answer = (_api: Api, question: { message: Message }, cardChange?: string) => {
@@ -123,10 +153,10 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
       cardChanges.push(cardChange);
     };
     const edits = createSelfEdits({ sql, anthropic: parser.client, config, answer, botNames: () => ["Waggle", "waggle_test_bot"], onSeeded });
-    const message = { ...(await say(chatId, asker, text)), from: asker.tg };
+    const message = { ...(await say(chatId, asker, text)), from: asker.tg, ...extra };
     edits.handle(api, { chatId, chatTitle: "Hive", message: message as Message, from: asker.tg, me }, asker);
     await edits.idle();
-    return { parser, sent, answered, cardChanges, message };
+    return { parser, sent, edited, answered, cardChanges, message };
   }
 
   const requestOf = async (chatId: number, msgId: number) =>
@@ -270,7 +300,7 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     const bob = await member(chat, "Bob");
     const failed = await run(chat, bob, "@waggle_test_bot запиши мне стек: Rust, и как дела?", new Error("overloaded"));
     expect(failed.sent).toEqual([]);
-    expect(failed.cardChanges).toEqual(["nothing was changed on any card"]);
+    expect(failed.cardChanges).toEqual([expect.stringMatching(/^nothing was changed on any card: a request in it could not be read just now/)]);
     expect((await requestOf(chat, failed.message.message_id)).kind).toBe("not_a_request");
   });
 
@@ -328,5 +358,155 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     const request = await requestOf(chat, personal.message.message_id);
     expect(await undoOwnOps(sql, subject, request.id, personal.message.message_id)).not.toBeNull();
     expect(await sql`SELECT text FROM memos WHERE chat_id = ${chat} ORDER BY id`).toEqual([{ text: "релиз в декабре" }]);
+  });
+
+  it("brings back an undone change for its sender alone, asked in a reply to its receipt", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    const kit = await member(chat, "Kit");
+    const added = await run(chat, bob, "@waggle_test_bot добавь заметку: ищу дизайнера", { kind: "edit", also_asks: false, ops: [{ action: "add_note", field: null, ref: null, value: "ищу дизайнера" }] });
+    const request = await requestOf(chat, added.message.message_id);
+    const [receipt] = await sql<{ receipt_msg_id: number }[]>`SELECT receipt_msg_id FROM self_edits WHERE id = ${request.id}`;
+    await undoOwnOps(sql, subjectOf(bob, chat, bob.tg), request.id, added.message.message_id);
+    const toReceipt = { reply_to_message: { message_id: receipt!.receipt_msg_id, date: 0, chat: { id: chat, type: "supergroup", title: "Hive" }, from: me, text: "✏️" } } as unknown as Partial<Message>;
+    const redo = { kind: "redo" as const, also_asks: false, ops: [] };
+
+    // Someone else asking it back gets an answer, not Bob's change.
+    const stranger = await run(chat, kit, "@waggle_test_bot верни", redo, undefined, toReceipt);
+    expect(stranger.parser.prompts).toEqual([]);
+    expect(await sql`SELECT 1 FROM memos WHERE chat_id = ${chat}`).toHaveLength(0);
+
+    const back = await run(chat, bob, "@waggle_test_bot еще раз добавь, случайно отменил", { ...redo, asks: "еще раз добавь" }, undefined, toReceipt);
+    expect(back.parser.prompts[0]).toContain("<their_undone_request");
+    expect(back.parser.prompts[0]).toContain("ищу дизайнера");
+    expect(back.edited).toEqual([expect.objectContaining({ messageId: receipt!.receipt_msg_id, markup: { inline_keyboard: [[expect.objectContaining({ callback_data: `se:undo:${request.id}` })]] } })]);
+    expect(back.sent[0]!.text).toMatch(/^↪️/);
+    expect(back.sent[0]!.markup).toBeUndefined();
+    expect(await sql`SELECT user_id, text FROM memos WHERE chat_id = ${chat}`).toEqual([{ user_id: bob.id, text: "ищу дизайнера" }]);
+    const [after] = await sql<{ status: string; receipt_msg_id: number }[]>`SELECT status, receipt_msg_id FROM self_edits WHERE id = ${request.id}`;
+    expect(after).toEqual({ status: "applied", receipt_msg_id: receipt!.receipt_msg_id });
+
+    // Once nothing is undone, the same words are a question again.
+    const again = await run(chat, bob, "@waggle_test_bot верни", redo);
+    expect(again.parser.prompts).toEqual([]);
+    expect(again.answered).toHaveLength(1);
+  });
+
+  it("drives Undo and Redo on a receipt for its sender alone, and tells a repeat tap apart", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    const kit = await member(chat, "Kit");
+    const press = fakeButtons();
+    await run(chat, bob, "@waggle_test_bot запиши мне стек: Rust", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "stack", ref: null, value: "Rust" }] });
+    const [request] = await sql<{ id: number; receipt_msg_id: number }[]>`SELECT id, receipt_msg_id FROM self_edits WHERE chat_id = ${chat} AND kind = 'edit'`;
+    const stack = () => sql`SELECT value FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id}`;
+
+    expect((await press(kit.tg, `se:undo:${request!.id}`, chat, request!.receipt_msg_id)).toasts).toEqual(["That's not your request"]);
+    expect(await stack()).toHaveLength(1);
+    const undone = await press(bob.tg, `se:undo:${request!.id}`, chat, request!.receipt_msg_id);
+    expect(await stack()).toHaveLength(0);
+    expect(undone.edits[0]!.markup!.inline_keyboard[0]![0]!.callback_data).toBe(`se:redo:${request!.id}`);
+    expect((await press(kit.tg, `se:redo:${request!.id}`, chat, request!.receipt_msg_id)).toasts).toEqual(["That's not your request"]);
+    expect(await stack()).toHaveLength(0);
+    const redone = await press(bob.tg, `se:redo:${request!.id}`, chat, request!.receipt_msg_id);
+    expect(await stack()).toEqual([{ value: "Rust" }]);
+    expect(redone.edits[0]!.markup!.inline_keyboard[0]![0]!.callback_data).toBe(`se:undo:${request!.id}`);
+    expect((await press(bob.tg, `se:redo:${request!.id}`, chat, request!.receipt_msg_id)).toasts[0]).toMatch(/Уже вернул|back already/);
+    await press(bob.tg, `se:undo:${request!.id}`, chat, request!.receipt_msg_id);
+    expect(await stack()).toHaveLength(0);
+  });
+
+  it("brings back nothing from a reply to another receipt, nor from news that only says «снова»", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    await proposeFact(sql, { chatId: chat, userId: bob.id, kind: "stack", value: "PHP", confidence: 1, sourceMsgIds: [], source: "user" });
+    await run(chat, bob, "@waggle_test_bot удали из карточки PHP", { kind: "edit", also_asks: false, ops: [{ action: "remove", field: null, ref: "r1", value: null }] });
+    const [removal] = await sql<{ receipt_msg_id: number }[]>`SELECT receipt_msg_id FROM self_edits WHERE chat_id = ${chat} AND kind = 'edit'`;
+    const noted = await run(chat, bob, "@waggle_test_bot добавь заметку: ищу дизайнера", { kind: "edit", also_asks: false, ops: [{ action: "add_note", field: null, ref: null, value: "ищу дизайнера" }] });
+    const note = await requestOf(chat, noted.message.message_id);
+    await undoOwnOps(sql, subjectOf(bob, chat, bob.tg), note.id, noted.message.message_id);
+
+    // «верни» under the PHP receipt is about that change; the note undone a moment ago stays undone.
+    const toRemoval = { reply_to_message: { message_id: removal!.receipt_msg_id, date: 0, chat: { id: chat, type: "supergroup", title: "Hive" }, from: me, text: "✏️" } } as unknown as Partial<Message>;
+    const wrongReceipt = await run(chat, bob, "@waggle_test_bot верни", { kind: "redo", also_asks: false, ops: [] }, undefined, toRemoval);
+    expect(wrongReceipt.parser.prompts).toEqual([]);
+    expect(await sql`SELECT 1 FROM memos WHERE chat_id = ${chat}`).toHaveLength(0);
+
+    // News with «снова» while an Undo is fresh: a misread edit is answered as a question, and the card stays as it is.
+    const news = await run(chat, bob, "@waggle_test_bot я снова пишу на Go", { kind: "edit", asks: "я снова пишу на Go", also_asks: false, ops: [{ action: "add", field: "stack", ref: null, value: "Go" }] });
+    expect(news.sent).toEqual([]);
+    expect(news.answered).toHaveLength(1);
+    expect(await sql`SELECT value FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toEqual([]);
+  });
+
+  it("keeps the note limit and names taken since when a change comes back", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    const kit = await member(chat, "Kit");
+    const subject = subjectOf(bob, chat, bob.tg);
+    for (let index = 0; index < 20; index++) await sql`INSERT INTO memos (chat_id, user_id, text) VALUES (${chat}, ${bob.id}, ${`note ${index}`})`;
+    const [row] = await sql<{ id: number }[]>`INSERT INTO self_edits (chat_id, msg_id, user_id, tg_id, kind, status) VALUES (${chat}, 1, ${bob.id}, ${bob.tg.id}, 'edit', 'parsing') RETURNING id`;
+    expect(await applyOwnOps(sql, subject, [{ action: "add_memo", projectId: null, projectName: null, text: "one too many" }], 1, row!.id, "parsing")).toEqual([]);
+    expect(await sql`SELECT 1 FROM memos WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toHaveLength(20);
+
+    // Bob takes «Макс», undoes it, Kit takes it: Bob's Redo brings back nothing.
+    const named = await run(chat, bob, "@waggle_test_bot зовите меня Макс", { kind: "edit", also_asks: false, ops: [{ action: "add_alias", field: null, ref: null, value: "Макс" }] });
+    const alias = await requestOf(chat, named.message.message_id);
+    const [receipt] = await sql<{ receipt_msg_id: number }[]>`SELECT receipt_msg_id FROM self_edits WHERE id = ${alias.id}`;
+    await undoOwnOps(sql, subject, alias.id, named.message.message_id);
+    await sql`INSERT INTO aliases (chat_id, user_id, alias, alias_norm, source) VALUES (${chat}, ${kit.id}, 'Макс', 'макс', 'person')`;
+    const press = fakeButtons();
+    const redone = await press(bob.tg, `se:redo:${alias.id}`, chat, receipt!.receipt_msg_id);
+    expect(redone.toasts[0]).toMatch(/не вернуть|can't come back/);
+    expect(await sql`SELECT 1 FROM aliases WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toHaveLength(0);
+    // Nothing applied leaves the request undone, so it can come back once there is room again.
+    expect((await requestOf(chat, named.message.message_id)).status).toBe("undone");
+  });
+
+  it("confirms a Telegram link after the tap it needs, and brings it back after an Undo", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    const press = fakeButtons();
+    const asked = await run(chat, bob, "@waggle_test_bot запиши мне ссылку https://t.me/beacon_news", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "link", ref: null, value: "https://t.me/beacon_news" }] });
+    const request = await requestOf(chat, asked.message.message_id);
+    expect(request.status).toBe("proposed");
+    const preview = asked.sent[0]!;
+    const [receipt] = await sql<{ receipt_msg_id: number }[]>`SELECT receipt_msg_id FROM self_edits WHERE id = ${request.id}`;
+    expect(preview.markup!.inline_keyboard[0]![0]!.callback_data).toBe(`se:ok:${request.id}`);
+    await press(bob.tg, `se:ok:${request.id}`, chat, receipt!.receipt_msg_id);
+    const links = () => sql`SELECT value FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id} AND kind = 'link'`;
+    expect(await links()).toEqual([{ value: "https://t.me/beacon_news" }]);
+    await press(bob.tg, `se:undo:${request.id}`, chat, receipt!.receipt_msg_id);
+    expect(await links()).toEqual([]);
+    await press(bob.tg, `se:redo:${request.id}`, chat, receipt!.receipt_msg_id);
+    expect(await links()).toEqual([{ value: "https://t.me/beacon_news" }]);
+  });
+
+  it("takes a reading of redo only with a redo word, and a reply to its notice about the change it brought back", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    const added = await run(chat, bob, "@waggle_test_bot добавь заметку: ищу дизайнера", { kind: "edit", also_asks: false, ops: [{ action: "add_note", field: null, ref: null, value: "ищу дизайнера" }] });
+    const note = await requestOf(chat, added.message.message_id);
+    const [receipt] = await sql<{ receipt_msg_id: number }[]>`SELECT receipt_msg_id FROM self_edits WHERE id = ${note.id}`;
+    const subject = subjectOf(bob, chat, bob.tg);
+    await undoOwnOps(sql, subject, note.id, added.message.message_id);
+    const reply = (messageId: number) => ({ reply_to_message: { message_id: messageId, date: 0, chat: { id: chat, type: "supergroup", title: "Hive" }, from: me, text: "✏️" } }) as unknown as Partial<Message>;
+
+    // A new request misread as redo brings nothing back.
+    const fresh = await run(chat, bob, "@waggle_test_bot добавь лучше заметку про Go", { kind: "redo", asks: "добавь лучше заметку про Go", also_asks: false, ops: [] }, undefined, reply(receipt!.receipt_msg_id));
+    expect(fresh.parser.prompts[0]).not.toContain("<their_undone_request");
+    expect(await sql`SELECT 1 FROM memos WHERE chat_id = ${chat}`).toHaveLength(0);
+
+    const back = await run(chat, bob, "@waggle_test_bot верни", { kind: "redo", asks: "верни", also_asks: false, ops: [] }, undefined, reply(receipt!.receipt_msg_id));
+    expect(await sql`SELECT text FROM memos WHERE chat_id = ${chat}`).toEqual([{ text: "ищу дизайнера" }]);
+    const notice = back.sent[0]!;
+    const [redoRow] = await sql<{ redo_of: number; receipt_msg_id: number }[]>`SELECT redo_of, receipt_msg_id FROM self_edits WHERE chat_id = ${chat} AND kind = 'redo'`;
+    expect(redoRow!.redo_of).toBe(note.id);
+    expect(notice.text).toMatch(/^↪️/);
+
+    // Undone again, then «верни» in a reply to the notice: the same note comes back.
+    await undoOwnOps(sql, subject, note.id, added.message.message_id);
+    await run(chat, bob, "@waggle_test_bot верни", { kind: "redo", asks: "верни", also_asks: false, ops: [] }, undefined, reply(redoRow!.receipt_msg_id));
+    expect(await sql`SELECT text FROM memos WHERE chat_id = ${chat}`).toEqual([{ text: "ищу дизайнера" }]);
   });
 });
