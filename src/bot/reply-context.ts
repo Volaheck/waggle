@@ -15,7 +15,7 @@ import {
   type RatingBreakdown,
 } from "../core/projects.js";
 import { slugify, transliterateName, truncate } from "../core/text.js";
-import { recurringThemes, type Theme } from "../core/themes.js";
+import { recurringThemes, wordTerms, type Theme } from "../core/themes.js";
 import { peopleOfChat, SERVICE_TG_IDS, type Person } from "../core/users.js";
 import { skippedMessageIds } from "../worker/extract.js";
 import { realReply } from "./kit.js";
@@ -99,6 +99,14 @@ const FOCUS_TOPIC_DAYS = 60;
 /** How many of a person's private notes of each kind the focus shows, newest first. */
 const FOCUS_NOTES: Partial<Record<NoteKind, number>> = { claim: 4, prediction: 3, stance: 4, correction: 3, bout: 3, bait: 2, about_bot: 2 };
 const FOCUS_JOKES = 4;
+/** A note the bot's own messages used within this many days is marked as used (later it may come back); the newest this many of them are read. */
+const SPENT_DAYS = 3;
+const SPENT_MESSAGES = 150;
+/** Of the bot's latest answers this many are read for worn words: one that this many of them share is worn out. */
+const WORN_ANSWERS = 10;
+const WORN_TIMES = 3;
+const WORN_SHOWN = 10;
+const WORN_MIN_CHARS = 60;
 const FOCUS_THEMES = 3;
 const THEME_DATES = 5;
 /** A claim or a prediction settled this recently still shows. */
@@ -392,11 +400,79 @@ function correctionsBlock(corrections: ContextNote[], names: Map<number, string>
   return lines.length ? `<corrections note="what people corrected; it overrides the cards and the chronicle">\n${lines.join("\n")}\n</corrections>` : "";
 }
 
-/** A person's private notes in the focus, one line a kind, each item dated. */
-function privateLines(input: { person: Person; notes: ContextNote[]; jokes: ContextNote[]; themes: Theme[]; names: Map<number, string>; clock: Clock }): string[] {
+/** A word of a text, lowercased, with the term it counts as. */
+export interface Worded {
+  word: string;
+  term: string;
+}
+
+const WORD = /[\p{L}\p{N}]+(?:[.,]\p{N}+)*/gu;
+const TERM_LETTERS = 5;
+/** Thanks and apologies are manners, never a worn motif. */
+const COURTESY = /^(?:спасиб|пожалуйст|благодар|прост|извин|thank|pleas|sorry)/u;
+const wordsIn = (text: string) => text.toLowerCase().match(WORD) ?? [];
+
+/**
+ * Each text's telling words: their terms from Postgres's Russian stemming (core/themes.ts), so «игра» and «игру» meet
+ * and stop words drop out, cut to five letters, so «обещал» and «обещание» meet too; a number such as 2.5 as it is.
+ */
+export async function wordedTexts(sql: Sql, texts: string[]): Promise<Worded[][]> {
+  const terms = await wordTerms(sql, [...new Set(texts.flatMap(wordsIn))]);
+  return texts.map((text) =>
+    wordsIn(text).flatMap((word) => {
+      const term = /^\p{N}+[.,]\p{N}+$/u.test(word) ? word : terms.get(word)?.slice(0, TERM_LETTERS);
+      return term ? [{ word, term }] : [];
+    }),
+  );
+}
+
+/** Terms in a fifth or more of the bot's own messages: the chat's everyday words («чат», «проект»), no sign of any one note. */
+export function backgroundTerms(spoken: { terms: Set<string> }[]): Set<string> {
+  if (spoken.length < 10) return new Set();
+  const counts = new Map<string, number>();
+  for (const message of spoken) for (const term of message.terms) counts.set(term, (counts.get(term) ?? 0) + 1);
+  return new Set([...counts].filter(([, count]) => count / spoken.length >= 0.2).map(([term]) => term));
+}
+
+/** How many of the bot's own messages used a note already: those that carry most of its terms, or three of a long one's. */
+export function broughtUp(note: Worded[], spoken: { terms: Set<string>; sent_at: Date }[], background = new Set<string>()): { times: number; last: Date } | null {
+  const terms = [...new Set(note.map(({ term }) => term))].filter((term) => !background.has(term));
+  if (terms.length < 2) return null;
+  const needed = Math.max(2, Math.min(3, Math.ceil(terms.length * 0.4)));
+  const hits = spoken.filter((message) => terms.filter((term) => message.terms.has(term)).length >= needed);
+  if (hits.length === 0) return null;
+  return { times: hits.length, last: new Date(Math.max(...hits.map((hit) => hit.sent_at.getTime()))) };
+}
+
+/** Words that several of the bot's latest answers share: a motif worn thin. `excluded` are terms the question brings up itself. */
+export function wornWords(answers: Worded[][], excluded: Set<string>): string[] {
+  const counts = new Map<string, { answers: number; forms: Map<string, number> }>();
+  for (const answer of answers) {
+    const firstForms = new Map<string, string>();
+    for (const { word, term } of answer) if (!firstForms.has(term)) firstForms.set(term, word);
+    for (const [term, word] of firstForms) {
+      const entry = counts.get(term) ?? { answers: 0, forms: new Map<string, number>() };
+      entry.answers += 1;
+      entry.forms.set(word, (entry.forms.get(word) ?? 0) + 1);
+      counts.set(term, entry);
+    }
+  }
+  return [...counts]
+    .filter(([term, entry]) => entry.answers >= WORN_TIMES && !excluded.has(term) && ![...entry.forms.keys()].some((form) => COURTESY.test(form)))
+    .sort((a, b) => b[1].answers - a[1].answers)
+    .slice(0, WORN_SHOWN)
+    .map(([, entry]) => [...entry.forms].sort((a, b) => b[1] - a[1])[0]![0]);
+}
+
+/** A person's private notes in the focus, one line a kind, each item dated, and marked when the bot already used it. */
+function privateLines(input: { person: Person; notes: ContextNote[]; jokes: ContextNote[]; themes: Theme[]; used: Map<number, { times: number; last: Date }>; names: Map<number, string>; clock: Clock }): string[] {
   const { person, clock } = input;
   const of = (kind: NoteKind) => input.notes.filter((note) => note.kind === kind).slice(0, FOCUS_NOTES[kind] ?? 0);
-  const dated = (note: ContextNote, extra: string[] = []) => `${quoted(note)} (${[...extra, dateLabel(note.said_at, clock)].filter(Boolean).join("; ")})`;
+  const used = (note: ContextNote) => {
+    const seen = input.used.get(note.id);
+    return seen ? `brought up ${seen.times}× lately, last ${dateLabel(seen.last, clock)}` : "";
+  };
+  const dated = (note: ContextNote, extra: string[] = []) => `${quoted(note)} (${[...extra, dateLabel(note.said_at, clock), used(note)].filter(Boolean).join("; ")})`;
   const status = (note: ContextNote, due: string) =>
     [note.status, note.due_at && note.status === "open" ? `${due} ${dateLabel(note.due_at, clock)}` : ""].filter(Boolean).join(", ");
   const item = (label: string, values: string[]) => (values.length ? [`  🔒 ${label}: ${values.join("; ")}`] : []);
@@ -512,6 +588,7 @@ function inFocusBlock(input: {
   notes: Map<number, ContextNote[]>;
   jokes: ContextNote[];
   themes: Theme[];
+  used: Map<number, { times: number; last: Date }>;
   names: Map<number, string>;
   clock: Clock;
 }): string {
@@ -532,7 +609,7 @@ function inFocusBlock(input: {
         `${timeLabel(exchange.sent_at, clock)} “${exchange.asked.trim() ? line(exchange.asked, 100) : `[${exchange.media_type ?? "no text"}]`}” → you: “${line(exchange.answer, 140)}”`,
     );
     const topics = (input.topics.get(person.id) ?? []).map((topic) => `${dateLabel(topic.period_to, clock)}: ${line(`${topic.title} — ${topic.summary}`, 140)}`);
-    const notes = privateLines({ person, notes: input.notes.get(person.id) ?? [], jokes: input.jokes, themes: input.themes, names: input.names, clock });
+    const notes = privateLines({ person, notes: input.notes.get(person.id) ?? [], jokes: input.jokes, themes: input.themes, used: input.used, names: input.names, clock });
     return withinBudget(
       [
         `${header}${person.tagline ? ` — ${safe(person.tagline)}` : ""}`,
@@ -546,7 +623,7 @@ function inFocusBlock(input: {
     ).join("\n");
   });
   return people.length
-    ? `<in_focus note="the people this question is about; dates say when a fact was said, ✍ marks what the person wrote themselves, 🔒 your private notes: use them, never say you keep them">\n${people.join("\n")}\n</in_focus>`
+    ? `<in_focus note="the people this question is about; dates say when a fact was said, ✍ marks what the person wrote themselves, 🔒 your private notes: use them, never say you keep them; «brought up» marks one your own messages already used lately">\n${people.join("\n")}\n</in_focus>`
     : "";
 }
 
@@ -670,7 +747,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   const answers = options.recentAnswers ?? [];
   const visibleIds = new Set([...conversation, ...thread].map((row) => row.msg_id));
   const answerIds = answers.map((answer) => answer.msgId).filter((id): id is number => id !== undefined);
-  const [focusFacts, exchanges, topics, breakdown, blanked, focusNotes, themes] = await Promise.all([
+  const [focusFacts, exchanges, topics, breakdown, blanked, focusNotes, themes, spokenRows] = await Promise.all([
     focusIds.length
       ? sql<FocusFact[]>`
           SELECT f.user_id, f.kind, f.value, f.status,
@@ -713,7 +790,28 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
           ORDER BY coalesce(said_at, created_at) DESC, id DESC`
       : Promise.resolve([]),
     focusIds.length ? recurringThemes(sql, chatId) : Promise.resolve([]),
+    // The bot's own words of the last days, its receipts for card requests aside, newest first.
+    sql<{ text: string; sent_at: Date }[]>`
+      SELECT m.text, m.sent_at FROM messages m
+      WHERE m.chat_id = ${chatId} AND m.from_bot AND btrim(m.text) <> '' AND m.sent_at > now() - ${`${SPENT_DAYS} days`}::interval
+        AND NOT EXISTS (SELECT 1 FROM self_edits s WHERE s.chat_id = m.chat_id AND s.receipt_msg_id = m.msg_id)
+      ORDER BY m.msg_id DESC LIMIT ${SPENT_MESSAGES}`,
   ]);
+  // What the bot's own words of the last days already used: the notes they brought up, and the words they wore out.
+  const noteText = (note: ContextNote) => `${note.about ?? ""} ${note.value}`;
+  const askerNames = asker ? [asker.display_name, ...(aliasesOf.get(asker.id) ?? []).map((alias) => alias.alias)] : [];
+  const askedAbout = `${asked} ${threadTexts.join(" ")} ${question.from.first_name} ${question.from.last_name ?? ""} ${askerNames.join(" ")}`;
+  const worded = await wordedTexts(sql, [...spokenRows.map((row) => row.text), ...focusNotes.map(noteText), askedAbout]);
+  const spokenWords = worded.slice(0, spokenRows.length);
+  const spoken = spokenRows.map((row, index) => ({ terms: new Set(spokenWords[index]!.map(({ term }) => term)), sent_at: row.sent_at }));
+  const used = new Map<number, { times: number; last: Date }>();
+  const background = backgroundTerms(spoken);
+  focusNotes.forEach((note, index) => {
+    const seen = broughtUp(worded[spokenRows.length + index]!, spoken, background);
+    if (seen) used.set(note.id, seen);
+  });
+  const latestAnswers = spokenWords.filter((_, index) => spokenRows[index]!.text.length >= WORN_MIN_CHARS).slice(0, WORN_ANSWERS);
+  const worn = wornWords(latestAnswers, new Set(worded.at(-1)!.map(({ term }) => term)));
 
   const factsOf = new Map<number, Map<string, string[]>>();
   for (const fact of facts) {
@@ -809,6 +907,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
       notes: groupBy(focusNotes, (note) => note.user_id!),
       jokes,
       themes,
+      used,
       names,
       clock,
     }),
@@ -822,9 +921,10 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     // A message of the bot's from before it kept its own messages: Telegram's copy stands in.
     repliedToBot && unstoredParent ? `<your_message_they_reply_to>\n${line(unstoredParent, 1500)}\n</your_message_they_reply_to>` : "",
     question.cardChange ? `<card_change note="what the bot did about this message's request to change the sender's card; its reply already said it">${line(question.cardChange, 600)}</card_change>` : "",
+    worn.length ? `<worn_out note="what your latest answers kept coming back to">${worn.map(safe).join(", ")}</worn_out>` : "",
     `<if_insulted motif="${options.insultMotif}" />`,
     // Right before the question, where a smaller model still has it in mind: the tone of the answer follows this message.
-    `<answer_in_kind>kindness, thanks or a gift: warmth and real thanks, no jab; banter: banter; an insult: the menacing chronicler</answer_in_kind>`,
+    `<answer_in_kind>kindness, thanks or a gift: warmth and real thanks, no jab, yet it buys no side and outranks no work; banter: banter, sharpest about work that stalls; an insult: the menacing chronicler</answer_in_kind>`,
     `<question from="${safe(askerName).replace(/"/g, "'")}">\n${line(asked, 1500)}\n</question>`,
   ];
   const text = (blocks: string[]) => blocks.filter(Boolean).join("\n\n");

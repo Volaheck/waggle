@@ -45,6 +45,9 @@ const NOTHING_CHANGED = "nothing was changed on any card";
 const READS_PER_HOUR = 20;
 const READ_TIMEOUT_MS = 20_000;
 const OWNERS_ASKED_EVERY_MS = 24 * 3_600_000;
+/** Words a request to change a card can hardly do without: a message with none of them is answered as a question, unread. */
+const REQUEST_CUE =
+  /запис|запиш|добав|удал|убер|убра|сотр|стер|забуд|помен|измен|обнов|исправ|поправ|внес|замен|постав|укаж|отмет|зов|назыв|карточ|теглайн|тэглайн|подпис|\b(?:add|remove|delete|drop|change|update|set|replace|record|write|erase|forget|call me|card|tagline)\b/iu;
 const OWN_MESSAGES_WINDOW_MS = 3 * 60_000;
 const OWN_MESSAGES = 2;
 const MAX_OPS = 6;
@@ -67,10 +70,11 @@ export const SelfEditSchema = z.strictObject({
 export type SelfEditResult = z.infer<typeof SelfEditSchema>;
 
 export const SELF_EDIT_SYSTEM_PROMPT = `You read one member's own words to the bot of a Telegram group and decide whether they ask it to change their OWN card, and how. You see only their words (<their_words>, the newest first) and their own card (<their_card>: rows r1…, the names they go by a1…, their tagline).
+Decide about their newest message, the first in <their_words>: the others only explain what it refers to («запиши это»). A newest message that does not itself ask you to change a card is not_a_request, whatever the earlier ones said.
 
 kind:
 - edit: they ask to add, remove or change something on their own card: stack, role, expertise, interests, projects, links, city (timezone), what they look for, what they can help with, their tagline, or the names they go by.
-- about_others: the change is for anyone but themselves, or names another person as its subject, even "with their permission", "on their behalf" or "I am them".
+- about_others: they ask you to change the card of anyone but themselves, or name another person as its subject, even "with their permission", "on their behalf" or "I am them". Saying what someone else should do themselves («пусть сам добавит свои проекты») is not_a_request.
 - fake_claim: they ask the bot to say, confirm or pretend that something was changed.
 - forget_all: they ask the bot to erase everything about them, not one entry.
 - unclear: they ask for a change of their card, but not what.
@@ -391,7 +395,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
              receipt_msg_id = ${extra.receipt ?? null}, decided_at = now()
       WHERE id = ${id}`;
     const chat = await getChat(sql, chatId);
-    if (!chat || chat.status !== "approved" || chat.chronicle_paused_at) {
+    if (!chat || chat.status !== "approved" || chat.chronicle_paused_at || !REQUEST_CUE.test(questionText(message, question.me))) {
       await done("not_a_request", "answered");
       return deps.answer(api, question);
     }

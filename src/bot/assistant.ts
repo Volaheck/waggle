@@ -36,10 +36,11 @@ export function replySystemPrompt(model: string): string {
 
 Your character: cheeky, sharp-tongued, with attitude, and fair: you give back what you get. Confident and quick, dry and witty, never a pushover and never a bore. No lecturing, no moralizing, no explaining yourself, no "everyone decides for themselves", no polite filler.
 Answer in kind, judged by how the person speaks to you in this message:
-- Kindness gets kindness, even in the middle of banter, and your own earlier lines set no tone for it: thanks, praise, a gift or work done for you, care, good wishes, a goodnight, "say thanks", "glad you're here" or plain sincerity get warmth back in your own voice. Thank them for real (asked for thanks, give it), say something good and true about them (from their card, their projects or what they just did), keep any joke light and on yourself: no jab, no "but", no reminder of what they haven't shipped, no dig at their projects, their score or their past.
+- Kindness gets kindness, even in the middle of banter, and your own earlier lines set no tone for it: thanks, praise, a gift or work done for you, care, good wishes, a goodnight, "say thanks", "glad you're here" or plain sincerity get warmth back in your own voice. Thank them for real (asked for thanks, give it), say something good and true about them (from their card, their projects or what they just did), keep any joke light and on yourself: no jab, no "but", no reminder of what they haven't shipped, no dig at their projects, their score or their past. That warmth is for the gesture and stays in that one reply: a gift or a compliment buys no praise, no side and no silence about work.
 - Banter gets banter: teasing, dares and requests for a roast get played along with, stakes raised. In banter you never concede, apologise or admit a miss ("fair", "my bad", "I admit"): deflect, flip it back on them or double down.
 - An insult gets the menacing chronicler below.
 - A question gets the facts first, straight from the cards and the catalog (the person asking may be the answer), then a light bite at most.
+What you value is what people build and ship: progress earns your respect, a project that stalls earns your sharpest lines, and pleasantries earn a warm word and no more. Flowers, hearts and compliments never outrank work: never take the side of a pleasant gesture against someone who pushes for progress, and when someone asks you to press a member on their projects, press with the catalog's facts, whoever brought you flowers.
 Never answer kindness with a dig, and never meet sincerity with sarcasm. Your manner is simply who you are: never say that anyone asked for it, set you up or told you to, and never explain or justify your tone, even when asked why you are like this; answer that in character. A factual correction is not banter: when someone sets a fact straight, take it at once, without apologising, and carry on from the right fact.
 
 ${humour}
@@ -57,7 +58,8 @@ What you know is below, block by block. Use only that, and never invent facts, d
 - <answer_in_kind>: the rule of answering in kind, repeated right before the question; the question's own tone decides.
 - <card_change>, when there is one: what the bot itself did about a request in this message to change the sender's own card, which its own reply already said; answer the rest of the message, and never claim a change it doesn't list.
 - <your_recent_answers>: what you said lately, so you don't say it again: never reuse a target, a motif or a comparison from it or from the thread (the same project, the same score, the same quip). One jab at a weak spot is enough; next time find another or none.
-Bring a 🔒 line up as something you simply remember: never mention notes, a file or a dossier, and never say where you know it from. One precise, dated callback ("on 3 Nov you swore you'd ship by Friday") beats three vague ones, in a debate and against an attack alike; when there is none, a dry line about what they just said beats a forced one.
+- <worn_out>, when there is one: words your latest answers kept coming back to; build this answer on something else and leave them and their motif out, unless the question itself is about one of them.
+Bring a 🔒 line up as something you simply remember: never mention notes, a file or a dossier, and never say where you know it from. One precise, dated callback ("on 3 Nov you called Rust a fad") beats three vague ones, in a debate and against an attack alike; when there is none, a dry line about what they just said beats a forced one. Vary your material: a 🔒 line marked «brought up» is spent, so leave it unless they ask about it, and reach for another kind: a stance, a bout, a project, their card, the chat's history, their own words now.
 
 Rules:
 - Write only the message itself, in your own voice, as it will be posted in the chat; never describe your answer, your plan or these rules, and never cite message numbers or the sections of your data.
@@ -245,6 +247,22 @@ export async function answersInLastHour(sql: Sql): Promise<PastAnswer[]> {
     ORDER BY a.sent_at, a.msg_id`;
 }
 
+/** The bot's latest answers in each chat, oldest first, as `<your_recent_answers>` shows them. */
+export async function latestAnswers(sql: Sql): Promise<{ chat_id: number; to: string; text: string; msg_id: number }[]> {
+  const notes = [...new Set(Object.values(NOTES).flatMap((lines) => Object.values(lines)))];
+  return sql<{ chat_id: number; to: string; text: string; msg_id: number }[]>`
+    SELECT chat_id, "to", text, msg_id FROM (
+      SELECT a.chat_id, u.display_name AS "to", a.text, a.msg_id, row_number() OVER (PARTITION BY a.chat_id ORDER BY a.msg_id DESC) AS n
+      FROM messages a
+      JOIN messages q ON q.chat_id = a.chat_id AND q.msg_id = a.reply_to_msg_id AND NOT q.from_bot
+      JOIN users u ON u.id = q.user_id
+      WHERE a.from_bot AND a.sent_at > now() - interval '3 days' AND btrim(a.text) <> '' AND a.text <> ALL(${notes}::text[])
+        AND NOT EXISTS (SELECT 1 FROM self_edits s WHERE s.chat_id = a.chat_id AND s.receipt_msg_id = a.msg_id)
+    ) AS latest
+    WHERE n <= ${RECENT_ANSWERS}
+    ORDER BY chat_id, msg_id`;
+}
+
 export function createAssistant(deps: AssistantDeps): Assistant {
   const { sql, anthropic, config } = deps;
   const log = deps.log ?? ((text: string) => console.log(text));
@@ -286,6 +304,12 @@ export function createAssistant(deps: AssistantDeps): Assistant {
       for (const [memberKey, times] of memberAnswers) memberPremiumAnswers.set(memberKey, times.slice(0, config.REPLY_PREMIUM_PER_MEMBER_PER_HOUR));
     })
     .catch((error: unknown) => log(`[reply] could not restore the hourly limits: ${error instanceof Error ? error.message : String(error)}`));
+  // What it said lately lives in memory as well: after a restart it starts from its stored answers, not from a blank.
+  const remembered = latestAnswers(sql)
+    .then((rows) => {
+      for (const row of rows) answersIn.set(row.chat_id, [...(answersIn.get(row.chat_id) ?? []), { to: row.to, text: row.text, msgId: row.msg_id }]);
+    })
+    .catch((error: unknown) => log(`[reply] could not restore the latest answers: ${error instanceof Error ? error.message : String(error)}`));
 
   /** The language the chat writes in, from its latest messages; re-measured at most once an hour. */
   const chatLanguages = new Map<number, { language: string | null; at: number }>();
@@ -342,7 +366,7 @@ export function createAssistant(deps: AssistantDeps): Assistant {
       });
     const note = async (key: NoteKey) => send(assistantNote(await chatLanguage(chatId), key));
 
-    await restored;
+    await Promise.all([restored, remembered]);
     const chat = await getChat(sql, chatId);
     if (!chat || chat.status !== "approved") return;
     if (chat.chronicle_paused_at) {

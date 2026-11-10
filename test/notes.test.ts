@@ -4,7 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { signInitData } from "../src/api/init-data.js";
 import { createApi } from "../src/api/server.js";
 import { createBot } from "../src/bot/bot.js";
-import { buildReplyContext, promptText, type Question } from "../src/bot/reply-context.js";
+import { buildReplyContext, promptText, wordedTexts, wornWords, type Question } from "../src/bot/reply-context.js";
 import { addAlias } from "../src/core/aliases.js";
 import { migrateChat } from "../src/core/chat-migration.js";
 import { attachLegacyData, getChat, LEGACY_CHAT_ID, registerChat, setChatStatus } from "../src/core/chats.js";
@@ -785,6 +785,31 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       // The chat-wide lists are the same whoever asks, the asker's own notes included; the focus repeats those.
       expect(block(context, "corrections")).toMatch(/^- about Dora: “Atlas — проект Доры, а не Боба” \(\d{1,2} \w{3,4}\)\n- about Kit: “Кит — не дизайнер, а бэкендер” \(\d{1,2} \w{3,4}\)$/);
       expect(block(context, "about_you")).toMatch(/What members say about you: “бот умнее половины чата” \(Bob, \d{1,2} \w{3,4}\); “бот тайно считает наши опечатки” \(Kit, \d{1,2} \w{3,4}\)\./);
+    });
+
+    it("marks a note the bot's own messages used in the last days, and only that one, so it can rest", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      const said = new Date(Date.now() - 5 * DAY);
+      await stored(chat, { userId: kit.id, kind: "claim", value: "обещал выкатить iOS-версию к пятнице", saidAt: said });
+      await stored(chat, { userId: kit.id, kind: "stance", about: "фреймворки", value: "пустая трата времени", saidAt: said });
+      await stored(chat, { userId: kit.id, kind: "bout", value: "назвал бота калькулятором; зашло", saidAt: said });
+      await botSays(chat, "Пятница прошла, а iOS-версия, которую ты обещал выкатить, всё ещё в мечтах.", { at: new Date(Date.now() - DAY) });
+      await botSays(chat, "Опять обещания про iOS-версию?", { at: new Date(Date.now() - 2 * HOUR) });
+      await botSays(chat, "Калькулятор помнит всё.", { at: new Date(Date.now() - 10 * DAY) });
+      const focus = block(await contextFor(asking(chat, kit, "что нового?")), "in_focus")!;
+      expect(focus).toMatch(/“обещал выкатить iOS-версию к пятнице” \([^)]*; brought up 2× lately, last \d{1,2} \w{3,4}\)/);
+      expect(focus).not.toMatch(/пустая трата времени” \([^)]*brought up/);
+      // Ten days on, a comeback is fresh again.
+      expect(focus).not.toMatch(/калькулятором; зашло” \([^)]*brought up/);
+    });
+
+    it("names the words several of its latest answers share, unless the question brings them up", async () => {
+      const answers = ["Твои обещания опять в летописи, 2.5 из 6.", "Обещания, обещания: летопись помнит 2.5 из 6.", "Обещание к пятнице, как всегда: 2.5 из 6.", "Rust — это хорошо."];
+      const worded = await wordedTexts(sql, [...answers, "что нового?", "что я обещал?"]);
+      const asked = (index: number) => new Set(worded[index]!.map(({ term }) => term));
+      expect(wornWords(worded.slice(0, 4), asked(4))).toEqual(["обещания", "2.5"]);
+      expect(wornWords(worded.slice(0, 4), asked(5))).toEqual(["2.5"]);
     });
   });
 

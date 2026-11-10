@@ -66,6 +66,22 @@ export async function textTerms(sql: Sql, texts: string[]): Promise<string[][]> 
   return rows.map((row) => termsOf(row.lexemes));
 }
 
+/**
+ * Each word's term as textTerms counts it; none for a stop word or a fragment. A Latin word the stemming cuts below
+ * three letters («iOS» → 'io') stays whole.
+ */
+export async function wordTerms(sql: Sql, words: string[]): Promise<Map<string, string>> {
+  if (words.length === 0) return new Map();
+  const rows = await sql<{ word: string; lexemes: string[] }[]>`
+    SELECT listed.word, tsvector_to_array(to_tsvector('russian', listed.word)) AS lexemes FROM unnest(${words}::text[]) AS listed(word)`;
+  const terms = new Map<string, string>();
+  for (const row of rows) {
+    const term = termsOf(row.lexemes)[0] ?? (row.lexemes.length && /^[a-z][a-z0-9]{2,}$/.test(row.word) ? row.word : undefined);
+    if (term) terms.set(row.word, term);
+  }
+  return terms;
+}
+
 export interface ThemeTopic {
   id: number;
   title: string;

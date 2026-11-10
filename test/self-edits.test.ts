@@ -201,6 +201,11 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     const question = await run(chat, bob, "@waggle_test_bot кто у нас пишет на Rust?", { kind: "not_a_request", also_asks: false, ops: [] });
     expect(question.answered).toEqual(["@waggle_test_bot кто у нас пишет на Rust?"]);
     expect(question.sent).toEqual([]);
+    // A message that asks for no change is not even read, whatever a model would make of it.
+    const banter = await run(chat, bob, "@waggle_test_bot держи 🌹 жаль, что цветы тебе интереснее прогресса", { kind: "about_others", also_asks: false, ops: [] });
+    expect(banter.parser.prompts).toEqual([]);
+    expect(banter.sent).toEqual([]);
+    expect(banter.answered).toHaveLength(1);
   });
 
   it("does not edit a card claimed automatically until an owner confirms it", async () => {
@@ -233,7 +238,7 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     expect(news.parser.prompts[0]).toContain("я теперь пишу на Rust");
     const declined = await run(chat, bob, "@waggle_test_bot запиши Киту стек PHP", { kind: "about_others", also_asks: false, ops: [] });
     expect(declined.sent[0]!.text).toContain("🔒");
-    const again = await run(chat, bob, "@waggle_test_bot и мне то же самое", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "stack", ref: null, value: "PHP" }] });
+    const again = await run(chat, bob, "@waggle_test_bot и мне запиши то же самое", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "stack", ref: null, value: "PHP" }] });
     expect(again.parser.prompts[0]).not.toContain("PHP");
     expect(await sql`SELECT value FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toEqual([{ value: "Rust" }]);
   });
