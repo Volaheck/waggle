@@ -100,7 +100,7 @@ const FOCUS_TOPIC_DAYS = 60;
 const FOCUS_NOTES: Partial<Record<NoteKind, number>> = { claim: 4, prediction: 3, stance: 4, correction: 3, bout: 3, bait: 2, about_bot: 2 };
 const FOCUS_JOKES = 4;
 /** A note the bot's own messages used within this many days is marked as used (later it may come back); the newest this many of them are read. */
-const SPENT_DAYS = 3;
+const SPENT_DAYS = 1;
 const SPENT_MESSAGES = 150;
 /** Of the bot's latest answers this many are read for worn words: one that this many of them share is worn out. */
 const WORN_ANSWERS = 10;

@@ -787,20 +787,20 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       expect(block(context, "about_you")).toMatch(/What members say about you: “бот умнее половины чата” \(Bob, \d{1,2} \w{3,4}\); “бот тайно считает наши опечатки” \(Kit, \d{1,2} \w{3,4}\)\./);
     });
 
-    it("marks a note the bot's own messages used in the last days, and only that one, so it can rest", async () => {
+    it("marks a note the bot's own messages used in the last day, and only that one, so it can rest", async () => {
       const chat = await newChat();
       const kit = await member(chat, "Kit");
       const said = new Date(Date.now() - 5 * DAY);
       await stored(chat, { userId: kit.id, kind: "claim", value: "обещал выкатить iOS-версию к пятнице", saidAt: said });
       await stored(chat, { userId: kit.id, kind: "stance", about: "фреймворки", value: "пустая трата времени", saidAt: said });
       await stored(chat, { userId: kit.id, kind: "bout", value: "назвал бота калькулятором; зашло", saidAt: said });
-      await botSays(chat, "Пятница прошла, а iOS-версия, которую ты обещал выкатить, всё ещё в мечтах.", { at: new Date(Date.now() - DAY) });
+      await botSays(chat, "Пятница прошла, а iOS-версия, которую ты обещал выкатить, всё ещё в мечтах.", { at: new Date(Date.now() - 20 * HOUR) });
       await botSays(chat, "Опять обещания про iOS-версию?", { at: new Date(Date.now() - 2 * HOUR) });
-      await botSays(chat, "Калькулятор помнит всё.", { at: new Date(Date.now() - 10 * DAY) });
+      await botSays(chat, "Калькулятор помнит всё.", { at: new Date(Date.now() - 2 * DAY) });
       const focus = block(await contextFor(asking(chat, kit, "что нового?")), "in_focus")!;
       expect(focus).toMatch(/“обещал выкатить iOS-версию к пятнице” \([^)]*; brought up 2× lately, last \d{1,2} \w{3,4}\)/);
       expect(focus).not.toMatch(/пустая трата времени” \([^)]*brought up/);
-      // Ten days on, a comeback is fresh again.
+      // A day on, a comeback is fresh again.
       expect(focus).not.toMatch(/калькулятором; зашло” \([^)]*brought up/);
     });
 

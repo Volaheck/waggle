@@ -256,7 +256,7 @@ export async function latestAnswers(sql: Sql): Promise<{ chat_id: number; to: st
       FROM messages a
       JOIN messages q ON q.chat_id = a.chat_id AND q.msg_id = a.reply_to_msg_id AND NOT q.from_bot
       JOIN users u ON u.id = q.user_id
-      WHERE a.from_bot AND a.sent_at > now() - interval '3 days' AND btrim(a.text) <> '' AND a.text <> ALL(${notes}::text[])
+      WHERE a.from_bot AND a.sent_at > now() - interval '1 day' AND btrim(a.text) <> '' AND a.text <> ALL(${notes}::text[])
         AND NOT EXISTS (SELECT 1 FROM self_edits s WHERE s.chat_id = a.chat_id AND s.receipt_msg_id = a.msg_id)
     ) AS latest
     WHERE n <= ${RECENT_ANSWERS}
