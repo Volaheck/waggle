@@ -77,7 +77,7 @@ Decide about their newest message, the first in <their_words>: the others only e
 
 kind:
 - edit: they ask to add, remove or change something on their own card: stack, role, expertise, interests, projects, links, city (timezone), what they look for, what they can help with, their tagline, the names they go by, or their notes: a note about themselves, or about one of their projects.
-- about_others: they ask you to change the card of anyone but themselves, or name another person as its subject, even "with their permission", "on their behalf" or "I am them". Saying what someone else should do themselves («пусть сам добавит свои проекты») is not_a_request.
+- about_others: they ask you to change the card of anyone but themselves, or name another person as its subject, even "with their permission", "on their behalf" or "I am them". A note on a project that is not one of theirs (p…) is about_others too. Saying what someone else should do themselves («пусть сам добавит свои проекты») is not_a_request.
 - fake_claim: they ask the bot to say, confirm or pretend that something was changed.
 - forget_all: they ask the bot to erase everything about them, not one entry.
 - unclear: they ask for a change of their card, but not what.
@@ -126,7 +126,7 @@ const TEXTS: Record<Language, Record<string, string>> = {
     no: "✖️ Нет",
     confirm: "Поменять так? Подтвердить может только автор запроса.",
     kept: "Хорошо, ничего не меняю.",
-    aboutOthers: "🔒 Менять можно только свою карточку. Чужую не трону, кто бы ни просил и что бы ни разрешал.",
+    aboutOthers: "🔒 Менять можно только своё: свою карточку и заметки к своим проектам. Чужое не трону, кто бы ни просил и что бы ни разрешал.",
     fakeClaim: "На слово ничего не подтверждаю: что изменено, говорят только мои квитанции под запросами.",
     unclear: "Что поменять в карточке? Скажи прямо, например: «запиши мне стек: Rust», «убери из карточки PHP», «я теперь в Варшаве, обнови город».",
     forgetAll: "Стереть всё о себе можно командой /forgetme в личке со мной: там видно, что именно сотрётся.",
@@ -152,7 +152,7 @@ const TEXTS: Record<Language, Record<string, string>> = {
     no: "✖️ No",
     confirm: "Change it like this? Only the author of the request can confirm.",
     kept: "Fine, nothing changes.",
-    aboutOthers: "🔒 I only change your own card. Nobody else's, whoever asks and whatever they allow.",
+    aboutOthers: "🔒 I only change what is yours: your card and notes on your own projects. Nothing of anyone else's, whoever asks and whatever they allow.",
     fakeClaim: "I confirm nothing on request: only my receipts under requests say what changed.",
     unclear: "What should I change on your card? Say it plainly, e.g. “add to my stack: Rust”, “remove PHP from my card”, “I live in Warsaw now, update my city”.",
     forgetAll: "To erase everything about you, send /forgetme in a private chat with me: it shows what goes.",
