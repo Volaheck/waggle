@@ -597,24 +597,16 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
       expect(await sql`SELECT 1 FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id} AND kind = 'stack'`).toHaveLength(0);
     });
 
-    it("asks a member whose card spans several zones for their city when they write about a day, once a week", async () => {
+    it("never asks on its own which city someone is in: where they are comes from what they say", async () => {
       const chat = await russianChat();
       const bob = await member(chat, "Bob");
       await proposeFact(sql, { chatId: chat, userId: bob.id, kind: "timezone", value: "Канада", confidence: 1, sourceMsgIds: [], source: "user" });
       await sql`UPDATE facts SET zones = ${CANADA} WHERE chat_id = ${chat} AND user_id = ${bob.id}`;
-      const plain = await run(chat, bob, "@waggle_test_bot как дела?", { kind: "not_a_request", also_asks: false, ops: [] });
-      expect(plain.sent).toEqual([]);
-      const first = await run(chat, bob, "@waggle_test_bot что у нас завтра?", { kind: "not_a_request", also_asks: false, ops: [] });
-      expect(first.answered).toEqual(["@waggle_test_bot что у нас завтра?"]);
-      expect(first.sent[0]!.text).toContain("🕐 В твоей карточке «Канада», а это 6 часовых поясов. В каком ты городе?");
-      // The answer knows the bot asked, so it does not ask again.
-      expect(first.cardChanges[0]).toContain("the bot itself asked them in its own message which city they are in");
-      const again = await run(chat, bob, "@waggle_test_bot а вечером что?", { kind: "not_a_request", also_asks: false, ops: [] });
-      expect(again.sent).toEqual([]);
-      // Their reply to the question sets the zone.
-      const [question] = await sql<{ receipt_msg_id: number }[]>`SELECT receipt_msg_id FROM self_edits WHERE chat_id = ${chat} AND msg_id = ${first.message.message_id}`;
-      await run(chat, bob, "в Торонто", { kind: "edit", asks: "в Торонто", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "Торонто" }] }, undefined, replyTo(chat, question!.receipt_msg_id));
-      expect(await zoneOf(chat, bob.id)).toEqual({ time_zone: "America/Toronto", time_zone_source: "chat" });
+      const asked = await run(chat, bob, "@waggle_test_bot что у нас завтра?", { kind: "not_a_request", also_asks: false, ops: [] });
+      expect(asked.sent).toEqual([]);
+      expect(asked.parser.prompts).toEqual([]);
+      expect(asked.answered).toEqual(["@waggle_test_bot что у нас завтра?"]);
+      expect(asked.cardChanges).toEqual([undefined]);
     });
 
     it("sets no zone on an opted-out card, and says so when a place cannot be placed", async () => {

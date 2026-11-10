@@ -276,8 +276,8 @@ describe("chronicler prompts", () => {
     expect(prompt).toContain("u7 | Mike (@mike) | no tagline");
     expect(prompt).toContain("atlas | Atlas | idea | authors: u7");
     expect(prompt).toContain("These members asked that nothing be collected about them (do not write facts or taglines about them): u8");
-    expect(prompt).toContain("[2] Mike (u7) ↩1 [forwarded from Tech News] [photo]: Look at this");
-    expect(prompt).toContain("[3] unknown: Look at this");
+    expect(prompt).toMatch(/\[2 \d{2}:\d{2}\] Mike \(u7\) ↩1 \[forwarded from Tech News\] \[photo\]: Look at this/);
+    expect(prompt).toMatch(/\[3 \d{2}:\d{2}\] unknown: Look at this/);
     expect(prompt).not.toMatch(cyrillic);
   });
 
@@ -285,8 +285,8 @@ describe("chronicler prompts", () => {
     const mike: Person = { id: 7, tg_id: 7, username: "mike", display_name: "Mike", is_admin: false, dm_started: false, current_chat_id: null, chat_id: -1, user_id: 7, tagline: null, tagline_manual: false, opted_out: false, first_seen_at: null, last_message_at: null, left_at: null, time_zone: null, time_zone_source: null };
     const photo: StoredMessage = { chat_id: -1, msg_id: 4, user_id: 7, sent_at: new Date(), text: "", reply_to_msg_id: null, is_forward: false, forward_source: null, media_type: "photo" };
     const prompt = buildExtractionPrompt({ chatId: -1, batch: [photo, { ...photo, msg_id: 5, text: "Nice shot", media_type: null, reply_to_msg_id: 4 }], context: [], users: [mike], facts: [], projects: [] });
-    expect(prompt).toContain("[4] Mike (u7) [photo]\n");
-    expect(prompt).toContain("[5] Mike (u7) ↩4: Nice shot");
+    expect(prompt).toMatch(/\[4 \d{2}:\d{2}\] Mike \(u7\) \[photo\]\n/);
+    expect(prompt).toMatch(/\[5 \d{2}:\d{2}\] Mike \(u7\) ↩4: Nice shot/);
   });
 });
 

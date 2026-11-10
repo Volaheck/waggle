@@ -703,7 +703,7 @@ export function localTimesBlock(focus: { person: Person; reason: FocusReason }[]
       const who = `- ${safe(person.display_name)}${person.username ? ` (@${person.username})` : ""}, ${reason}`;
       const clock = clocks.get(person.id);
       if (clock?.unclear && clock.place) {
-        return `${who}: unknown: their card says «${safe(line(clock.place, 60))}», which spans ${clock.unclear} time zones, and they have set none, so the chat's time stands in; «поставь мне пояс <город>» sets theirs`;
+        return `${who}: unknown: their card says «${safe(line(clock.place, 60))}», which spans ${clock.unclear} time zones, and nothing on it tells which yet, so the chat's time stands in`;
       }
       if (!clock || clock.source === "chat_zone") return `${who}: the chat's time (no zone of their own)`;
       const source = clock.source === "card" && clock.place ? `${CLOCK_SOURCES.card}, «${safe(line(clock.place, 60))}»` : CLOCK_SOURCES[clock.source];

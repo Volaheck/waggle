@@ -94,7 +94,7 @@ describe("the chronicler's two calls", () => {
     expect(Object.keys(NotesSchema.shape)).toEqual(["notes", "aliases"]);
     expect(Object.keys(NotesSchema.shape.notes.element.shape)).toEqual(["person", "kind", "about", "value", "status", "due_at", "replaces", "people", "confidence", "source_msg_ids"]);
     expect(Object.keys(NotesSchema.shape.aliases.element.shape)).toEqual(["person", "alias", "source_msg_ids"]);
-    for (const line of ["- tagline —", "nationality or ethnicity", "logins, passwords", "no places", "only if the person said themselves where they live", "debate (an argument"]) {
+    for (const line of ["- tagline —", "nationality or ethnicity", "logins, passwords", "no places", "where the person lives or is staying now", "debate (an argument"]) {
       expect(EXTRACTION_SYSTEM_PROMPT).toContain(line);
     }
     for (const kind of ["- correction —", "- claim —", "- stance —", "- prediction —", "- bit —", "- bout —", "- bait —", "- about_bot —"]) {
@@ -308,7 +308,7 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       // Both calls get the same masked messages under the same date lines.
       const lines = (prompt: string) => /<new_messages>\n([\s\S]*?)\n<\/new_messages>/.exec(prompt)![1];
       expect(lines(second!.prompt)).toBe(lines(main!.prompt));
-      expect(lines(main!.prompt)).toMatch(/^--- \d{4}-\d{2}-\d{2}, \w+day ---\n\[\d+\] Kit/);
+      expect(lines(main!.prompt)).toMatch(/^--- \d{4}-\d{2}-\d{2}, \w+day ---\n\[\d+ \d{2}:\d{2}\] Kit/);
       expect(stats).toMatchObject({ calls: 1, notesCalls: 1, notesFailures: [] });
       expect((await sql<{ purpose: string }[]>`SELECT purpose FROM llm_usage WHERE chat_id = ${chat} ORDER BY id`).map((row) => row.purpose)).toEqual(["extract", NOTES_PURPOSE]);
       const notes = await notesOf(chat);
@@ -459,7 +459,7 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       const chat = await newChat("Unlucky hive");
       const kit = await member(chat, "Kit");
       let notes: Answer<NotesResult> = "refusal";
-      const newest = (prompt: string) => Number([...prompt.split("<new_messages>")[1]!.matchAll(/\[(\d+)\] Kit/g)].at(-1)![1]);
+      const newest = (prompt: string) => Number([...prompt.split("<new_messages>")[1]!.matchAll(/\[(\d+) \d{2}:\d{2}\] Kit/g)].at(-1)![1]);
       const model = fakeModel({
         main: (prompt) => ({ ...EMPTY, topics: [{ title: "Release day", summary: "Kit shipped a build.", kind: "discussion", importance: 3, project: null, msg_ids: [newest(prompt)] }] }),
         notes: () => notes,
@@ -513,7 +513,7 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       const { client } = fakeModel({
         notes: (prompt) => {
           round += 1;
-          const id = Number(/\[(\d+)\] Dora/.exec(prompt.split("<new_messages>")[1]!)![1]);
+          const id = Number(/\[(\d+) \d{2}:\d{2}\] Dora/.exec(prompt.split("<new_messages>")[1]!)![1]);
           return { aliases: [], notes: [note({ person: `u${dora.id}`, kind: "about_bot", about: CONSENT, value: `не хочет, чтобы её записывали (${round})`, source_msg_ids: [id] })] };
         },
       });
@@ -751,6 +751,53 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
     });
   });
 
+  describe("where people are", () => {
+    it("lets what someone's own clock showed tell which zone of their country is theirs, and nothing more", async () => {
+      const chat = await newChat();
+      const lee = await member(chat, "Lee");
+      const dana = await member(chat, "Dana");
+      const eve = await member(chat, "Eve");
+      const bob = await member(chat, "Bob");
+      const canada = "{America/St_Johns,America/Halifax,America/Toronto,America/Winnipeg,America/Edmonton,America/Vancouver}";
+      for (const [who, place] of [[dana, "Канада"], [eve, "Канада"], [bob, "Китай"]] as const) {
+        await proposeFact(sql, { chatId: chat, userId: who.id, kind: "timezone", value: place, confidence: 1, sourceMsgIds: [], source: "user" });
+      }
+      await sql`UPDATE facts SET zones = ${canada} WHERE chat_id = ${chat} AND user_id IN (${dana.id}, ${eve.id})`;
+      await sql`UPDATE facts SET zones = '{Asia/Shanghai}' WHERE chat_id = ${chat} AND user_id = ${bob.id}`;
+      const at = new Date("2026-11-06T19:42:00Z");
+      const lees = await say(chat, lee, "у меня 4 утра, а ты всё читаешь", { at });
+      const danas = await say(chat, dana, "а у меня 14:42, обед", { at });
+      // A bare hour at 20:40 UTC is 15:40 in Toronto and 14:40 in Winnipeg: it cannot tell them apart.
+      const eves = await say(chat, eve, "у меня 3 часа дня", { at: new Date("2026-11-06T20:40:00Z") });
+      const bobs = await say(chat, bob, "у меня 9 вечера", { at });
+      const forwarded = await say(chat, lee, "В Пекине сейчас 4 утра", { at, forward: true });
+      const { client } = fakeModel({
+        main: {
+          ...EMPTY,
+          facts_add: [
+            fact(lee, "timezone", "04:00", [lees]),
+            fact(dana, "timezone", "14:42", [danas]),
+            fact(eve, "timezone", "15:00", [eves]),
+            fact(bob, "timezone", "21:00", [bobs]),
+            fact(lee, "timezone", "04:00", [forwarded]),
+            fact(lee, "timezone", "4 утра", [lees]),
+            fact(lee, "timezone", "UTC+7", [lees]),
+          ],
+        },
+      });
+      await pass(chat, client);
+      const places = (userId: number) => sql`SELECT value, zones FROM facts WHERE chat_id = ${chat} AND user_id = ${userId} AND kind = 'timezone' ORDER BY id`;
+      // A clock alone puts nothing on a card: no offset, no «4 утра», no «UTC+7» the model worked out itself.
+      expect(await places(lee.id)).toEqual([]);
+      // «Канада» narrows to the one zone that showed 14:42 then, the message joining its sources.
+      expect(await places(dana.id)).toEqual([{ value: "Канада", zones: ["America/Toronto"] }]);
+      expect((await sql`SELECT source_msg_ids FROM facts WHERE chat_id = ${chat} AND user_id = ${dana.id}`)[0]).toEqual({ source_msg_ids: [danas] });
+      expect(await places(eve.id)).toEqual([{ value: "Канада", zones: canada.slice(1, -1).split(",") }]);
+      // A clock that disagrees with a place of one zone leaves the place as it is.
+      expect(await places(bob.id)).toEqual([{ value: "Китай", zones: ["Asia/Shanghai"] }]);
+    });
+  });
+
   describe("the answer context", () => {
     it("knows whose «завтра» it is: each one's own clock, their today and tomorrow, and their messages in their time", async () => {
       const chat = await newChat();
@@ -775,7 +822,7 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       expect(times).toContain(`- Lee, asking: `);
       expect(times).toMatch(/Asia\/Shanghai \(from the place on their card, «Китай»\), \d+ h ahead of the chat/);
       expect(times).toContain(`their today ${shanghai(new Date())}, their tomorrow ${tomorrow}`);
-      expect(times).toContain("- Dana, named: unknown: their card says «Канада», which spans 6 time zones, and they have set none, so the chat's time stands in; «поставь мне пояс <город>» sets theirs");
+      expect(times).toContain("- Dana, named: unknown: their card says «Канада», which spans 6 time zones, and nothing on it tells which yet, so the chat's time stands in");
       // Lee's message carries Lee's own time; Bob's, in the chat's zone, only the chat's.
       const recent = block(context, "recent_messages")!;
       expect(recent).toMatch(/\[\d+ \d{2}:\d{2}, (?:\w{3} \d{1,2} \w{3} )?\d{2}:\d{2} their time\] Lee: завтра выкачу релиз/);

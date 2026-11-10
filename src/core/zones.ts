@@ -6,9 +6,10 @@ import { callStructured, type UsageLike } from "./llm.js";
 import { maskPersonalData } from "./privacy.js";
 
 /**
- * A member's clock. The zone they chose (in the chat or the Mini App) or their device gave comes first; without one,
- * the place on their card when it has a single time zone; otherwise the chat's zone. A place that spans several
- * zones («Канада») settles nothing: the clock stays the chat's and is marked unclear, so the bot asks which city.
+ * A member's clock. The zone they chose (in the chat or the Mini App) comes first; then their device's zone, taken
+ * once, unless the card has their own word for a place or the chat named one since; then the place on their card
+ * when it has a single time zone; otherwise the chat's zone. A place that spans several zones («Канада») settles
+ * nothing: the clock stays the chat's and is marked unknown, until what they say tells which.
  */
 
 export const CHOSEN_SOURCES = ["chat", "app", "device"] as const;
@@ -110,6 +111,64 @@ export function localDay(at: Date, zone: string): string {
 /** YYYY-MM-DD in a zone. */
 export const isoDayIn = (at: Date, zone: string) => at.toLocaleDateString("en-CA", { timeZone: zone });
 
+/** A time of day as the chronicler writes down someone's own clock: «04:00», «16:20». */
+export const CLOCK_TIME = /^([01]?\d|2[0-3]):([0-5]\d)$/;
+
+/**
+ * The minutes of the day a stated clock may mean. People round: a bare hour («4 утра», written «04:00») is anything
+ * from twenty minutes before it to its end, a time with minutes ten minutes either way. Null for anything but a time.
+ */
+export function clockWindow(time: string): { from: number; to: number } | null {
+  const match = CLOCK_TIME.exec(time.trim());
+  if (!match) return null;
+  const said = Number(match[1]) * 60 + Number(match[2]);
+  const [from, to] = Number(match[2]) === 0 ? [said - 20, said + 59] : [said - 10, said + 10];
+  const day = 24 * 60;
+  return { from: (from + day) % day, to: to % day };
+}
+
+/** The zones among `zones` whose clock showed a time in the window at that moment. */
+export function zonesShowing(zones: string[], window: { from: number; to: number }, at: Date): string[] {
+  const utc = at.getUTCHours() * 60 + at.getUTCMinutes();
+  const within = (minute: number) => (window.from <= window.to ? minute >= window.from && minute <= window.to : minute >= window.from || minute <= window.to);
+  return zones.filter((zone) => within((((utc + offsetAt(zone, at)) % 1440) + 1440) % 1440));
+}
+
+export type ClockOutcome = "narrowed" | "agrees" | "unsettled" | "no_time";
+
+/**
+ * What a member said their own clock showed, as the chronicler heard it, worked out in code, never by the model. It
+ * only ever tells which zone of a place of theirs that spans several («Канада») is theirs: when exactly one of that
+ * place's zones showed that time then, their own row narrows to it, the message joining its sources. A bare hour
+ * cannot tell neighbouring zones apart, so most clocks settle nothing, and nothing is ever written from a clock alone.
+ */
+export async function noteClock(sql: Queryable, input: { chatId: number; userId: number; time: string; at: Date; msgId: number }): Promise<ClockOutcome> {
+  const window = clockWindow(input.time);
+  if (!window) return "no_time";
+  const places = await sql<{ id: number; zones: string[] | null; source_msg_ids: number[] }[]>`
+    SELECT id, zones, source_msg_ids FROM facts
+    WHERE chat_id = ${input.chatId} AND user_id = ${input.userId} AND kind = 'timezone'
+      AND (status = 'manual' OR (status = 'auto' AND confidence >= ${MIN_VISIBLE_CONFIDENCE}))`;
+  const placed = places.filter((place) => (place.zones?.length ?? 0) > 0);
+  const single = placed.find((place) => place.zones!.length === 1);
+  if (single) return zonesShowing(single.zones!, window, input.at).length ? "agrees" : "unsettled";
+  const several = placed.find((place) => place.zones!.length > 1);
+  if (!several) return "unsettled";
+  const fits = distinctClocks(zonesShowing(several.zones!, window, input.at), input.at);
+  if (fits.length !== 1) return "unsettled";
+  const sources = [...new Set([...several.source_msg_ids, input.msgId])].slice(-10);
+  await sql`UPDATE facts SET zones = ${fits}, source_msg_ids = ${sources}, updated_at = now() WHERE id = ${several.id} AND zones = ${several.zones!}`;
+  return "narrowed";
+}
+
+/** «UTC+1», «UTC−3:30», «UTC». */
+export function utcOffset(zone: string, at: Date): string {
+  const minutes = offsetAt(zone, at);
+  if (minutes === 0) return "UTC";
+  const size = Math.abs(minutes);
+  return `UTC${minutes > 0 ? "+" : "−"}${Math.floor(size / 60)}${size % 60 ? `:${String(size % 60).padStart(2, "0")}` : ""}`;
+}
+
 /** «7 h ahead of», «1 h 30 min behind», or null for the same time. */
 export function zoneGap(zone: string, from: string, at: Date): string | null {
   const minutes = offsetAt(zone, at) - offsetAt(from, at);
@@ -122,19 +181,29 @@ export function zoneGap(zone: string, from: string, at: Date): string | null {
 export interface PlaceOnCard {
   value: string;
   zones: string[] | null;
+  /** When it was last said: the newest of its source messages, or when the member wrote it. */
+  at?: Date | string | null;
+  /** The member's own word for it (the Mini App, a request in the chat), not the chronicler's. */
+  manual?: boolean;
 }
 
-/** The clock of a member from what their card holds; the places come strongest first. */
+/**
+ * The clock of a member from what their card holds; the places come strongest first (their own word, then the newest).
+ * A zone they chose wins over everything. Their device's zone, taken once, gives way to a place of one zone that is
+ * their own word, or that the chat named after it: like the rest of the card, where someone is follows what they say.
+ */
 export function clockOf(
-  member: { time_zone: string | null; time_zone_source: ChosenSource | null; opted_out: boolean },
+  member: { time_zone: string | null; time_zone_source: ChosenSource | null; time_zone_set_at?: Date | string | null; opted_out: boolean },
   places: PlaceOnCard[],
   chatZone: string,
 ): MemberClock {
   const chats: MemberClock = { zone: chatZone, source: "chat_zone", place: null, unclear: null, choices: [] };
   if (member.opted_out) return chats;
-  const chosen = member.time_zone ? zoneName(member.time_zone) : null;
-  if (chosen) return { ...chats, zone: chosen, source: member.time_zone_source ?? "app" };
   const single = places.find((place) => place.zones?.length === 1);
+  const chosen = member.time_zone ? zoneName(member.time_zone) : null;
+  const time = (at: Date | string | null | undefined) => (at ? new Date(at).getTime() : 0);
+  const placeSince = member.time_zone_source === "device" && single !== undefined && (single.manual === true || time(single.at) > time(member.time_zone_set_at));
+  if (chosen && !placeSince) return { ...chats, zone: chosen, source: member.time_zone_source ?? "app" };
   if (single) return { ...chats, zone: single.zones![0]!, source: "card", place: single.value };
   const several = places.find((place) => (place.zones?.length ?? 0) > 1);
   return several ? { ...chats, place: several.value, unclear: several.zones!.length, choices: several.zones! } : chats;
@@ -144,20 +213,27 @@ interface ClockRow {
   user_id: number;
   time_zone: string | null;
   time_zone_source: ChosenSource | null;
+  time_zone_set_at: Date | null;
   opted_out: boolean;
   places: PlaceOnCard[];
 }
 
 async function clockRows(sql: Queryable, chatId: number, userIds: number[] | null): Promise<ClockRow[]> {
   return sql<ClockRow[]>`
-    SELECT m.user_id, m.time_zone, m.time_zone_source, m.opted_out,
-           coalesce(json_agg(json_build_object('value', f.value, 'zones', f.zones) ORDER BY f.status = 'manual' DESC, f.confidence DESC, f.updated_at DESC, f.id DESC)
+    SELECT m.user_id, m.time_zone, m.time_zone_source, m.time_zone_set_at, m.opted_out,
+           coalesce(json_agg(json_build_object('value', f.value, 'zones', f.zones, 'at', f.said_at, 'manual', f.status = 'manual')
+                             ORDER BY f.status = 'manual' DESC, f.said_at DESC, f.confidence DESC, f.id DESC)
                     FILTER (WHERE f.id IS NOT NULL), '[]') AS places
     FROM members m
-    LEFT JOIN facts f ON f.chat_id = m.chat_id AND f.user_id = m.user_id AND f.kind = 'timezone'
-      AND (f.status = 'manual' OR (f.status = 'auto' AND f.confidence >= ${MIN_VISIBLE_CONFIDENCE}))
+    -- When a place was said is its newest source message, not when a clean-up last touched the row.
+    LEFT JOIN LATERAL (
+      SELECT f.*, coalesce((SELECT max(s.sent_at) FROM messages s WHERE s.chat_id = f.chat_id AND s.msg_id = ANY(f.source_msg_ids)), f.updated_at) AS said_at
+      FROM facts f
+      WHERE f.chat_id = m.chat_id AND f.user_id = m.user_id AND f.kind = 'timezone'
+        AND (f.status = 'manual' OR (f.status = 'auto' AND f.confidence >= ${MIN_VISIBLE_CONFIDENCE}))
+    ) f ON true
     WHERE m.chat_id = ${chatId} AND (${userIds === null} OR m.user_id = ANY(${userIds ?? []}::int[]))
-    GROUP BY m.user_id, m.time_zone, m.time_zone_source, m.opted_out`;
+    GROUP BY m.user_id, m.time_zone, m.time_zone_source, m.time_zone_set_at, m.opted_out`;
 }
 
 /** Every member's clock in a chat. */
@@ -200,8 +276,8 @@ export async function setChosenZone(sql: Sql, chatId: number, userId: number, ch
 }
 
 /**
- * The device's zone, taken once, onto a card that never had one: from then on it changes only when the member chooses
- * another (or clears it), even if they move. Whether it was taken.
+ * The device's zone, taken once, onto a card that never had one: the device never changes it again, and a place they
+ * name in the chat afterwards, or a zone they choose, takes over (see clockOf). Whether it was taken.
  */
 export async function seedDeviceZone(sql: Sql, chatId: number, userId: number, zone: string): Promise<boolean> {
   const updated = await sql`

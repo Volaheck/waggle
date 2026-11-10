@@ -771,7 +771,7 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
         ],
       });
       await pass(chat, client);
-      expect(prompts[0]).toContain(`[${reply}] Waggle (bot) ↩${asks}: Kit also writes Go and Haskell`);
+      expect(prompts[0]).toMatch(new RegExp(`\\[${reply} \\d{2}:\\d{2}\\] Waggle \\(bot\\) ↩${asks}: Kit also writes Go and Haskell`));
       const facts = await sql<{ kind: string; value: string }[]>`SELECT kind, value FROM facts WHERE chat_id = ${chat} ORDER BY id`;
       expect(facts).toEqual([
         { kind: "stack", value: "Rust" },

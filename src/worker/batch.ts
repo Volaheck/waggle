@@ -7,7 +7,7 @@ import { maskPersonalData } from "../core/privacy.js";
 import type { ProjectStatus } from "../core/projects.js";
 import { truncate } from "../core/text.js";
 import { peopleOfChat, type Person } from "../core/users.js";
-import { chatClocks, isoDayIn } from "../core/zones.js";
+import { chatClocks, isoDayIn, utcOffset } from "../core/zones.js";
 
 /**
  * A batch of a chat's messages with what the chronicler is shown along with it, and how the messages read in a prompt.
@@ -166,7 +166,7 @@ export function chatLanguageOf(data: BatchData): string | null {
   );
 }
 
-function formatMessage(message: StoredMessage, users: Map<number, Person>): string {
+function formatMessage(message: StoredMessage, users: Map<number, Person>, stamp: string): string {
   const author = message.user_id ? users.get(message.user_id) : undefined;
   const who = message.from_bot ? "Waggle (bot)" : author ? `${author.display_name} (u${author.id})` : "unknown";
   const reply = message.reply_to_bot ? " ↩bot" : message.reply_to_msg_id ? ` ↩${message.reply_to_msg_id}` : "";
@@ -174,14 +174,15 @@ function formatMessage(message: StoredMessage, users: Map<number, Person>): stri
   const media = message.media_type ? ` [${message.media_type}]` : "";
   // Whitespace is collapsed first, so a number split by a line break is masked whole.
   const text = truncate(maskPersonalData(message.text.replace(/\s+/g, " ").trim()), message.is_forward ? 300 : 1200);
-  return `[${message.msg_id}] ${who}${reply}${forward}${media}${text ? `: ${text}` : ""}`;
+  return `[${stamp}] ${who}${reply}${forward}${media}${text ? `: ${text}` : ""}`;
 }
 
 export const isoDay = (date: Date, timeZone: string) => date.toLocaleDateString("en-CA", { timeZone });
 
 /**
- * The messages, each day opened by a line with its date, so a deadline or a forecast can be dated. A message whose
- * author lives on another day just then carries theirs: their «завтра» counts from it.
+ * The messages, each day opened by a line with its date and each message with its time, so a deadline, a forecast
+ * or someone's own «3 a.m. here» can be placed. A message whose author lives on another day just then carries theirs:
+ * their «завтра» counts from it.
  */
 export function messageLines(messages: StoredMessage[], users: Map<number, Person>, timeZone: string, zones?: Map<number, string>): string[] {
   const lines: string[] = [];
@@ -190,19 +191,22 @@ export function messageLines(messages: StoredMessage[], users: Map<number, Perso
     const today = isoDay(message.sent_at, timeZone);
     if (today !== day) lines.push(`--- ${today}, ${message.sent_at.toLocaleDateString("en-US", { weekday: "long", timeZone })} ---`);
     day = today;
+    const time = message.sent_at.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZone });
     const own = message.user_id !== null && !message.from_bot ? zones?.get(message.user_id) : undefined;
     const theirs = own ? isoDayIn(message.sent_at, own) : today;
-    const line = formatMessage(message, users);
-    lines.push(theirs === today ? line : line.replace(/^\[(\d+)\]/, `[$1, their day ${theirs}, ${message.sent_at.toLocaleDateString("en-US", { weekday: "long", timeZone: own })}]`));
+    const theirDay = theirs === today ? "" : `, their day ${theirs}, ${message.sent_at.toLocaleDateString("en-US", { weekday: "long", timeZone: own })}`;
+    lines.push(formatMessage(message, users, `${message.msg_id} ${time}${theirDay}`));
   }
   return lines;
 }
 
-/** The context and the new messages, as both calls show them. */
+/** The context and the new messages, as both calls show them, after the clock their times and dates are on. */
 export function messageBlocks(data: BatchData): string[] {
   const users = new Map(data.users.map((user) => [user.id, user]));
   const timeZone = data.timezone ?? "UTC";
+  const at = data.batch.at(-1)?.sent_at ?? new Date();
   return [
+    `<message_times>the chat's clock: ${timeZone}, ${utcOffset(timeZone, at)} at these messages</message_times>`,
     `<context>\n${messageLines(data.context, users, timeZone, data.zones).join("\n") || "(none)"}\n</context>`,
     `<new_messages>\n${messageLines(data.batch, users, timeZone, data.zones).join("\n")}\n</new_messages>`,
   ];

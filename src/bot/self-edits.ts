@@ -30,7 +30,7 @@ import {
 import { maskPersonalData } from "../core/privacy.js";
 import { escapeHtml, truncate } from "../core/text.js";
 import { getUser, type User } from "../core/users.js";
-import { localTimeOf, memberClock, zoneLabel, zoneName } from "../core/zones.js";
+import { localTimeOf, zoneLabel, zoneName } from "../core/zones.js";
 import { chatBudgetUsd } from "../worker/scheduler.js";
 import type { BotContext } from "./kit.js";
 import { questionText, type Question } from "./reply-context.js";
@@ -57,13 +57,10 @@ const OWNERS_ASKED_EVERY_MS = 24 * 3_600_000;
 /** Words a request to change a card can hardly do without: a message with none of them is answered as a question, unread. */
 const REQUEST_CUE =
   /запис|запиш|добав|удал|убер|убра|сотр|стер|забуд|помен|измен|обнов|исправ|поправ|внес|замен|постав|установ|смен|задай|задать|выстав|переключ|пояс|укаж|отмет|зов|назыв|карточ|теглайн|тэглайн|подпис|заметк|сохран|\b(?:add|remove|delete|drop|change|update|set|replace|record|write|erase|forget|call me|card|tagline|notes?|save|time ?zone)\b/iu;
-/** Words of a day or a time of day: someone whose card leaves their time zone unclear is asked their city when they use one. */
-const TIME_CUE =
-  /(?<!\p{L})(?:завтра|послезавтра|сегодня|вчера|утр\p{L}*|вечер\p{L}*|ноч\p{L}*|днём|днем|полдень|полночь|через\s+(?:\d+|час|пару|полчаса|минут)\p{L}*|в\s+\d{1,2}(?::\d{2})?(?!\d)|понедельник\p{L}*|вторник\p{L}*|сред[уаы]|четверг\p{L}*|пятниц\p{L}*|суббот\p{L}*|воскресень\p{L}*|выходн\p{L}*|tomorrow|today|tonight|yesterday|morning|evening|noon|midnight|o'clock|weekend|monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?!\p{L})/iu;
-/** Asked their city once, someone is not asked again for this long, and a reply to the question counts as long. */
+/** A reply to the bot's question about someone's city answers it this long. */
 const ASK_CITY_DAYS = 7;
-/** What the answer is told when the bot itself asked the sender's city in a message of its own. */
-const ASKED_CITY = "nothing was changed on any card; the bot itself asked them in its own message which city they are in, as the place on their card spans several time zones: don't ask it again, and until they answer their time is unknown";
+/** What the answer is told when the bot asked the sender's city, the place they gave spanning several time zones. */
+const ASKED_CITY = "the bot asked them in its own message which city they are in, as the place they gave spans several time zones: don't ask it again";
 const OWN_MESSAGES_WINDOW_MS = 3 * 60_000;
 const OWN_MESSAGES = 2;
 const MAX_OPS = 6;
@@ -168,7 +165,6 @@ const TEXTS: Record<Language, Record<string, string>> = {
     zone: "пояс",
     zoneNow: "у тебя сейчас",
     askCity: "🕐 {place}: это {zones}. В каком ты городе? Ответь на это сообщение, и я поставлю пояс.",
-    askCityOnCard: "🕐 В твоей карточке {place}, а это {zones}. В каком ты городе? Ответь на это сообщение, и я поставлю пояс, чтобы «завтра» и «вечером» понимать по твоему времени.",
   },
   English: {
     card: "Your card",
@@ -205,7 +201,6 @@ const TEXTS: Record<Language, Record<string, string>> = {
     zone: "time zone",
     zoneNow: "your time now",
     askCity: "🕐 {place} spans {zones}. Which city are you in? Reply to this message and I'll set your zone.",
-    askCityOnCard: "🕐 Your card says {place}, which spans {zones}. Which city are you in? Reply to this message and I'll set your zone, so “tomorrow” and “tonight” go by your time.",
   },
 };
 
@@ -278,9 +273,9 @@ function zonesPhrase(count: number, language: Language): string {
   return `${count} ${tens >= 11 && tens <= 14 ? "часовых поясов" : ones === 1 ? "часовой пояс" : ones >= 2 && ones <= 4 ? "часовых пояса" : "часовых поясов"}`;
 }
 
-/** The question for a place that spans several time zones: on a request, or about the place on their card. */
-export function cityQuestion(place: string, zones: number, language: Language, onCard: boolean): string {
-  const template = TEXTS[language][onCard ? "askCityOnCard" : "askCity"]!;
+/** The question that follows a request naming a place with several time zones: a reply to it answers it. */
+export function cityQuestion(place: string, zones: number, language: Language): string {
+  const template = TEXTS[language].askCity!;
   return template.replace("{place}", quote(place)).replace("{zones}", zonesPhrase(zones, language));
 }
 
@@ -664,7 +659,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     return request;
   };
 
-  /** The bot's question about their city that this message replies to, asked of the sender within the week it waits to ask again. */
+  /** The bot's question about their city that this message replies to, asked of the sender within ASK_CITY_DAYS. */
   const cityAskedOf = async (question: Question, userId: number): Promise<{ id: number; place: string } | undefined> => {
     const replied = question.message.reply_to_message;
     if (!replied || replied.from?.id !== question.me.id) return undefined;
@@ -674,25 +669,6 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
         AND NOT m.opted_out AND s.created_at > now() - ${`${ASK_CITY_DAYS} days`}::interval
       ORDER BY s.id DESC LIMIT 1`;
     return row ? { id: row.id, place: row.asked_city } : undefined;
-  };
-
-  /**
-   * Someone whose card names a place with several time zones and nothing else settles their clock is asked their city
-   * once a week, when they write to the bot about a day or a time: their «завтра» depends on it. The question is
-   * recorded on their message, so a reply to it answers it.
-   */
-  const askCityIfUnclear = async (api: Api, question: Question, user: User, id: number): Promise<string | undefined> => {
-    if (user.linked_by === "name" || user.linked_by === "username" || !TIME_CUE.test(questionText(question.message, question.me))) return undefined;
-    const clock = await memberClock(sql, question.chatId, user.id, config.DISPLAY_TIMEZONE);
-    if (!clock.unclear || !clock.place) return undefined;
-    const [recent] = await sql`
-      SELECT 1 FROM self_edits WHERE chat_id = ${question.chatId} AND user_id = ${user.id} AND asked_city IS NOT NULL
-        AND created_at > now() - ${`${ASK_CITY_DAYS} days`}::interval LIMIT 1`;
-    if (recent) return undefined;
-    const sent = await reply(api, question, cityQuestion(clock.place, clock.unclear, await languageOf(question.chatId), true));
-    await sql`UPDATE self_edits SET asked_city = ${clock.place}, receipt_msg_id = ${sent.message_id} WHERE id = ${id}`;
-    log(`[self-edit] chat ${question.chatId}: asked user ${user.id} which city they are in (their card's place spans ${clock.unclear} zones)`);
-    return ASKED_CITY;
   };
 
   const ownersAsked = new Map<number, number>();
@@ -719,10 +695,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     const cityAsked = open ? await cityAskedOf(question, user.id) : undefined;
     if (!open || (!cued && !cityAsked)) {
       await done("not_a_request", "answered");
-      const askedCity = open
-        ? await askCityIfUnclear(api, question, user, id).catch((error: unknown) => void log(`[self-edit] chat ${chatId}: could not ask for a city: ${describe(error)}`))
-        : undefined;
-      return deps.answer(api, question, askedCity);
+      return deps.answer(api, question);
     }
     const subject = subjectOf(user, chatId, from);
     // Words that only ask for something back are a request while there is an undone change of theirs to bring back.
@@ -821,7 +794,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     const others = namesSomeoneElse(questionText(message, question.me), await otherMembers(sql, subject)) ? `\n${escapeHtml(texts.othersPart!)}` : "";
     const refusals = `${resolved.problems.length ? `\n\n${texts.nothing} ${resolved.problems.join("; ")}` : ""}${others}`;
     // A place with several time zones: the bot asks which city, and a reply to its message answers it.
-    const cityLine = resolved.askCity ? cityQuestion(resolved.askCity.place, resolved.askCity.zones, language, false) : "";
+    const cityLine = resolved.askCity ? cityQuestion(resolved.askCity.place, resolved.askCity.zones, language) : "";
     const askedCity = async () => {
       if (resolved.askCity) await sql`UPDATE self_edits SET asked_city = ${resolved.askCity.place} WHERE id = ${id}`;
     };

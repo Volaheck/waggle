@@ -9,6 +9,7 @@ import { PROJECT_STATUSES, projectForSlug, renameProject, upsertProject, type Up
 import { hasForbiddenTopic, slugify, truncate } from "../core/text.js";
 import type { Person } from "../core/users.js";
 import { batchDataFor, chatLanguageOf, isOwner, MESSAGE_COLUMNS, memberSources, memberZones, messageBlocks, parseRef, skippedKey, type BatchData } from "./batch.js";
+import { CLOCK_TIME, noteClock, writtenZone } from "../core/zones.js";
 import { applyNotesResult, buildNotesPrompt, callNotesExtractor, NOTES_PURPOSE, type BatchDebate } from "./notes-extract.js";
 
 export { batchDataFor, MESSAGE_COLUMNS, skippedMessageIds, type BatchData, type PromptNote } from "./batch.js";
@@ -39,6 +40,11 @@ const MAX_FAILED_CALLS_PER_PASS = 12;
 const EXTRACTION_MAX_TOKENS = 32000;
 /** Skipped messages are kept out of later context too, or the same message would fail the next batch. */
 const SKIPPED_KEPT = 500;
+
+/** A clock taken from a message edited longer than this after it was sent is left out: the edit's time is not on it. */
+const CLOCK_EDIT_GRACE_MS = 5 * 60_000;
+/** A value that reads as a time of day but not as «04:00»: never a place on a card. */
+const TIME_LIKE = /^(?:~|около\s+|примерно\s+|about\s+)?\d{1,2}(?:\s*[:.hч]\s*\d{2})?\s*(?:am|pm|a\.\s?m\.?|p\.\s?m\.?|утра|дня|вечера|ночи|час\p{L}*)?$/iu;
 
 export const ExtractionSchema = z.object({
   topics: z.array(
@@ -110,7 +116,7 @@ export const PROMPT_STATUS_CODES = PROJECT_STATUSES.map((code) => `"${code}"`).j
 
 export const EXTRACTION_SYSTEM_PROMPT = `You are the chronicler of a private Telegram group chat of friends. Every few hours you receive all the new messages from that interval: you write the chronicle (what people talked about), update the members' cards and the catalog of their projects, and note what is happening with the projects. The members see all of this, so accuracy matters more than completeness.
 
-You receive: the members (a ref like u12, name, @username, current facts with ids), the project catalog, a few earlier messages for context and the NEW messages, under lines with their date. Work only with the NEW messages; the context is there to help you understand what is being discussed.
+You receive: the members (a ref like u12, name, @username, current facts with ids), the project catalog, a few earlier messages for context and the NEW messages, each with its time, under lines with their date. Work only with the NEW messages; the context is there to help you understand what is being discussed.
 
 Language
 Write ALL content in the chat's language. This covers topic titles and summaries, fact values, project names and taglines, signal notes and member taglines. When the input begins with <chat_language>, that is the chat's language, measured from its messages: write in it. Otherwise it is the language most of the members' own messages are written in (forwarded posts do not count): judge it by <new_messages> together with <context>, not by one thread or one member; if they are mixed or too few to tell, keep the language of <recent_chronicle> and of the facts already on the cards, so the chat does not switch languages from one batch to the next. Use that one language for the whole response. Never translate content into another language, English included. Never translate or transliterate names of people, products and technologies (a project that has its own name keeps it), but inflect them as the chat's language requires; stack facts use the fixed family names given below. These instructions are in English, and every example in them is only an illustration: no example is a reason to write in English when the chat is in another language.
@@ -139,7 +145,7 @@ A card is a short profile, not a diary. Each fact is one idea. Semantic duplicat
 - expertise — a topic they have real experience in and are worth asking about, briefly: "self-hosted VPN", "Unity shaders".
 - interest — a lasting hobby in one or two words: "Minecraft", "skydiving", "e-ink readers".
 - link — a public link to something personal: a GitHub profile, a personal site, a portfolio. Do not put project links here — they belong in the catalog.
-- timezone — a country or city, only if the person said themselves where they live.
+- timezone — where the person lives or is staying now, as precisely as their own words allow: a city, else a region, else a country ("I'm in Toronto", "it's snowing here in Toronto", "moved to Lisbon", "in Tokyo for a month"). A person has ONE: a newer or more precise place refines it with facts_update (a country to its city), a move replaces it. Their own clock counts too: when someone names the hour it is for them right now ("it's 4 a.m. here", "16:20 here"), add a timezone fact whose value is only that time on a 24-hour clock, with minutes only when they gave them ("04:00", "16:20"), with that one message as its source and confidence 0.8 or more; the bot works out in code which of their places' zones it fits, so never write an offset, a zone or a place you worked out yourself. No time they did not name ("late already", "past midnight"), and never from someone else's guesses about them, a time of a plan or an event, or the hours they happen to write at.
 - looking_for — what the person is looking for in their work or projects: collaborators, a co-founder, testers, a designer, feedback on their app. Only work, projects and skills: never money, a job as a source of income, housing or dating.
 - can_help — what they offer to help others with: code review, setting up a VPN, publishing to the app stores. Only work, projects and skills.
 - tagline — a one-line "who is this" (up to 90 characters, no value judgments, no places), only for members who have no tagline yet and about whom there is now enough information: what they do, make or are into. Never a placeholder that says nothing ("a chat member", "a new member", "quiet so far", "hasn't said much yet") — without real information, leave the member out.
@@ -312,9 +318,32 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
   const users = new Map(data.users.map((user) => [user.id, user]));
   const inBatch = (ids: number[]) => ids.filter((id) => batchById.has(id));
   const validSources = memberSources(batchById);
-  // Where someone lives is kept only when they said it themselves, a new place and a changed one alike.
-  const selfStated = (kind: string, userId: number, sources: number[]) =>
-    kind !== "timezone" || sources.some((id) => batchById.get(id)!.user_id === userId);
+  // Where someone is comes only from their own words: their own messages, never a post they forwarded.
+  const ownSources = (userId: number, sources: number[]) =>
+    sources.filter((id) => batchById.get(id)!.user_id === userId && !batchById.get(id)!.is_forward);
+  const selfStated = (kind: string, userId: number, sources: number[]) => kind !== "timezone" || ownSources(userId, sources).length > 0;
+  /**
+   * A timezone value before it goes on a card: a place goes on as usual; a stated clock («04:00») only tells, in code,
+   * which zone of their place is theirs; anything else that reads as a time, or an offset or a zone name nobody wrote,
+   * is left out.
+   */
+  const placeOrClock = async (tx: Queryable, userId: number, value: string, sources: number[]): Promise<"place" | "narrowed" | "skipped"> => {
+    const own = ownSources(userId, sources);
+    const text = value.trim();
+    if (CLOCK_TIME.test(text)) {
+      // One message of their own, as sent: the clock is timed by it, and an edit made later would time it wrong.
+      if (own.length !== 1) return "skipped";
+      const said = batchById.get(own[0]!)!;
+      const [edit] = await tx<{ edited_at: Date | null }[]>`SELECT edited_at FROM messages WHERE chat_id = ${data.chatId} AND msg_id = ${said.msg_id}`;
+      if (edit?.edited_at && edit.edited_at.getTime() - said.sent_at.getTime() > CLOCK_EDIT_GRACE_MS) return "skipped";
+      const outcome = await noteClock(tx, { chatId: data.chatId, userId, time: text, at: said.sent_at, msgId: said.msg_id });
+      return outcome === "narrowed" ? "narrowed" : "skipped";
+    }
+    if (TIME_LIKE.test(text)) return "skipped";
+    const flat = (words: string) => words.toLowerCase().replace(/[\s−–]/g, (char) => (/\s/.test(char) ? "" : "-"));
+    if (writtenZone(text) && !own.some((id) => flat(batchById.get(id)!.text).includes(flat(text)))) return "skipped";
+    return "place";
+  };
 
   const batchProjects = await applyProjects(sql, data, result, users, validSources, stats);
   await applyRenames(sql, data, result, validSources, batchProjects, stats);
@@ -360,7 +389,16 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
         stats.factsSkipped += 1;
         continue;
       }
-      const outcome = await proposeFact(tx, { chatId: data.chatId, userId, kind: item.kind, value: item.value, confidence: item.confidence, sourceMsgIds: sources, source: "llm" });
+      if (item.kind === "timezone") {
+        const word = await placeOrClock(tx, userId, item.value, sources);
+        if (word !== "place") {
+          stats[word === "narrowed" ? "factsUpdated" : "factsSkipped"] += 1;
+          continue;
+        }
+      }
+      // A place keeps only its person's own messages as sources: when it was said is when they said it.
+      const kept = item.kind === "timezone" ? ownSources(userId, sources) : sources;
+      const outcome = await proposeFact(tx, { chatId: data.chatId, userId, kind: item.kind, value: item.value, confidence: item.confidence, sourceMsgIds: kept, source: "llm" });
       if (outcome === "added") stats.factsAdded += 1;
       else if (outcome === "reinforced") stats.factsReinforced += 1;
       else stats.factsSkipped += 1;
@@ -374,8 +412,16 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
       if (sources.length === 0 && inBatch(item.source_msg_ids).length > 0) continue;
       if (item.value === null) {
         if (await deprecateFact(tx, item.fact_id, sources)) stats.factsOutdated += 1;
-      } else if (!selfStated(fact.kind, fact.user_id, sources)) stats.factsSkipped += 1;
-      else if (await rewriteFact(tx, item.fact_id, item.value, sources, "llm")) stats.factsUpdated += 1;
+        continue;
+      }
+      if (!selfStated(fact.kind, fact.user_id, sources)) {
+        stats.factsSkipped += 1;
+        continue;
+      }
+      // A clock given as a correction of a place is a clock all the same: it never rewords the place.
+      const word = fact.kind === "timezone" ? await placeOrClock(tx, fact.user_id, item.value, sources) : "place";
+      if (word !== "place") stats[word === "narrowed" ? "factsUpdated" : "factsSkipped"] += 1;
+      else if (await rewriteFact(tx, item.fact_id, item.value, fact.kind === "timezone" ? ownSources(fact.user_id, sources) : sources, "llm")) stats.factsUpdated += 1;
     }
 
     stats.signals += await applySignals(tx, data.chatId, runId, result, batchById, users, projectIdOf);

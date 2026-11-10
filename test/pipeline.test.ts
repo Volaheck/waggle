@@ -185,6 +185,8 @@ function fakeAnthropic(answer: (request: { system: string; prompt: string }) => 
 
 /** The line that opens a day among the messages the chronicler is sent (UTC when no time zone is set). */
 const dayLine = (at: Date) => `--- ${at.toLocaleDateString("en-CA", { timeZone: "UTC" })}, ${at.toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" })} ---`;
+/** A chronicler's line with its time left out: «[4 12:30] Bob» → «[4] Bob». */
+const untimed = (line: string) => line.replace(/^\[(\d+) \d{2}:\d{2}\]/, "[$1]");
 
 const EMPTY_EXTRACTION: ExtractionResult = { topics: [], facts_add: [], facts_update: [], projects: [], project_renames: [], project_signals: [] };
 const EMPTY_CLEANUP = JSON.stringify({ fact_merges: [], fact_drops: [], project_merges: [], project_updates: [] });
@@ -389,7 +391,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
 
     const { client, requests } = fakeAnthropic(() => ({ text: JSON.stringify(EMPTY_EXTRACTION) }));
     await runExtractionPass(deps(chat.id, client));
-    const context = /<context>\n([\s\S]*?)\n<\/context>/.exec(requests[0]!.prompt)![1]!.split("\n");
+    const context = /<context>\n([\s\S]*?)\n<\/context>/.exec(requests[0]!.prompt)![1]!.split("\n").map(untimed);
     expect(context).toEqual([dayLine(new Date(Date.now() - 2 * HOUR)), `[1] Anna (u${anna.id}): Anyone up for a board game tonight?`, `[3] Bob (u${bob.id}) ↩1 [sticker]`, `[4] Bob (u${bob.id}) ↩1: Count me in`]);
 
     const catchup = await catchupFor(sql, chat.id, (await getPerson(sql, chat.id, anna.id))!, 24);
@@ -408,7 +410,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
 
     const { client, requests } = fakeAnthropic(() => ({ text: JSON.stringify(EMPTY_EXTRACTION) }));
     await runExtractionPass(deps(chat.id, client));
-    const batch = /<new_messages>\n([\s\S]*?)\n<\/new_messages>/.exec(requests[0]!.prompt)![1]!.split("\n");
+    const batch = /<new_messages>\n([\s\S]*?)\n<\/new_messages>/.exec(requests[0]!.prompt)![1]!.split("\n").map(untimed);
     expect(batch).toEqual([
       dayLine(sentAt),
       `[1] Anna (u${anna.id}): Who wants to try my new app?`,

@@ -2114,8 +2114,9 @@ function TimeZoneSection({ info, onChanged, onToast }: { info: TimeZoneInfo; onC
 
   const place = info.place ? `“${info.place}”` : "";
   const line = info.unclear ? `${place} spans ${info.unclear} time zones — pick yours` : info.from === "card" ? `${CLOCK_FROM.card}: ${place}` : CLOCK_FROM[info.from];
-  // The device's zone is offered until the chosen one keeps its time: a clock that only falls back to it is not set.
-  const deviceOffered = device !== undefined && !(info.chosen && sameClock(device, info.chosen));
+  // The device's zone is offered unless the zone in effect is the chosen one and keeps the device's time: a place
+  // named in the chat since may have taken over from a zone the device gave once.
+  const deviceOffered = device !== undefined && !(info.chosen && info.from === info.source && sameClock(device, info.chosen));
   const offers = [...new Set([...(info.unclear ? info.choices : []), ...(deviceOffered ? [device] : [])])];
   return (
     <Card className="form">
@@ -2167,7 +2168,7 @@ function TimeZoneSection({ info, onChanged, onToast }: { info: TimeZoneInfo; onC
           )}
         </div>
       )}
-      <div className="hint">“Tomorrow” and “tonight” in your messages go by it. You can also ask the bot in the chat: “set my time zone to Toronto”.</div>
+      <div className="hint">“Tomorrow” and “tonight” in your messages go by it. The chronicler picks up where you are from the chat; pick a zone here or tell the bot “set my time zone to Toronto” to correct it.</div>
     </Card>
   );
 }
