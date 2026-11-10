@@ -52,7 +52,8 @@ export type OwnOp =
   | { action: "clear_tagline" }
   | { action: "add_alias"; value: string }
   | { action: "remove_alias"; aliasId: number }
-  | { action: "add_memo"; projectId: number | null; projectName: string | null; text: string }
+  /** `pick`: a note on one of their projects that they did not name; it waits for them to pick which. */
+  | { action: "add_memo"; projectId: number | null; projectName: string | null; text: string; pick?: true }
   | { action: "remove_memo"; memoId: number; projectName: string | null }
   | { action: "set_zone"; zone: string; place: string }
   | { action: "clear_zone" };
@@ -146,9 +147,9 @@ function variants(word: string): string[] {
   return [lower, ...(slang ? [slang] : []), ...back, ...transliterateName(lower).map((form) => form.toLowerCase())];
 }
 
-/** Whether every word of `value` is in the sender's own words, in some spelling or inflection. */
-export function groundedIn(value: string, senderText: string): boolean {
-  const said = wordsOf(foldMixedScript(senderText)).flatMap(variants);
+/** Whether a word is in `text`, in some spelling or inflection. */
+function wordMatcher(text: string): (word: string) => boolean {
+  const said = wordsOf(foldMixedScript(text)).flatMap(variants);
   const forms = new Set(said);
   // An inflected Russian word counts when it differs from the value's word only in its ending: «Варшаве» for «Варшава»,
   // «Берлине» for «Берлин».
@@ -158,7 +159,51 @@ export function groundedIn(value: string, senderText: string): boolean {
         (word.length >= 5 && form.length >= 5 && form.slice(0, -2) === word.slice(0, -2) && Math.abs(form.length - word.length) <= 2) ||
         (word.length >= 3 && form.startsWith(word) && form.length - word.length <= 2),
     );
-  return wordsOf(foldMixedScript(value)).every((word) => variants(word).some((form) => forms.has(form)) || inflected(word));
+  return (word) => variants(word).some((form) => forms.has(form)) || inflected(word);
+}
+
+/** Whether every word of `value` is in the sender's own words, in some spelling or inflection. */
+export function groundedIn(value: string, senderText: string): boolean {
+  return wordsOf(foldMixedScript(value)).every(wordMatcher(senderText));
+}
+
+/** The share of a worded note's own words that must come from what it was worded from. */
+const DRAWN_SHARE = 2 / 3;
+const NEGATIONS = new Set(["не", "ни", "нет", "без", "not", "no", "never", "without", "dont", "don't", "isn't", "won't", "can't"]);
+
+/** The words of a text, each with whether a negation stands right before it («не делаем»). */
+function wordsWithNegation(text: string): { word: string; negated: boolean }[] {
+  const words = text.normalize("NFKC").toLowerCase().replace(/ё/g, "е").match(/[\p{L}\p{N}']+/gu) ?? [];
+  return words.map((word, index) => ({ word: word.replace(/'/g, ""), negated: index > 0 && NEGATIONS.has(words[index - 1]!) }));
+}
+
+/**
+ * Whether a text the bot worded is drawn from `source`: two thirds of its words (short Cyrillic ones aside) are there,
+ * in some spelling or form («темы» for «тем»), every number in it is there as it is, and no word is negated in one and not in the
+ * other («релиз не раньше марта» never becomes «релиз раньше марта»). A text with nothing of the source in it is made up.
+ */
+export function drawnFrom(value: string, source: string): boolean {
+  const folded = foldMixedScript(value);
+  const words = wordsOf(folded).filter((word) => word.length >= 4 || /[a-z0-9]/.test(word));
+  if (words.length === 0) return false;
+  const inSource = wordMatcher(source);
+  const said = wordsWithNegation(foldMixedScript(source));
+  if (words.filter((word) => inSource(word) || said.some((use) => sameStem(word, use.word))).length / words.length < DRAWN_SHARE) return false;
+  const sourceNumbers = new Set(source.match(/\d+(?:[.,]\d+)?/g) ?? []);
+  if ((folded.match(/\d+(?:[.,]\d+)?/g) ?? []).some((number) => !sourceNumbers.has(number))) return false;
+  return wordsWithNegation(folded).every(({ word, negated }) => {
+    if (NEGATIONS.has(word) || word.length < 3) return true;
+    const uses = said.filter((use) => sameStem(word, use.word));
+    return uses.length === 0 || uses.some((use) => use.negated === negated);
+  });
+}
+
+/** Two forms of one word: the same, or differing only in a short ending («делаем», «делаете»). */
+function sameStem(one: string, other: string): boolean {
+  if (one === other) return true;
+  if (one.length >= 5 && other.length >= 5 && one.slice(0, -2) === other.slice(0, -2)) return true;
+  const [short, long] = one.length <= other.length ? [one, other] : [other, one];
+  return short.length >= 3 && long.startsWith(short) && long.length - short.length <= 2;
 }
 
 /** Other members as names a value must not hold: their names, aliases and @usernames. */
@@ -218,16 +263,18 @@ export type MemoProblem = "too_long" | "personal_data" | "forbidden" | "names_so
 
 /**
  * What is wrong with a note, if anything: the limits of a card, and no other member in it, so nobody writes about
- * someone else in a note of their own. From the chat, the note must be in the sender's newest message as it is.
+ * someone else in a note of their own. From the chat, the note is the sender's newest message as it is, or the bot's
+ * wording of their words or of the message they point at, drawn from it.
  */
-export function memoProblem(text: string, others: Named[], senderText?: string): MemoProblem | null {
+export function memoProblem(text: string, others: Named[], from?: { said: string; sources: (string | undefined)[] }): MemoProblem | null {
   const clean = cleanText(text);
   if (!clean || clean.length > MAX_MEMO_CHARS) return "too_long";
   if (maskPersonalData(clean) !== clean) return "personal_data";
   if (hasForbiddenTopic(clean)) return "forbidden";
   if (namesSomeoneElse(clean, others)) return "names_someone";
+  if (!from) return null;
   const flat = (value: string) => cleanText(value).toLowerCase();
-  if (senderText !== undefined && !flat(senderText).includes(flat(clean))) return "not_their_words";
+  if (!flat(from.said).includes(flat(clean)) && !from.sources.some((source) => source && drawnFrom(clean, source))) return "not_their_words";
   return null;
 }
 
@@ -404,9 +451,10 @@ async function removeOwnMemo(tx: Queryable, subject: Subject, op: Extract<OwnOp,
 /**
  * Applies the operations to the subject's own card, all or nothing, and records them on the request in the same
  * transaction, so a receipt that fails to go out never leaves a change nobody can undo. Someone who opted out gets
- * nothing added. `fromStatus` is what the request must still be (a tap on an old preview finds it changed).
+ * nothing added. `fromStatus` is what the request must still be (a tap on an old preview finds it changed). `asPlan`
+ * makes these operations the request's plan in the same transaction, for a plan a tap completed (a project picked).
  */
-export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgId: number, requestId: number, fromStatus: string): Promise<Applied[] | null> {
+export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgId: number, requestId: number, fromStatus: string, asPlan = false): Promise<Applied[] | null> {
   return asSubject(sql, subject, async (tx) => {
     const [request] = await tx`SELECT 1 FROM self_edits WHERE id = ${requestId} AND status = ${fromStatus} FOR UPDATE`;
     if (!request) return null;
@@ -433,7 +481,9 @@ export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgI
       else applied.push(...(await removeOwnMemo(tx, subject, op, msgId)));
     }
     if (applied.length === 0) return applied;
-    await tx`UPDATE self_edits SET status = 'applied', applied = ${tx.json(applied as never)}, decided_at = now() WHERE id = ${requestId}`;
+    await tx`
+      UPDATE self_edits SET status = 'applied', applied = ${tx.json(applied as never)}, decided_at = now()${asPlan ? tx`, plan = ${tx.json(ops as never)}` : tx``}
+      WHERE id = ${requestId}`;
     return applied;
   });
 }

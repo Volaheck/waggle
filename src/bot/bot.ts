@@ -193,7 +193,7 @@ export function createBot(deps: BotDeps): {
           sql,
           anthropic: deps.anthropic,
           config,
-          answer: (api, question, cardChange) => answers.answer(api, question, cardChange),
+          answer: (api, question, cardChange, onAnswered) => answers.answer(api, question, cardChange, onAnswered),
           zonesOf: (places, chatId) =>
             placeZones(places, {
               anthropic: deps.anthropic!,

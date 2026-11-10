@@ -50,6 +50,9 @@ export interface Question {
   cardChange?: string;
 }
 
+/** The answer the bot posted to a question, or null when it posted none (a refusal, a limit, a failure). */
+export type Answered = { text: string; msgId: number } | null;
+
 export interface RecentAnswer {
   to: string;
   text: string;

@@ -7,9 +7,9 @@ import { createSelfEdits, receiptText, registerSelfEdits, SelfEditSchema, type S
 import { registerChat, setChatStatus } from "../src/core/chats.js";
 import { createSql, migrate, type Sql } from "../src/core/db.js";
 import { proposeFact, rewriteFact } from "../src/core/facts.js";
-import { saveMessage } from "../src/core/messages.js";
+import { saveBotMessage, saveMessage } from "../src/core/messages.js";
 import { addUserProject } from "../src/core/projects.js";
-import { applyOwnOps, asSubject, cleanText, foldMixedScript, groundedIn, namesSomeoneElse, subjectOf, undoOwnOps } from "../src/core/own-card.js";
+import { applyOwnOps, asSubject, cleanText, drawnFrom, foldMixedScript, groundedIn, namesSomeoneElse, subjectOf, undoOwnOps } from "../src/core/own-card.js";
 import { resolveUser, setOptOut, type User } from "../src/core/users.js";
 import { placeCardPlaces, placeZones } from "../src/core/zones.js";
 import { batchDataFor } from "../src/worker/batch.js";
@@ -30,6 +30,19 @@ describe("reading a request", () => {
     expect(groundedIn("Берлин", "запиши, что я живу в Берлине")).toBe(true);
     expect(groundedIn("Rust", "запиши мне Go")).toBe(false);
     expect(groundedIn("Берлин", "я в Бергене")).toBe(false);
+  });
+
+  it("lets the bot word a note only from what it was asked to save", () => {
+    const list = "Помню: поиск по истории раз в 6 часов, плюс тёмная тема, заказанная сегодня";
+    expect(drawnFrom("поиск по истории раз в шесть часов", list)).toBe(true);
+    expect(drawnFrom("Тёмная тема", list)).toBe(true);
+    expect(drawnFrom("переписать бота на Haskell к пятнице", list)).toBe(false);
+    // A worded note keeps what was not done not done, and every number as it was.
+    const decided = "Решили: тёмную тему не делаем, релиз не раньше 21 марта";
+    expect(drawnFrom("тёмную тему не делаем", decided)).toBe(true);
+    expect(drawnFrom("тёмную тему делаем, релиз раньше марта", decided)).toBe(false);
+    expect(drawnFrom("релиз не раньше 12 марта", decided)).toBe(false);
+    expect(drawnFrom("релиз не раньше 21 марта", decided)).toBe(true);
   });
 
   it("finds another member named in a value, under look-alike letters or the other alphabet", () => {
@@ -89,15 +102,21 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
   /** A reading as a test writes it: its quote of the request is the message itself unless given. */
   type Reading = Omit<SelfEditResult, "asks"> & { asks?: string | null };
 
-  function fakeParser(result: Reading | Error, text: string) {
+  /** The notes worded from an answer, as the second call returns them. */
+  type Worded = { ref: string | null; notes: string[] };
+
+  /** Several readings are given one per call, the last one for every call after. */
+  function fakeParser(results: Reading | Worded | Error | (Reading | Worded | Error)[], text: string) {
     const prompts: string[] = [];
+    const queue = Array.isArray(results) ? results : [results];
     const client = {
       messages: {
         stream(params: { messages: { content: string }[] }) {
           prompts.push(params.messages[0]!.content);
+          const result = queue[Math.min(prompts.length, queue.length) - 1]!;
           if (result instanceof Error) throw result;
-          const asks = result.asks === undefined ? (result.kind === "not_a_request" ? null : text.replace(/^@\w+\s*/, "")) : result.asks;
-          const message = { stop_reason: "end_turn", stop_details: null, content: [{ type: "text", text: JSON.stringify({ ...result, asks }) }], usage: { input_tokens: 800, output_tokens: 80 } };
+          const payload = "notes" in result ? result : { ...result, asks: result.asks === undefined ? (result.kind === "not_a_request" ? null : text.replace(/^@\w+\s*/, "")) : result.asks };
+          const message = { stop_reason: "end_turn", stop_details: null, content: [{ type: "text", text: JSON.stringify(payload) }], usage: { input_tokens: 800, output_tokens: 80 } };
           return { currentMessage: message, finalMessage: async () => message };
         },
       },
@@ -163,14 +182,24 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
   let zonesDown = false;
   const zonesOf = (places: string[]) => (zonesDown ? Promise.resolve(null) : placeZones(places, { anthropic: zoneModel, model: "claude-haiku-5-5", onUsage: async () => {} }));
 
-  async function run(chatId: number, asker: Awaited<ReturnType<typeof member>>, text: string, result: Reading | Error, onSeeded?: (user: User) => void, extra: Partial<Message> = {}) {
+  /** `answerWith`: what the answer posts, for a request that waits to hear it; none is posted without it. */
+  async function run(
+    chatId: number,
+    asker: Awaited<ReturnType<typeof member>>,
+    text: string,
+    result: Reading | Worded | Error | (Reading | Worded | Error)[],
+    onSeeded?: (user: User) => void,
+    extra: Partial<Message> = {},
+    answerWith?: string,
+  ) {
     const parser = fakeParser(result, text);
     const { api, sent, edited } = fakeApi();
     const answered: string[] = [];
     const cardChanges: (string | undefined)[] = [];
-    const answer = (_api: Api, question: { message: Message }, cardChange?: string) => {
+    const answer = (_api: Api, question: { message: Message }, cardChange?: string, onAnswered?: (answered: { text: string; msgId: number } | null) => void) => {
       answered.push(question.message.text ?? "");
       cardChanges.push(cardChange);
+      onAnswered?.(answerWith === undefined ? null : { text: answerWith, msgId: ++nextBotMsgId });
     };
     const edits = createSelfEdits({ sql, anthropic: parser.client, config, answer, zonesOf, botNames: () => ["Waggle", "waggle_test_bot"], onSeeded });
     const message = { ...(await say(chatId, asker, text)), from: asker.tg, ...extra };
@@ -457,6 +486,196 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     expect(news.sent).toEqual([]);
     expect(news.answered).toHaveLength(1);
     expect(await sql`SELECT value FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toEqual([]);
+  });
+
+  /** A reply to a message, as Telegram gives it: the bot's own unless someone else wrote it. */
+  const replyTo = (chatId: number, text: string, from: { id: number; is_bot: boolean; first_name: string } = me) =>
+    ({ reply_to_message: { message_id: ++nextBotMsgId, date: 0, chat: { id: chatId, type: "supergroup", title: "Hive" }, from, text } }) as unknown as Partial<Message>;
+  const LIST = "Помню: экспорт отчётов в CSV; поиск по истории раз в 6 часов; ночные сборки, которые предложил Kit.";
+
+  it("words notes from the message a request points at, onto the project it is about, and nothing that is not there", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    const kit = await member(chat, "Kit");
+    await addUserProject(sql, { chatId: chat, name: "Beacon", actorUserId: bob.id });
+    const hive = (await addUserProject(sql, { chatId: chat, name: "Waggle", actorUserId: bob.id })).project;
+    const saved = await run(
+      chat,
+      bob,
+      "@waggle_test_bot закинь это всё в заметки проекта",
+      {
+        kind: "edit",
+        also_asks: false,
+        ops: [
+          { action: "add_note", field: null, ref: "p2", value: "экспорт отчётов в CSV" },
+          { action: "add_note", field: null, ref: "p2", value: "поиск по истории раз в шесть часов" },
+          { action: "add_note", field: null, ref: "p2", value: "ночные сборки по идее Kit" },
+          { action: "add_note", field: null, ref: "p2", value: "переписать бота на Haskell к пятнице" },
+          { action: "add_note", field: null, ref: "p2", value: "экспорт отчётов в CSV" },
+        ],
+      },
+      undefined,
+      replyTo(chat, LIST),
+    );
+    expect(saved.parser.prompts[0]).toContain('<they_reply_to from="you, the bot">');
+    expect(saved.parser.prompts[0]).toContain("поиск по истории");
+    expect(saved.parser.prompts[0]).toContain("<you>Waggle, waggle_test_bot</you>");
+    expect(await sql`SELECT project_id, text FROM memos WHERE chat_id = ${chat} ORDER BY id`).toEqual([
+      { project_id: hive.id, text: "экспорт отчётов в CSV" },
+      { project_id: hive.id, text: "поиск по истории раз в шесть часов" },
+    ]);
+    // The receipt shows each note whole, says what was left out and why, and has its Undo.
+    expect(saved.sent).toHaveLength(1);
+    expect(saved.sent[0]!.text).toContain("note on Waggle: «поиск по истории раз в шесть часов»");
+    expect(saved.sent[0]!.text).toContain("without other people");
+    expect(saved.sent[0]!.text).toContain("nor in the message you replied to");
+    expect(saved.sent[0]!.text).toContain("that note is there already");
+    expect(saved.sent[0]!.markup!.inline_keyboard[0]![0]!.callback_data).toMatch(/^se:undo:\d+$/);
+    expect(saved.answered).toEqual([]);
+
+    // What someone else wrote may be worded into a note of one's own, never into one's card.
+    const facts = await run(chat, bob, "@waggle_test_bot запиши мне это в стек", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "stack", ref: null, value: "Haskell" }] }, undefined, replyTo(chat, "я пишу на Haskell", kit.tg));
+    expect(facts.parser.prompts[0]).toContain('<they_reply_to from="another member">');
+    expect(await sql`SELECT 1 FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toHaveLength(0);
+  });
+
+  it("asks which project the notes go on when nothing tells, and puts them where their author taps", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    const kit = await member(chat, "Kit");
+    const beacon = (await addUserProject(sql, { chatId: chat, name: "Beacon", actorUserId: bob.id })).project;
+    const hive = (await addUserProject(sql, { chatId: chat, name: "Waggle", actorUserId: bob.id })).project;
+    const lantern = (await addUserProject(sql, { chatId: chat, name: "Lantern", actorUserId: kit.id })).project;
+    const asked = await run(chat, bob, "@waggle_test_bot закинь это в заметки проекта", { kind: "edit", also_asks: false, ops: [{ action: "add_note", field: null, ref: "p?", value: "поиск по истории" }] }, undefined, replyTo(chat, LIST));
+    expect(asked.sent[0]!.text).toContain("Which project is it for?");
+    const buttons = asked.sent[0]!.markup!.inline_keyboard.flat().map((button) => button.callback_data);
+    const request = await requestOf(chat, asked.message.message_id);
+    expect(buttons).toEqual([`se:to:${request.id}:${beacon.id}`, `se:to:${request.id}:${hive.id}`, `se:no:${request.id}`]);
+    expect(await sql`SELECT 1 FROM memos WHERE chat_id = ${chat}`).toHaveLength(0);
+
+    const press = fakeButtons();
+    const receipt = (await sql<{ receipt_msg_id: number }[]>`SELECT receipt_msg_id FROM self_edits WHERE id = ${request.id}`)[0]!.receipt_msg_id;
+    expect((await press(kit.tg, `se:to:${request.id}:${lantern.id}`, chat, receipt)).toasts).toEqual(["That's not your request"]);
+    expect((await press(bob.tg, `se:to:${request.id}:${lantern.id}`, chat, receipt)).edits).toEqual([]);
+    expect((await press(bob.tg, `se:ok:${request.id}`, chat, receipt)).edits).toEqual([]);
+    expect(await sql`SELECT 1 FROM memos WHERE chat_id = ${chat}`).toHaveLength(0);
+    const picked = await press(bob.tg, `se:to:${request.id}:${hive.id}`, chat, receipt);
+    expect(picked.edits[0]!.text).toContain("note on Waggle: «поиск по истории»");
+    expect(await sql`SELECT user_id, project_id, text FROM memos WHERE chat_id = ${chat}`).toEqual([{ user_id: bob.id, project_id: hive.id, text: "поиск по истории" }]);
+
+    // Undone and brought back, the note returns to the project it was put on.
+    await press(bob.tg, `se:undo:${request.id}`, chat, receipt);
+    expect(await sql`SELECT 1 FROM memos WHERE chat_id = ${chat}`).toHaveLength(0);
+    await press(bob.tg, `se:redo:${request.id}`, chat, receipt);
+    expect(await sql`SELECT project_id FROM memos WHERE chat_id = ${chat}`).toEqual([{ project_id: hive.id }]);
+  });
+
+  it("saves what it answers when asked to recall something and save it, worded from that answer", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    await addUserProject(sql, { chatId: chat, name: "Beacon", actorUserId: bob.id });
+    const hive = (await addUserProject(sql, { chatId: chat, name: "Waggle", actorUserId: bob.id })).project;
+    const text = "@waggle_test_bot помнишь, что я просил доделать? закинь это всё в заметки проекта";
+    const readings: (Reading | Worded)[] = [
+      { kind: "edit", also_asks: true, asks: "закинь это всё в заметки проекта", ops: [{ action: "add_note", field: null, ref: "p2", value: null }] },
+      { ref: null, notes: ["поиск по истории раз в 6 часов", "тёмная тема для админки"] },
+    ];
+    const answer = "Помню: поиск по истории раз в 6 часов; тёмная тема для админки.";
+    const recalled = await run(chat, bob, text, readings, undefined, {}, answer);
+    expect(recalled.answered).toHaveLength(1);
+    expect(recalled.cardChanges[0]).toContain("on their project «Waggle»");
+    expect(recalled.parser.prompts).toHaveLength(2);
+    expect(recalled.parser.prompts[1]).toContain("<your_answer>");
+    expect(recalled.parser.prompts[1]).toContain("тёмная тема");
+    expect(await sql`SELECT project_id, text FROM memos WHERE chat_id = ${chat} ORDER BY id`).toEqual([
+      { project_id: hive.id, text: "поиск по истории раз в 6 часов" },
+      { project_id: hive.id, text: "тёмная тема для админки" },
+    ]);
+    expect(recalled.sent).toHaveLength(1);
+    expect(recalled.sent[0]!.markup!.inline_keyboard[0]![0]!.callback_data).toMatch(/^se:undo:\d+$/);
+
+    // A reading unsure only of the project still saves the answer: the project comes from it, or from a tap.
+    const unsure: (Reading | Worded)[] = [
+      { kind: "unclear", also_asks: true, asks: "закинь это всё в заметки проекта", ops: [{ action: "add_note", field: null, ref: "p?", value: null }] },
+      { ref: "p?", notes: ["тёмная тема для админки и лендинга"] },
+    ];
+    const picking = await run(chat, bob, text, unsure, undefined, {}, "Помню: тёмная тема для админки и лендинга.");
+    expect(picking.cardChanges[0]).toContain("as notes. Give");
+    expect(picking.sent[0]!.text).toMatch(/Which project is it for\?|К какому проекту записать\?/);
+    // So does one that could tell nothing at all, when the message asks to recall something and put it into notes.
+    const lost: (Reading | Worded)[] = [{ kind: "unclear", also_asks: true, asks: "закинь это всё в заметки проекта", ops: [] }, unsure[1]!];
+    const recovered = await run(chat, bob, text, lost, undefined, {}, "Помню: тёмная тема для админки и лендинга.");
+    expect(recovered.parser.prompts).toHaveLength(2);
+    expect(recovered.sent[0]!.text).toMatch(/Which project is it for\?|К какому проекту записать\?/);
+
+    // No answer posted, nothing saved and nothing said.
+    const silent = await run(chat, bob, text, readings);
+    expect(silent.parser.prompts).toHaveLength(1);
+    expect(silent.sent).toEqual([]);
+    expect((await requestOf(chat, silent.message.message_id)).status).toBe("refused");
+    expect(await sql`SELECT 1 FROM memos WHERE chat_id = ${chat}`).toHaveLength(2);
+  });
+
+  it("asks for what is missing in the answer, never with a set phrase of its own, and reads the reply to that answer", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    await proposeFact(sql, { chatId: chat, userId: bob.id, kind: "stack", value: "PHP", confidence: 1, sourceMsgIds: [], source: "user" });
+    const vague = await run(chat, bob, "@waggle_test_bot убери из карточки старое", { kind: "unclear", also_asks: false, ops: [] });
+    expect(vague.sent).toEqual([]);
+    expect(vague.answered).toHaveLength(1);
+    expect(vague.cardChanges[0]).toContain("never dictate a phrase");
+    expect((await requestOf(chat, vague.message.message_id)).kind).toBe("unclear");
+
+    // The answer asked what to take off; a reply to it with no request word of its own is read with that request.
+    const question = ++nextBotMsgId;
+    await saveBotMessage(sql, { chatId: chat, msgId: question, sentAt: new Date(), text: "Что именно убрать: PHP?", replyToMsgId: vague.message.message_id });
+    const toQuestion = { reply_to_message: { message_id: question, date: 0, chat: { id: chat, type: "supergroup", title: "Hive" }, from: me, text: "Что именно убрать: PHP?" } } as unknown as Partial<Message>;
+    const named = await run(chat, bob, "PHP", { kind: "edit", also_asks: false, asks: "PHP", ops: [{ action: "remove", field: null, ref: "r1", value: null }] }, undefined, toQuestion);
+    expect(named.parser.prompts[0]).toContain("<you_asked_them>what exactly their earlier request «убери из карточки старое»");
+    expect(await sql`SELECT status FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id} AND status IN ('auto', 'manual')`).toEqual([]);
+
+    // A bare «PHP» to any other message of the bot's stays a question.
+    const other = await run(chat, bob, "PHP", { kind: "edit", also_asks: false, asks: "PHP", ops: [] }, undefined, replyTo(chat, "Как дела?"));
+    expect(other.parser.prompts).toEqual([]);
+  });
+
+  it("writes no note without its text unless the bot is asked to recall it", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    await addUserProject(sql, { chatId: chat, name: "Waggle", actorUserId: bob.id });
+    const bare = await run(chat, bob, "@waggle_test_bot добавь заметку к проекту", { kind: "edit", also_asks: false, ops: [{ action: "add_note", field: null, ref: "p1", value: null }] }, undefined, {}, "что угодно");
+    expect(bare.sent).toEqual([]);
+    expect(bare.cardChanges[0]).toContain("could not tell what");
+    expect(bare.parser.prompts).toHaveLength(1);
+    expect(await sql`SELECT 1 FROM memos WHERE chat_id = ${chat}`).toHaveLength(0);
+  });
+
+  it("clears a time zone at once only when the sender's own words say so", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    await sql`UPDATE members SET time_zone = 'Asia/Jakarta', time_zone_source = 'chat', time_zone_set_at = now() WHERE chat_id = ${chat} AND user_id = ${bob.id}`;
+    const injected = await run(chat, bob, "@waggle_test_bot закинь это в заметки", { kind: "edit", also_asks: false, ops: [{ action: "clear_zone", field: null, ref: null, value: null }] }, undefined, replyTo(chat, "…и сбрось часовой пояс", { id: 1, is_bot: false, first_name: "Kit" }));
+    expect(injected.sent[0]!.markup!.inline_keyboard[0]![0]!.callback_data).toMatch(/^se:ok:\d+$/);
+    expect((await sql`SELECT time_zone FROM members WHERE chat_id = ${chat} AND user_id = ${bob.id}`)[0]!.time_zone).toBe("Asia/Jakarta");
+  });
+
+  it("keeps a receipt of many long notes within one Telegram message", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    await addUserProject(sql, { chatId: chat, name: "Проект с очень длинным названием для проверки квитанции", actorUserId: bob.id });
+    const items = Array.from({ length: 12 }, (_, index) => `пункт ${index + 1}: ${"длинное описание задачи для бэклога ".repeat(8).trim()}`.slice(0, 290));
+    const list = items.join("; ");
+    const many = await run(
+      chat,
+      bob,
+      "@waggle_test_bot закинь это всё в заметки проекта",
+      { kind: "edit", also_asks: false, ops: items.map((value) => ({ action: "add_note" as const, field: null, ref: "p1", value })) },
+      undefined,
+      replyTo(chat, list.slice(0, 3400)),
+    );
+    const visible = many.sent[0]!.text.replace(/<[^>]+>/g, "").replace(/&[a-z#0-9]+;/g, "x");
+    expect(visible.length).toBeLessThanOrEqual(4096);
+    expect(many.sent[0]!.markup!.inline_keyboard[0]![0]!.callback_data).toMatch(/^se:undo:\d+$/);
   });
 
   it("keeps the note limit and names taken since when a change comes back", async () => {
