@@ -294,14 +294,14 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       expect((await visibleFacts(sql, A, ids.anna!)).map((item) => item.value)).toContain("Bouldering");
     });
 
-    it("links a seeded card by name only when that is unambiguous and harmless", async () => {
+    it("links a seeded card by its @username by itself, never by a name anyone can copy", async () => {
       const seed = async (name: string, chats: number[], username: string | null = null) => {
         const [row] = await sql<{ id: number }[]>`INSERT INTO users (username, display_name) VALUES (${username}, ${name}) RETURNING id`;
         for (const chatId of chats) await sql`INSERT INTO members (chat_id, user_id) VALUES (${chatId}, ${row!.id})`;
         return row!.id;
       };
       const kate = await seed("Kate", [A]);
-      expect((await resolveUser(sql, { id: 9301, first_name: "Kate" }, [], A)).id).toBe(kate);
+      expect((await resolveUser(sql, { id: 9301, first_name: "Kate" }, [], A)).id).not.toBe(kate);
 
       const lena = await seed("Lena", [A], "lena_art");
       expect((await resolveUser(sql, { id: 9302, first_name: "Lena" }, [], A)).id).not.toBe(lena);
@@ -1067,11 +1067,12 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       await bot.handleUpdate(inGroup(A, maestro, "hello") as never);
       await bot.handleUpdate(leaves(A, maestro) as never);
       await bot.handleUpdate(joins(A, maestro) as never);
-      // Taking over a harmless card by its exact name is no question either.
+      // A card that matches by its exact name only is not taken over by itself: the owners are asked about it too.
       await card("Quill");
       await bot.handleUpdate(joins(A, { id: 9873, is_bot: false, first_name: "Quill" }) as never);
       await offersSent.get(bot)!();
-      expect(questions()).toHaveLength(1);
+      expect(questions()).toHaveLength(2);
+      expect(String(questions()[1]!.payload.text)).toContain("Quill");
 
       await bot.handleUpdate(tap(alice, link) as never);
       expect(answers().at(-1)).toBe("That's up to the bot owner");

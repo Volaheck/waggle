@@ -43,6 +43,8 @@ export function fullName(identity: TelegramIdentity): string {
   return [identity.first_name, identity.last_name].filter(Boolean).join(" ").trim();
 }
 
+const CLAIM_BY_NAME = false;
+
 const PERSON_COLUMNS = `u.id, u.tg_id, u.username, u.display_name, u.is_admin, u.dm_started, u.current_chat_id,
   m.chat_id, m.user_id, m.tagline, m.tagline_manual, m.opted_out, m.first_seen_at, m.last_message_at, m.left_at`;
 
@@ -58,7 +60,8 @@ async function claimableSeed(sql: Sql, username: string | null, name: string, ch
       SELECT * FROM users WHERE tg_id IS NULL AND username IS NOT NULL AND lower(username) = lower(${username})`;
     if (byUsername) return { seed: byUsername, by: "username" };
   }
-  if (chatId === undefined) return undefined;
+  // A display name proves nothing (anyone can copy one): a card that matches only by name waits for an owner's /link.
+  if (chatId === undefined || !CLAIM_BY_NAME) return undefined;
   const byName = await sql<(User & { claimable: boolean })[]>`
     SELECT u.*,
            (u.username IS NULL
@@ -207,7 +210,17 @@ async function applyOptOut(tx: Queryable, userId: number, optedOut: boolean, sco
 
 /** Opting out removes the person's card in one chat — or, without a chat id, in every chat. */
 export async function setOptOut(sql: Sql, userId: number, optedOut: boolean, chatId?: number): Promise<void> {
-  await sql.begin((tx) => applyOptOut(tx, userId, optedOut, chatId ?? null));
+  await sql.begin(async (tx) => {
+    await applyOptOut(tx, userId, optedOut, chatId ?? null);
+    if (optedOut) await dropCardRequests(tx, userId, chatId ?? null);
+  });
+}
+
+/** Opting out leaves nothing to confirm or undo, and no card values in the requests' records. */
+async function dropCardRequests(tx: Queryable, userId: number, chatId: number | null): Promise<void> {
+  await tx`
+    UPDATE self_edits SET status = CASE WHEN status IN ('proposed', 'applied') THEN 'refused' ELSE status END, plan = NULL, applied = NULL
+    WHERE user_id = ${userId} AND (${chatId}::bigint IS NULL OR chat_id = ${chatId}::bigint)`;
 }
 
 /**
@@ -219,6 +232,7 @@ export async function forgetUser(sql: Sql, userId: number, options: { chatId?: n
   const scope = options.chatId ?? null;
   await sql.begin(async (tx) => {
     await applyOptOut(tx, userId, true, scope);
+    await dropCardRequests(tx, userId, scope);
     if (!options.messages) return;
     await tx`
       UPDATE interjections said SET text = NULL

@@ -821,7 +821,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     threadLines.length ? `<thread note="the messages the question replies to, root first">\n${threadLines.join("\n")}\n</thread>` : "",
     // A message of the bot's from before it kept its own messages: Telegram's copy stands in.
     repliedToBot && unstoredParent ? `<your_message_they_reply_to>\n${line(unstoredParent, 1500)}\n</your_message_they_reply_to>` : "",
-    question.cardChange ? `<card_change note="already done by the bot's receipt; don't repeat or confirm it">${line(question.cardChange, 600)}</card_change>` : "",
+    question.cardChange ? `<card_change note="what the bot did about this message's request to change the sender's card; its reply already said it">${line(question.cardChange, 600)}</card_change>` : "",
     `<if_insulted motif="${options.insultMotif}" />`,
     // Right before the question, where a smaller model still has it in mind: the tone of the answer follows this message.
     `<answer_in_kind>kindness, thanks or a gift: warmth and real thanks, no jab; banter: banter; an insult: the menacing chronicler</answer_in_kind>`,

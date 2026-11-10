@@ -120,11 +120,11 @@ function variants(word: string): string[] {
 
 /** Whether every word of `value` is in the sender's own words, in some spelling or inflection. */
 export function groundedIn(value: string, senderText: string): boolean {
-  const said = new Set(wordsOf(foldMixedScript(senderText)).flatMap(variants));
-  const stems = [...said].filter((word) => word.length >= 4).map((word) => word.slice(0, -1));
-  return wordsOf(foldMixedScript(value)).every(
-    (word) => variants(word).some((form) => said.has(form)) || (word.length >= 4 && stems.some((stem) => word.startsWith(stem))),
-  );
+  const said = wordsOf(foldMixedScript(senderText)).flatMap(variants);
+  const forms = new Set(said);
+  // An inflected Russian word counts when it differs from the value's word only in its ending («Варшаве» for «Варшава»).
+  const inflected = (word: string) => word.length >= 5 && said.some((form) => form.length >= 5 && form.slice(0, -2) === word.slice(0, -2) && Math.abs(form.length - word.length) <= 2);
+  return wordsOf(foldMixedScript(value)).every((word) => variants(word).some((form) => forms.has(form)) || inflected(word));
 }
 
 /** Other members as names a value must not hold: their names, aliases and @usernames. */
@@ -160,8 +160,12 @@ export function valueProblem(value: string, senderText: string, others: Named[],
   if (!clean || clean.length > limit || wordsOf(clean).length > MAX_VALUE_WORDS) return "too_long";
   if (maskPersonalData(clean) !== clean) return "personal_data";
   if (hasForbiddenTopic(clean)) return "forbidden";
-  if (field === "link") return safeHttpUrl(clean.startsWith("http") ? clean : `https://${clean}`) ? null : "bad_link";
-  if (namesSomeoneElse(clean, others)) return "names_someone";
+  if (namesSomeoneElse(clean.replace(/^https?:\/\/[^/]+\//i, ""), others)) return "names_someone";
+  if (field === "link") {
+    const url = safeHttpUrl(clean.startsWith("http") ? clean : `https://${clean}`);
+    const bare = (text: string) => text.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/+$/, "");
+    return !url ? "bad_link" : bare(senderText).includes(bare(clean)) ? null : "not_their_words";
+  }
   if (!groundedIn(clean, senderText)) return "not_their_words";
   return null;
 }
@@ -284,11 +288,20 @@ async function removeOwnAlias(tx: Queryable, subject: Subject, aliasId: number, 
   return [{ kind: "alias_removed", row }];
 }
 
-/** Applies the operations to the subject's own card, all or nothing, and returns what was done. */
-export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgId: number): Promise<Applied[]> {
+/**
+ * Applies the operations to the subject's own card, all or nothing, and records them on the request in the same
+ * transaction, so a receipt that fails to go out never leaves a change nobody can undo. Someone who opted out gets
+ * nothing added. `fromStatus` is what the request must still be (a tap on an old preview finds it changed).
+ */
+export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgId: number, requestId: number, fromStatus: string): Promise<Applied[] | null> {
   return asSubject(sql, subject, async (tx) => {
+    const [request] = await tx`SELECT 1 FROM self_edits WHERE id = ${requestId} AND status = ${fromStatus} FOR UPDATE`;
+    if (!request) return null;
+    const [member] = await tx<{ opted_out: boolean }[]>`SELECT opted_out FROM members WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} FOR UPDATE`;
+    const adds = new Set(["add", "replace", "set_tagline", "add_alias"]);
     const applied: Applied[] = [];
     for (const op of ops) {
+      if (member?.opted_out !== false && adds.has(op.action)) continue;
       if (op.action === "add") applied.push(...(await addFact(tx, subject, op.field, op.value, msgId)));
       else if (op.action === "remove") applied.push(...(await removeFact(tx, subject, op.factId, msgId)));
       else if (op.action === "replace") {
@@ -299,14 +312,25 @@ export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgI
       else if (op.action === "add_alias") applied.push(...(await addOwnAlias(tx, subject, op.value, msgId)));
       else applied.push(...(await removeOwnAlias(tx, subject, op.aliasId, msgId)));
     }
+    await tx`UPDATE self_edits SET status = 'applied', applied = ${tx.json(applied as never)}, decided_at = now() WHERE id = ${requestId}`;
     return applied;
   });
 }
 
-/** Undoes what applyOwnOps did, newest first, on the subject's own card only. */
-export async function undoOwnOps(sql: Sql, subject: Subject, applied: Applied[], msgId: number): Promise<void> {
-  await asSubject(sql, subject, async (tx) => {
+/** Undoes what applyOwnOps recorded on the request, newest first, on the subject's own card only; null when there is nothing to undo. */
+export async function undoOwnOps(sql: Sql, subject: Subject, requestId: number, msgId: number): Promise<Applied[] | null> {
+  return asSubject(sql, subject, async (tx) => {
+    const [request] = await tx<{ applied: Applied[] | null }[]>`
+      UPDATE self_edits SET status = 'undone', decided_at = now()
+      WHERE id = ${requestId} AND status = 'applied' AND applied IS NOT NULL AND created_at > now() - interval '24 hours'
+      RETURNING applied`;
+    if (!request?.applied) return null;
+    const [member] = await tx<{ opted_out: boolean }[]>`SELECT opted_out FROM members WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId}`;
+    // Nothing comes back onto the card of someone who has opted out since.
+    const restores = new Set(["fact_removed", "alias_removed", "tagline"]);
+    const applied = request.applied;
     for (const change of [...applied].reverse()) {
+      if (member?.opted_out !== false && restores.has(change.kind)) continue;
       if (change.kind === "fact_added") {
         if (change.before) {
           await tx`
@@ -348,6 +372,7 @@ export async function undoOwnOps(sql: Sql, subject: Subject, applied: Applied[],
       }
     }
     await log(tx, subject, "self_edit", msgId, "undo", null, null, msgId);
+    return applied;
   });
 }
 

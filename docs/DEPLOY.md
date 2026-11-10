@@ -75,4 +75,10 @@ docker compose exec -T backup pg_restore -h waggle-db -U waggle -d waggle --clea
 docker compose start bot
 ```
 
+A dump holds no roles. On a new server, create the role that card requests write under (migration 008) before restoring:
+
+```bash
+docker compose exec -T db psql -U waggle waggle -c 'CREATE ROLE waggle_self_edit NOLOGIN; GRANT waggle_self_edit TO waggle;'
+```
+
 To go back to the previous release by hand: `docker tag waggle-bot-bot:previous waggle-bot-bot && docker compose up -d --no-build bot`, or run `Deploy` by hand on an older tag. The next deploy from `main` replaces it again.

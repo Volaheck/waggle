@@ -191,6 +191,7 @@ export function createBot(deps: BotDeps): {
           config,
           answer: (api, question, cardChange) => answers.answer(api, question, cardChange),
           botNames: () => [bot.botInfo.first_name, bot.botInfo.username],
+          onSeeded: (user) => askOwnersAboutSeed(user, `asks to change the imported card they took over by its ${user.linked_by === "name" ? "name" : "@username"}`),
         })
       : undefined;
   // A message still being read for a card request is an answer under way too.
@@ -222,12 +223,13 @@ export function createBot(deps: BotDeps): {
     pendingOffers.add(offer);
   };
   // An account that took over an imported card by itself: the owners confirm it before the card can be edited from the chat.
-  const onClaimed = (user: User, by: "name" | "username") => {
-    const text = `🔗 <b>${escapeHtml(user.display_name)}</b>${user.username ? ` (@${escapeHtml(user.username)})` : ""} took over an imported card by its ${by === "name" ? "name" : "@username"}. If it is really them, confirm it: until then they can't change that card from the chat.`;
+  const askOwnersAboutSeed = (user: User, what: string) => {
+    const text = `🔗 <b>${escapeHtml(user.display_name)}</b>${user.username ? ` (@${escapeHtml(user.username)})` : ""} ${what}. If it is really them, confirm it: until then they can't change that card from the chat.`;
     for (const tgId of new Set(config.ADMIN_TG_IDS)) {
       void bot.api.sendMessage(tgId, text, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("✅ It's them", `seedok:${user.id}`) }).catch(() => {});
     }
   };
+  const onClaimed = (user: User, by: "name" | "username") => askOwnersAboutSeed(user, `took over an imported card by its ${by === "name" ? "name" : "@username"}`);
   const kit = createKit(bot, sql, config, membership, onJoined, onClaimed);
   const isGroup = (ctx: BotContext) => ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
 

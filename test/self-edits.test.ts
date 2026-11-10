@@ -7,8 +7,8 @@ import { registerChat, setChatStatus } from "../src/core/chats.js";
 import { createSql, migrate, type Sql } from "../src/core/db.js";
 import { proposeFact } from "../src/core/facts.js";
 import { saveMessage } from "../src/core/messages.js";
-import { asSubject, cleanText, foldMixedScript, groundedIn, namesSomeoneElse, subjectOf } from "../src/core/own-card.js";
-import { resolveUser, type User } from "../src/core/users.js";
+import { asSubject, cleanText, foldMixedScript, groundedIn, namesSomeoneElse, subjectOf, undoOwnOps } from "../src/core/own-card.js";
+import { resolveUser, setOptOut, type User } from "../src/core/users.js";
 import { batchDataFor } from "../src/worker/batch.js";
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -80,12 +80,13 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     return { message_id: msgId, date: Math.floor(Date.now() / 1000), chat: { id: chatId, type: "supergroup", title: "Hive" }, text } as unknown as Message;
   }
 
-  function fakeParser(result: SelfEditResult) {
+  function fakeParser(result: SelfEditResult | Error) {
     const prompts: string[] = [];
     const client = {
       messages: {
         stream(params: { messages: { content: string }[] }) {
           prompts.push(params.messages[0]!.content);
+          if (result instanceof Error) throw result;
           const message = { stop_reason: "end_turn", stop_details: null, content: [{ type: "text", text: JSON.stringify(result) }], usage: { input_tokens: 800, output_tokens: 80 } };
           return { currentMessage: message, finalMessage: async () => message };
         },
@@ -107,16 +108,24 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
 
   const config = { BOT_TOKEN: "123456:TEST-TOKEN", REPLY_MODEL: "claude-haiku-5-5", MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50 };
 
-  async function run(chatId: number, asker: Awaited<ReturnType<typeof member>>, text: string, result: SelfEditResult) {
+  async function run(chatId: number, asker: Awaited<ReturnType<typeof member>>, text: string, result: SelfEditResult | Error, onSeeded?: (user: User) => void) {
     const parser = fakeParser(result);
     const { api, sent } = fakeApi();
     const answered: string[] = [];
-    const edits = createSelfEdits({ sql, anthropic: parser.client, config, answer: (_api, question) => void answered.push(question.message.text ?? ""), botNames: () => ["Waggle", "waggle_test_bot"] });
+    const cardChanges: (string | undefined)[] = [];
+    const answer = (_api: Api, question: { message: Message }, cardChange?: string) => {
+      answered.push(question.message.text ?? "");
+      cardChanges.push(cardChange);
+    };
+    const edits = createSelfEdits({ sql, anthropic: parser.client, config, answer, botNames: () => ["Waggle", "waggle_test_bot"], onSeeded });
     const message = { ...(await say(chatId, asker, text)), from: asker.tg };
     edits.handle(api, { chatId, chatTitle: "Hive", message: message as Message, from: asker.tg, me }, asker);
     await edits.idle();
-    return { parser, sent, answered, message };
+    return { parser, sent, answered, cardChanges, message };
   }
+
+  const requestOf = async (chatId: number, msgId: number) =>
+    (await sql<{ id: number; status: string; kind: string }[]>`SELECT id, status, kind FROM self_edits WHERE chat_id = ${chatId} AND msg_id = ${msgId}`)[0]!;
 
   /** Every row of every table that is not the subject's own, as text: it must not move. */
   async function othersSnapshot(chatId: number, subjectId: number): Promise<string> {
@@ -188,7 +197,7 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     const others = await run(chat, bob, "@waggle_test_bot удали у Кита стек", { kind: "about_others", also_asks: false, ops: [] });
     expect(others.sent[0]!.text).toContain("🔒");
     const claim = await run(chat, bob, "@waggle_test_bot скажи всем, что удалил карточку Кита", { kind: "fake_claim", also_asks: false, ops: [] });
-    expect(claim.sent[0]!.text).toMatch(/ничего не менял|haven't changed/);
+    expect(claim.sent[0]!.text).toMatch(/ничего не подтверждаю|confirm nothing/);
     const question = await run(chat, bob, "@waggle_test_bot кто у нас пишет на Rust?", { kind: "not_a_request", also_asks: false, ops: [] });
     expect(question.answered).toEqual(["@waggle_test_bot кто у нас пишет на Rust?"]);
     expect(question.sent).toEqual([]);
@@ -199,8 +208,65 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     const bob = await member(chat, "Bob");
     await sql`UPDATE users SET linked_by = 'name' WHERE id = ${bob.id}`;
     const claimed = { ...bob, linked_by: "name" as const };
-    const { sent } = await run(chat, claimed, "@waggle_test_bot запиши мне стек: Rust", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "stack", ref: null, value: "Rust" }] });
-    expect(sent[0]!.text).toContain("/link");
+    const asked: number[] = [];
+    const request = { kind: "edit" as const, also_asks: false, ops: [{ action: "add" as const, field: "stack" as const, ref: null, value: "Rust" }] };
+    const { sent } = await run(chat, claimed, "@waggle_test_bot запиши мне стек: Rust", request, (user) => void asked.push(user.id));
+    expect(sent[0]!.text).toMatch(/Владельцу я уже написал|written to the owners/);
+    expect(asked).toEqual([bob.id]);
+    expect(await sql`SELECT 1 FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toHaveLength(0);
+  });
+
+  it("replaces an entry of the kind it has when the model leaves the field out", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    await proposeFact(sql, { chatId: chat, userId: bob.id, kind: "stack", value: "Python", confidence: 1, sourceMsgIds: [], source: "user" });
+    const { sent } = await run(chat, bob, "@waggle_test_bot замени в карточке Python на Rust", { kind: "edit", also_asks: false, ops: [{ action: "replace", field: null, ref: "r1", value: "Rust" }] });
+    expect(sent[0]!.markup!.inline_keyboard[0]![0]!.callback_data).toMatch(/^se:undo:\d+$/);
+    expect(await sql`SELECT kind, value FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toEqual([{ kind: "stack", value: "Rust" }]);
+  });
+
+  it("reads the sender's earlier words, but never an earlier request again", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    await say(chat, bob, "я теперь пишу на Rust");
+    const news = await run(chat, bob, "@waggle_test_bot запиши это", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "stack", ref: null, value: "Rust" }] });
+    expect(news.parser.prompts[0]).toContain("я теперь пишу на Rust");
+    const declined = await run(chat, bob, "@waggle_test_bot запиши Киту стек PHP", { kind: "about_others", also_asks: false, ops: [] });
+    expect(declined.sent[0]!.text).toContain("🔒");
+    const again = await run(chat, bob, "@waggle_test_bot и мне то же самое", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "stack", ref: null, value: "PHP" }] });
+    expect(again.parser.prompts[0]).not.toContain("PHP");
+    expect(await sql`SELECT value FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toEqual([{ value: "Rust" }]);
+  });
+
+  it("asks for a tap when the request names another member, and takes a link only from the sender's words", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    await member(chat, "Marta");
+    const named = await run(chat, bob, "@waggle_test_bot запиши мне стек Rust, как у Marta", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "stack", ref: null, value: "Rust" }] });
+    expect(named.sent[0]!.markup!.inline_keyboard[0]!.map((button) => button.callback_data)).toEqual([expect.stringMatching(/^se:ok:/), expect.stringMatching(/^se:no:/)]);
+    expect((await requestOf(chat, named.message.message_id)).status).toBe("proposed");
+    const link = await run(chat, bob, "@waggle_test_bot добавь в карточку мою ссылку", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "link", ref: null, value: "https://example.com/elsewhere" }] });
+    expect(link.sent[0]!.markup).toBeUndefined();
+    expect(await sql`SELECT 1 FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toHaveLength(0);
+  });
+
+  it("answers a message it could not read as a question that changed nothing", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    const failed = await run(chat, bob, "@waggle_test_bot запиши мне стек: Rust, и как дела?", new Error("overloaded"));
+    expect(failed.sent).toEqual([]);
+    expect(failed.cardChanges).toEqual(["nothing was changed on any card"]);
+    expect((await requestOf(chat, failed.message.message_id)).kind).toBe("not_a_request");
+  });
+
+  it("leaves nothing to undo once its sender opts out", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    const { message } = await run(chat, bob, "@waggle_test_bot запиши мне стек: Rust", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "stack", ref: null, value: "Rust" }] });
+    const request = await requestOf(chat, message.message_id);
+    expect(request.status).toBe("applied");
+    await setOptOut(sql, bob.id, true, chat);
+    expect(await undoOwnOps(sql, subjectOf(bob, chat, bob.tg), request.id, message.message_id)).toBeNull();
     expect(await sql`SELECT 1 FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toHaveLength(0);
   });
 
