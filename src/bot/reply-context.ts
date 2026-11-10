@@ -408,8 +408,8 @@ export interface Worded {
 
 const WORD = /[\p{L}\p{N}]+(?:[.,]\p{N}+)*/gu;
 const TERM_LETTERS = 5;
-/** Thanks and apologies are manners, never a worn motif. */
-const COURTESY = /^(?:спасиб|пожалуйст|благодар|прост|извин|thank|pleas|sorry)/u;
+/** Manners, the chat's own subject (projects, the rating, cards) and filler are never a worn motif. */
+const NEVER_WORN = /^(?:спасиб|пожалуйст|благодар|прост|извин|thank|pleas|sorry|проект|project|рейтинг|rating|карточ|card|котор|человек|people|person)/u;
 const wordsIn = (text: string) => text.toLowerCase().match(WORD) ?? [];
 
 /**
@@ -458,7 +458,7 @@ export function wornWords(answers: Worded[][], excluded: Set<string>): string[] 
     }
   }
   return [...counts]
-    .filter(([term, entry]) => entry.answers >= WORN_TIMES && !excluded.has(term) && ![...entry.forms.keys()].some((form) => COURTESY.test(form)))
+    .filter(([term, entry]) => entry.answers >= WORN_TIMES && !excluded.has(term) && ![...entry.forms.keys()].some((form) => NEVER_WORN.test(form)))
     .sort((a, b) => b[1].answers - a[1].answers)
     .slice(0, WORN_SHOWN)
     .map(([, entry]) => [...entry.forms].sort((a, b) => b[1] - a[1])[0]![0]);

@@ -167,7 +167,7 @@ describe.skipIf(!DATABASE_URL)("speaking up uninvited", () => {
         stream(params: { model: string; system: string; messages: { content: string }[]; output_config?: { effort?: string }; metadata?: { user_id?: string } }) {
           // A mention is first read for a card request (self-edits.ts): not one here.
           if (params.system === SELF_EDIT_SYSTEM_PROMPT) {
-            const reading = { stop_reason: "end_turn", stop_details: null, content: [{ type: "text", text: JSON.stringify({ kind: "not_a_request", also_asks: false, ops: [] }) }], usage };
+            const reading = { stop_reason: "end_turn", stop_details: null, content: [{ type: "text", text: JSON.stringify({ kind: "not_a_request", asks: null, also_asks: false, ops: [] }) }], usage };
             return { currentMessage: reading, finalMessage: async () => reading };
           }
           const prompt = params.messages[0]!.content;
