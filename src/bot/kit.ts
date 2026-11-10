@@ -108,11 +108,19 @@ export interface BotKit {
  * `onJoined` hears about every account that appears in a chat for the first time — by writing, joining, or being
  * confirmed as a silent member — so the owners can be asked whether it is someone from the imported history.
  */
-export function createKit(bot: Bot<BotContext>, sql: Sql, config: Config, membership: MembershipCache, onJoined?: (chatId: number, user: User) => void): BotKit {
+export function createKit(
+  bot: Bot<BotContext>,
+  sql: Sql,
+  config: Config,
+  membership: MembershipCache,
+  onJoined?: (chatId: number, user: User) => void,
+  onClaimed?: (user: User, by: "name" | "username") => void,
+): BotKit {
   const isPrivate = (ctx: BotContext) => ctx.chat?.type === "private";
   const identity = async (from: TelegramUser, chatId?: number): Promise<User> => {
-    const { user, joined } = await resolveAccount(sql, from, config.ADMIN_TG_IDS, chatId);
+    const { user, joined, claimedBy } = await resolveAccount(sql, from, config.ADMIN_TG_IDS, chatId);
     if (joined && chatId !== undefined) onJoined?.(chatId, user);
+    if (claimedBy) onClaimed?.(user, claimedBy);
     return user;
   };
   const join = async (chatId: number, user: User): Promise<void> => {

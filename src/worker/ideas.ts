@@ -40,7 +40,7 @@ export type IdeaStatus = (typeof IDEA_STATUSES)[number];
 const CAPABILITIES = [
   "answers whoever mentions it or replies to it, from the members' cards, the project catalog with its rating, the chronicle and its private memory of people",
   "keeps the chronicle of the chat's topics, debates and news, finds the arguments the chat keeps coming back to and speaks up uninvited, at most three times a day, when one flares up again",
-  "member cards (stack, role, interests, city, links, what they look for and can help with, a tagline): people edit their own in the Mini App (/app) and /me; names and nicknames with /alias and /unalias; /whatyouknow shows a person what is known about them, /forgetme erases it",
+  "member cards (stack, role, interests, city, links, what they look for and can help with, a tagline): people edit their own in the Mini App (/app), /me, or by asking the bot in the chat (it posts a receipt with Undo, and only ever changes the asker's own card); names and nicknames with /alias and /unalias; /whatyouknow shows a person what is known about them, /forgetme erases it",
   "the project catalog and its rating from what people do and say (/projects, /top), the members list (/people), the chronicle (/chronicle, /today, /week) and a digest of what someone missed (/catchup)",
   "for its owners only: /botstatus, /chats, /notes, /link, reminders from their own private chats (/reminders) and deleted or edited messages there",
   "it cannot see reactions, send images, stickers or polls, browse the web, run code, or post on a schedule of its own beyond this weekly idea",

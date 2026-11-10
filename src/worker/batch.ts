@@ -60,7 +60,30 @@ export async function skippedMessageIds(sql: Sql, chatId: number): Promise<numbe
 }
 
 /** Everything the chronicler is shown along with a batch of messages: the context before it, the people, the catalog, the notes. */
-export async function batchDataFor(sql: Sql, chatId: number, batch: StoredMessage[]): Promise<BatchData> {
+/** What the chronicler reads instead of a request to the bot about someone's card: never a source for anyone's data. */
+const CARD_REQUEST_TEXTS: Record<string, string> = {
+  edit: "[asked the bot to change their own card; the bot handled it]",
+  about_others: "[asked the bot to change another member's card; the bot refused]",
+  fake_claim: "[asked the bot to say it changed someone's data; the bot refused]",
+  unclear: "[asked the bot to change their card without saying what]",
+  parsing: "[a request to the bot about a card]",
+};
+
+/**
+ * Requests to change a card are handled by the bot itself (src/bot/self-edits.ts): the chronicler sees only that one
+ * was made, so it can neither apply one again, nor bring back what its author undid, nor take a request about another
+ * member as a fact or a correction about them.
+ */
+async function withoutCardRequests(sql: Sql, chatId: number, messages: StoredMessage[]): Promise<StoredMessage[]> {
+  if (messages.length === 0) return messages;
+  const requests = await sql<{ msg_id: number; kind: string }[]>`
+    SELECT msg_id, kind FROM self_edits WHERE chat_id = ${chatId} AND msg_id = ANY(${messages.map((message) => message.msg_id)}::bigint[]) AND kind <> 'not_a_request'`;
+  const kinds = new Map(requests.map((request) => [request.msg_id, request.kind]));
+  return messages.map((message) => (kinds.has(message.msg_id) ? { ...message, text: CARD_REQUEST_TEXTS[kinds.get(message.msg_id)!] ?? CARD_REQUEST_TEXTS.parsing! } : message));
+}
+
+export async function batchDataFor(sql: Sql, chatId: number, rawBatch: StoredMessage[]): Promise<BatchData> {
+  const batch = await withoutCardRequests(sql, chatId, rawBatch);
   const skipped = await skippedMessageIds(sql, chatId);
   // A message whose text was cleared after the retention period has nothing left to show; media still says what was sent.
   const context = (
@@ -72,6 +95,7 @@ export async function batchDataFor(sql: Sql, chatId: number, batch: StoredMessag
       ORDER BY msg_id DESC
       LIMIT ${CONTEXT_MESSAGES}`
   ).reverse();
+  const shownContext = await withoutCardRequests(sql, chatId, context);
 
   const authorIds = [...new Set(batch.map((message) => message.user_id).filter((id): id is number => id !== null))];
   const users = (await peopleOfChat(sql, chatId, { includeLeft: true })).filter((person) => person.left_at === null || authorIds.includes(person.id));
@@ -102,7 +126,7 @@ export async function batchDataFor(sql: Sql, chatId: number, batch: StoredMessag
     ) AS current
     WHERE rank <= CASE WHEN user_id IS NULL THEN ${PROMPT_BITS}::int ELSE ${PROMPT_NOTES_PER_PERSON}::int END
     ORDER BY user_id NULLS FIRST, said_at`;
-  return { chatId, batch, context, users, facts, projects, recentTopics, notes };
+  return { chatId, batch, context: shownContext, users, facts, projects, recentTopics, notes };
 }
 
 function involvedUserIds(batch: StoredMessage[], all: StoredMessage[], users: Person[]): number[] {

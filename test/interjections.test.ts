@@ -2,6 +2,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import type { Message, UserFromGetMe } from "grammy/types";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { answersInLastHour, replySystemPrompt } from "../src/bot/assistant.js";
+import { SELF_EDIT_SYSTEM_PROMPT } from "../src/bot/self-edits.js";
 import { createBot } from "../src/bot/bot.js";
 import { INTERJECTION_SYSTEM_PROMPT, InterjectionSchema, liveSegments, type InterjectionResult, type SegmentRow } from "../src/bot/interjector.js";
 import { buildReplyContext, promptText, type Question } from "../src/bot/reply-context.js";
@@ -164,6 +165,11 @@ describe.skipIf(!DATABASE_URL)("speaking up uninvited", () => {
           return { stop_reason: "end_turn", content: [{ type: "text", text: "Kit writes Rust 🐝" }], usage };
         },
         stream(params: { model: string; system: string; messages: { content: string }[]; output_config?: { effort?: string }; metadata?: { user_id?: string } }) {
+          // A mention is first read for a card request (self-edits.ts): not one here.
+          if (params.system === SELF_EDIT_SYSTEM_PROMPT) {
+            const reading = { stop_reason: "end_turn", stop_details: null, content: [{ type: "text", text: JSON.stringify({ kind: "not_a_request", also_asks: false, ops: [] }) }], usage };
+            return { currentMessage: reading, finalMessage: async () => reading };
+          }
           const prompt = params.messages[0]!.content;
           checks.push({ model: params.model, system: params.system, prompt, effort: params.output_config?.effort, userId: params.metadata?.user_id });
           const message = { stop_reason: "end_turn", stop_details: null, content: [{ type: "text", text: JSON.stringify(decide(prompt)) }], usage };

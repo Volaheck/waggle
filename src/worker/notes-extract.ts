@@ -1,6 +1,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import { addAlias, nameForms } from "../core/aliases.js";
+import { aliasRejected } from "../core/own-card.js";
 import type { Queryable } from "../core/db.js";
 import { callStructured, type StructuredOutcome, type UsageLike } from "../core/llm.js";
 import type { StoredMessage } from "../core/messages.js";
@@ -147,7 +148,7 @@ async function applyAlias(tx: Queryable, data: BatchData, users: Map<number, Per
   const own = memberSources(batchById)(item.source_msg_ids).some((id) => batchById.get(id)!.user_id === user.id && !batchById.get(id)!.is_forward);
   if (!own) return 0;
   const derived = new Set([...nameForms(user.display_name), ...(user.username ? [user.username] : [])].map(nameKey));
-  if (derived.has(nameKey(item.alias))) return 0;
+  if (derived.has(nameKey(item.alias)) || (await aliasRejected(tx, data.chatId, user.id, item.alias))) return 0;
   return (await addAlias(tx, { chatId: data.chatId, target: { userId: user.id }, alias: item.alias, source: "chronicler" })) === "added" ? 1 : 0;
 }
 

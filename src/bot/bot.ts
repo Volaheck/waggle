@@ -35,6 +35,7 @@ import { catchupHtml, clampTelegram, countOf, formatDate, userHeader } from "./f
 import { registerAliases } from "./aliases.js";
 import { BUSINESS_UPDATES, businessRemindersOn, registerBusiness } from "./business.js";
 import { createAssistant, isAddressedToBot, repliesSpendUsd, type Assistant, type AssistantDeps } from "./assistant.js";
+import { createSelfEdits, registerSelfEdits, type SelfEdits } from "./self-edits.js";
 import { createInterjector, type Interjector } from "./interjector.js";
 import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
 import { isInChat, MembershipCache } from "./membership.js";
@@ -170,6 +171,7 @@ export function createBot(deps: BotDeps): {
   bot: Bot<BotContext>;
   membership: MembershipCache;
   assistant?: Assistant;
+  selfEdits?: SelfEdits;
   interjector?: Interjector;
   /** Call when an account appears in a chat for the first time outside the bot (the Mini App): the owners may be asked about it. */
   onJoined: (chatId: number, user: User) => void;
@@ -178,8 +180,31 @@ export function createBot(deps: BotDeps): {
 } {
   const { sql, config } = deps;
   // Answers are off without a key or with a zero cap; a mention then gets the help text instead.
-  const assistant =
+  const answers =
     deps.anthropic && config.REPLIES_MONTHLY_BUDGET_USD > 0 ? createAssistant({ sql, anthropic: deps.anthropic, config, limits: deps.answerLimits }) : undefined;
+  // Every message addressed to the bot is first checked for a request about the sender's own card (see self-edits.ts).
+  const selfEdits: SelfEdits | undefined =
+    deps.anthropic && answers
+      ? createSelfEdits({
+          sql,
+          anthropic: deps.anthropic,
+          config,
+          answer: (api, question, cardChange) => answers.answer(api, question, cardChange),
+          botNames: () => [bot.botInfo.first_name, bot.botInfo.username],
+        })
+      : undefined;
+  // A message still being read for a card request is an answer under way too.
+  const assistant: Assistant | undefined =
+    answers && selfEdits
+      ? {
+          ...answers,
+          answering: (chatId) => selfEdits.busy(chatId) || answers.answering(chatId),
+          idle: async () => {
+            await selfEdits.idle();
+            await answers.idle();
+          },
+        }
+      : answers;
   // Speaking up uninvited spends from the answers' caps, so it is on only where answers are.
   const interjector =
     deps.anthropic && assistant && config.INTERJECTIONS_PER_CHAT_PER_DAY > 0
@@ -196,7 +221,14 @@ export function createBot(deps: BotDeps): {
       .finally(() => pendingOffers.delete(offer));
     pendingOffers.add(offer);
   };
-  const kit = createKit(bot, sql, config, membership, onJoined);
+  // An account that took over an imported card by itself: the owners confirm it before the card can be edited from the chat.
+  const onClaimed = (user: User, by: "name" | "username") => {
+    const text = `🔗 <b>${escapeHtml(user.display_name)}</b>${user.username ? ` (@${escapeHtml(user.username)})` : ""} took over an imported card by its ${by === "name" ? "name" : "@username"}. If it is really them, confirm it: until then they can't change that card from the chat.`;
+    for (const tgId of new Set(config.ADMIN_TG_IDS)) {
+      void bot.api.sendMessage(tgId, text, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("✅ It's them", `seedok:${user.id}`) }).catch(() => {});
+    }
+  };
+  const kit = createKit(bot, sql, config, membership, onJoined, onClaimed);
   const isGroup = (ctx: BotContext) => ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
 
   // ---------- Linking imported cards: an account the automatic match missed is offered to the owners ----------
@@ -361,6 +393,14 @@ export function createBot(deps: BotDeps): {
 
   // Owners' own private chats, through Telegram Business: handled apart from everything below.
   registerBusiness(bot, { sql, config, remindersOn: businessRemindersOn(deps.anthropic, config) });
+  registerSelfEdits(bot, { sql });
+
+  bot.callbackQuery(/^seedok:(\d+)$/, async (ctx) => {
+    const owner = await kit.identity(ctx.from);
+    if (!kit.isOwner(owner)) return ctx.answerCallbackQuery({ text: "That's up to the bot owner" });
+    const [confirmed] = await sql`UPDATE users SET linked_by = 'owner' WHERE id = ${Number(ctx.match[1])} AND linked_by IN ('name', 'username') RETURNING id`;
+    await ctx.answerCallbackQuery({ text: confirmed ? "Confirmed: they can edit their card now" : "Nothing to confirm" });
+  });
 
   bot.on("my_chat_member", async (ctx) => {
     if (!isGroup(ctx)) return;
@@ -590,7 +630,9 @@ export function createBot(deps: BotDeps): {
           // update must not buy a second answer or another look.
           if (isNew && person && !message.forward_origin) {
             if (assistant && isAddressedToBot(message, ctx.me)) {
-              assistant.answer(ctx.api, { chatId, chatTitle: ctx.chat.title ?? null, message, from: person, me: ctx.me });
+              const question = { chatId, chatTitle: ctx.chat.title ?? null, message, from: person, me: ctx.me };
+              if (selfEdits && user) selfEdits.handle(ctx.api, question, user);
+              else assistant.answer(ctx.api, question);
             } else {
               interjector?.consider(ctx.api, chatId, ctx.me);
             }
@@ -876,7 +918,7 @@ export function createBot(deps: BotDeps): {
     if (error.ctx.callbackQuery) void error.ctx.answerCallbackQuery({ text: "Something went wrong 😕" }).catch(() => {});
   });
 
-  return { bot, membership, assistant, interjector, onJoined, cardOffersIdle: async () => void (await Promise.allSettled([...pendingOffers])) };
+  return { bot, membership, assistant, selfEdits, interjector, onJoined, cardOffersIdle: async () => void (await Promise.allSettled([...pendingOffers])) };
 }
 
 const OWNER_COMMANDS = [

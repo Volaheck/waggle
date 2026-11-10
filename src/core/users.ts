@@ -13,6 +13,8 @@ export interface User {
   is_admin: boolean;
   dm_started: boolean;
   current_chat_id: number | null;
+  /** How the account came to own an imported card: null for its own, "owner" after /link, "name" or "username" when claimed automatically. */
+  linked_by?: "owner" | "name" | "username" | null;
 }
 
 /** A person's presence in one chat: their card there is independent from other chats. */
@@ -50,11 +52,11 @@ const PERSON_COLUMNS = `u.id, u.tg_id, u.username, u.display_name, u.is_admin, u
  * @username of its own, it is the only unlinked card with that name in the chat, it belongs to no other
  * chat and authors no project. Everything else waits for an owner's /link.
  */
-async function claimableSeed(sql: Sql, username: string | null, name: string, chatId: number | undefined): Promise<User | undefined> {
+async function claimableSeed(sql: Sql, username: string | null, name: string, chatId: number | undefined): Promise<{ seed: User; by: "name" | "username" } | undefined> {
   if (username) {
     const [byUsername] = await sql<User[]>`
       SELECT * FROM users WHERE tg_id IS NULL AND username IS NOT NULL AND lower(username) = lower(${username})`;
-    if (byUsername) return byUsername;
+    if (byUsername) return { seed: byUsername, by: "username" };
   }
   if (chatId === undefined) return undefined;
   const byName = await sql<(User & { claimable: boolean })[]>`
@@ -67,7 +69,7 @@ async function claimableSeed(sql: Sql, username: string | null, name: string, ch
       AND EXISTS (SELECT 1 FROM members m WHERE m.user_id = u.id AND m.chat_id = ${chatId})
     LIMIT 2`;
   const [only] = byName;
-  return byName.length === 1 && only?.claimable ? only : undefined;
+  return byName.length === 1 && only?.claimable ? { seed: only, by: "name" } : undefined;
 }
 
 /**
@@ -79,12 +81,21 @@ export async function resolveUser(sql: Sql, identity: TelegramIdentity, adminTgI
   return (await resolveAccount(sql, identity, adminTgIds, chatId)).user;
 }
 
-/** resolveUser that also says whether the account has just appeared in the chat for the first time, as itself and not as a card it took over. */
-export async function resolveAccount(sql: Sql, identity: TelegramIdentity, adminTgIds: number[], chatId?: number): Promise<{ user: User; joined: boolean }> {
+/**
+ * resolveUser that also says whether the account has just appeared in the chat for the first time, as itself and not
+ * as a card it took over, and whether it has just taken over an imported card by name or @username.
+ */
+export async function resolveAccount(
+  sql: Sql,
+  identity: TelegramIdentity,
+  adminTgIds: number[],
+  chatId?: number,
+): Promise<{ user: User; joined: boolean; claimedBy: "name" | "username" | null }> {
   const name = fullName(identity) || identity.username || `user${identity.id}`;
   const username = identity.username ?? null;
   const isAdmin = adminTgIds.includes(identity.id);
   let user: User | undefined;
+  let claimedBy: "name" | "username" | null = null;
 
   const [existing] = await sql<User[]>`SELECT * FROM users WHERE tg_id = ${identity.id}`;
   if (existing) {
@@ -98,11 +109,13 @@ export async function resolveAccount(sql: Sql, identity: TelegramIdentity, admin
   } else {
     const seeded = await claimableSeed(sql, username, name, chatId);
     if (seeded) {
-      // Seed names come from someone's contact list; from now on the person's own Telegram name wins.
+      // Seed names come from someone's contact list; from now on the person's own Telegram name wins. A card claimed
+      // this way is not edited from the chat until an owner confirms it with /link (src/bot/self-edits.ts).
       [user] = await sql<User[]>`
-        UPDATE users SET tg_id = ${identity.id}, username = coalesce(${username}, username), display_name = ${name}, is_admin = ${isAdmin}
-        WHERE id = ${seeded.id}
+        UPDATE users SET tg_id = ${identity.id}, username = coalesce(${username}, username), display_name = ${name}, is_admin = ${isAdmin}, linked_by = ${seeded.by}
+        WHERE id = ${seeded.seed.id}
         RETURNING *`;
+      claimedBy = seeded.by;
     } else {
       if (username) {
         await sql`UPDATE users SET username = NULL WHERE lower(username) = lower(${username}) AND tg_id IS DISTINCT FROM ${identity.id}`;
@@ -114,7 +127,7 @@ export async function resolveAccount(sql: Sql, identity: TelegramIdentity, admin
   }
   if (!user) throw new Error("Could not resolve the Telegram user");
   const joined = chatId !== undefined && (await ensureMember(sql, chatId, user.id));
-  return { user, joined };
+  return { user, joined, claimedBy };
 }
 
 /** Makes the person a member of the chat again; true when this is their first time there. */
