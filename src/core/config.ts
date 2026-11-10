@@ -56,6 +56,14 @@ const EnvSchema = z.object({
   BUSINESS_REMINDER_MODEL: z.string().default("claude-haiku-5-5"),
   /** Cap for that reading across all owners, on top of MONTHLY_LLM_BUDGET_USD; 0 turns reminders off. */
   BUSINESS_REMINDERS_MONTHLY_BUDGET_USD: z.coerce.number().min(0).default(2),
+  /** Anyone may ask for a private portrait of their character (/portrait): this model reads their messages into observations… */
+  PORTRAIT_READER_MODEL: z.string().default("claude-sonnet-5-5"),
+  /** …and this one writes the portrait from them every few days. */
+  PORTRAIT_MODEL: z.string().default("claude-opus-5-5"),
+  /** Cap for portraits across everyone, on top of MONTHLY_LLM_BUDGET_USD; 0 turns them off. */
+  PORTRAIT_MONTHLY_BUDGET_USD: z.coerce.number().min(0).default(20),
+  /** Cap for one person's portrait a month; owners have only the caps above. */
+  PORTRAIT_PERSON_MONTHLY_USD: z.coerce.number().min(0).default(3),
   WEB_DIST_DIR: z.string().default("web/dist"),
   /** Local development only: open the Mini App in a plain browser via a secret link printed at startup. */
   DEV_BROWSER_LOGIN: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),

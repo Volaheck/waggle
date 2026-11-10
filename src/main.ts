@@ -5,6 +5,7 @@ import { createApi } from "./api/server.js";
 import { ALLOWED_UPDATES, createBot, notifyAdmins, registerCommands } from "./bot/bot.js";
 import { businessRemindersOn, startBusinessRetention } from "./bot/business.js";
 import { startBusinessReminders } from "./worker/business-reminders.js";
+import { portraitsOn, startPortraits } from "./worker/portrait.js";
 import { startWeeklyIdeas } from "./worker/ideas.js";
 import { startNameSync } from "./bot/names.js";
 import { telegramWebhook } from "./bot/webhook.js";
@@ -117,6 +118,7 @@ const stopRetention = startMessageRetention(sql, config.MESSAGE_RETENTION_DAYS);
 const stopBusinessRetention = startBusinessRetention(sql, config.BUSINESS_MESSAGE_RETENTION_DAYS);
 const stopBusinessReminders =
   anthropic && businessRemindersOn(anthropic, config) ? startBusinessReminders({ sql, anthropic, api: bot.api, config }) : async () => {};
+const stopPortraits = anthropic && portraitsOn(anthropic, config) ? startPortraits({ sql, anthropic, api: bot.api, config }) : async () => {};
 const stopWeeklyIdeas = anthropic ? startWeeklyIdeas({ sql, anthropic, api: bot.api, config, botUsername: bot.botInfo.username }) : async () => {};
 const stopNameSync = startNameSync(bot.api, sql, config.ADMIN_TG_IDS);
 if (config.ADMIN_TG_IDS.length === 0) {
@@ -128,7 +130,7 @@ const shutdown = async (signal: string) => {
   stopNameSync();
   stopRetention();
   stopBusinessRetention();
-  await settledWithin(REPLIES_WAIT_MS, [stopBusinessReminders(), stopWeeklyIdeas()]);
+  await settledWithin(REPLIES_WAIT_MS, [stopBusinessReminders(), stopPortraits(), stopWeeklyIdeas()]);
   // The bot does not start speaking up uninvited any more; a check under way finishes with the answers below.
   interjector?.stop();
   // The bot keeps serving while the chronicler call under way finishes; no new call starts. A call that takes longer

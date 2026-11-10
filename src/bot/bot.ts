@@ -35,6 +35,8 @@ import { registerCatalog } from "./catalog.js";
 import { catchupHtml, clampTelegram, countOf, formatDate, userHeader } from "./format.js";
 import { registerAliases } from "./aliases.js";
 import { BUSINESS_UPDATES, businessRemindersOn, registerBusiness } from "./business.js";
+import { registerPortrait } from "./portrait.js";
+import { portraitsOn } from "../worker/portrait.js";
 import { createAssistant, isAddressedToBot, repliesSpendUsd, type Assistant, type AssistantDeps } from "./assistant.js";
 import { createSelfEdits, registerSelfEdits, type SelfEdits } from "./self-edits.js";
 import { createInterjector, type Interjector } from "./interjector.js";
@@ -78,6 +80,7 @@ const PRIVATE_COMMANDS = [
   { command: "aliases", description: "What people and projects are called here" },
   { command: "addproject", description: "Add your project" },
   { command: "whatyouknow", description: "What the bot knows about me" },
+  { command: "portrait", description: "A private portrait of my character" },
   { command: "forgetme", description: "Delete everything about me" },
   { command: "help", description: "What the bot can do" },
 ];
@@ -403,7 +406,9 @@ export function createBot(deps: BotDeps): {
   }
 
   // Owners' own private chats, through Telegram Business: handled apart from everything below.
-  registerBusiness(bot, { sql, config, remindersOn: businessRemindersOn(deps.anthropic, config) });
+  registerBusiness(bot, { sql, config, remindersOn: businessRemindersOn(deps.anthropic, config), portraitsOn: portraitsOn(deps.anthropic, config) });
+  // A person's private portrait: their own private chat with the bot only.
+  registerPortrait(bot, { sql, config, on: portraitsOn(deps.anthropic, config) });
   registerSelfEdits(bot, { sql, botNames: () => [bot.botInfo.first_name, bot.botInfo.username] });
 
   bot.callbackQuery(/^seedok:(\d+)$/, async (ctx) => {

@@ -241,6 +241,8 @@ export async function forgetUser(sql: Sql, userId: number, options: { chatId?: n
   await sql.begin(async (tx) => {
     await applyOptOut(tx, userId, true, scope);
     await dropCardRequests(tx, userId, scope);
+    // Everywhere means the private portrait too (src/core/portrait.ts).
+    if (scope === null) await tx`DELETE FROM portraits WHERE tg_id = (SELECT tg_id FROM users WHERE id = ${userId})`;
     if (!options.messages) return;
     await tx`
       UPDATE interjections said SET text = NULL

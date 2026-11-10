@@ -22,6 +22,7 @@ import {
 } from "../core/business.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
+import { portraitOf, savePortraitLine } from "../core/portrait.js";
 import { escapeHtml, truncate } from "../core/text.js";
 import { reminderButtons, reminderLine } from "../worker/business-reminders.js";
 import { clampTelegram, countOf, formatDate } from "./format.js";
@@ -163,11 +164,12 @@ async function resendMedia(api: Api, chatId: number, kind: BusinessMediaKind, fi
 /**
  * The bot connected to an owner's own account (Telegram Business → Chat Automation) keeps the other side's messages
  * in the chats it was given, and tells the owner in their DM with the bot when one of them is deleted or edited.
- * Only owners (ADMIN_TG_IDS) get this; for anyone else the bot keeps nothing. The owner's own messages are not kept.
+ * Only owners (ADMIN_TG_IDS) get this. Anyone who started a portrait (/portrait) has both sides of these chats read
+ * for it; for anyone else the bot keeps nothing. The owner's own messages are not kept for deletion tracking.
  * Registered before every other handler: these updates never reach the group logic.
  */
-export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config: Config; remindersOn: boolean }): void {
-  const { sql, config, remindersOn } = deps;
+export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config: Config; remindersOn: boolean; portraitsOn: boolean }): void {
+  const { sql, config, remindersOn, portraitsOn } = deps;
   const isOwner = (tgId: number) => config.ADMIN_TG_IDS.includes(tgId);
   const timeZone = config.DISPLAY_TIMEZONE;
 
@@ -190,7 +192,7 @@ export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config:
       await store(fetched);
       connection = await connectionById(sql, id);
     }
-    return connection?.enabled && isOwner(connection.owner_tg_id) ? connection : undefined;
+    return connection?.enabled ? connection : undefined;
   };
 
   const tell = (chatId: number, html: string) =>
@@ -209,8 +211,18 @@ export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config:
     const before = await connectionById(sql, connection.id);
     await store(connection);
     if (!isOwner(connection.user.id)) {
+      const portrait = portraitsOn ? await portraitOf(sql, connection.user.id) : undefined;
       if (connection.is_enabled && !before?.enabled) {
-        await tell(connection.user_chat_id, "This bot tracks deleted and edited messages only for its owners. It keeps nothing from your chats.");
+        await tell(
+          connection.user_chat_id,
+          portrait?.status === "on"
+            ? "🔌 <b>Connected.</b> Your private chats now go into your portrait too, both sides, read and then deleted. /portrait to see it, pause it or delete it."
+            : portraitsOn
+              ? "🔌 Deleted and edited messages are tracked only for this bot's owners. What I can do for you is a private portrait of your character from your chats: /portrait. Until you start one, I keep nothing from your chats."
+              : "This bot tracks deleted and edited messages only for its owners. It keeps nothing from your chats.",
+        );
+      } else if (!connection.is_enabled && before?.enabled && portrait) {
+        await tell(connection.user_chat_id, "🔌 <b>Disconnected.</b> Your portrait goes on from the groups only. /portrait to pause or delete it.");
       }
       return;
     }
@@ -226,6 +238,7 @@ export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config:
                 "⏰ I also read these chats, both sides, for promises and plans (“I'll send it tomorrow”, “call on Friday at 7”) and remind you of them here; /reminders lists them. The lines are kept for 2 days, and their text goes to Claude with phone numbers, emails and secrets masked.",
               ]
             : []),
+          ...(portraitsOn ? ["", "🪞 /portrait: a private portrait of your character from these chats and the groups, if you want one."] : []),
         ].join("\n"),
       );
     } else if (!connection.is_enabled && before?.enabled) {
@@ -250,10 +263,29 @@ export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config:
     });
   };
 
+  /** Both sides go to the person's portrait, when they started one. */
+  const keepPortraitLine = async (connection: BusinessConnectionRow, message: Message) => {
+    if (!portraitsOn) return;
+    const media = mediaOf(message);
+    const text = [media ? `[${MEDIA_LABELS[media.kind]}]` : "", textOf(message)].filter(Boolean).join(" ");
+    if (!text) return;
+    const fromSubject = message.from?.id === connection.owner_tg_id;
+    await savePortraitLine(sql, connection.owner_tg_id, {
+      chat_id: message.chat.id,
+      msg_id: message.message_id,
+      from_subject: fromSubject,
+      speaker: fromSubject ? "me" : message.from ? nameOf(message.from) : chatName(message.chat as Chat.PrivateChat),
+      text,
+      sent_at: new Date(message.date * 1000),
+    });
+  };
+
   bot.on("business_message", async (ctx) => {
     const message = ctx.businessMessage;
     const connection = await activeConnection(ctx.api, message.business_connection_id);
     if (!connection) return;
+    await keepPortraitLine(connection, message);
+    if (!isOwner(connection.owner_tg_id)) return;
     await keepDialogueLine(connection, message);
     if (message.from?.id === connection.owner_tg_id) return;
     const kept = toBusinessMessage(connection.id, message);
@@ -264,6 +296,8 @@ export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config:
     const message = ctx.editedBusinessMessage;
     const connection = await activeConnection(ctx.api, message.business_connection_id);
     if (!connection) return;
+    await keepPortraitLine(connection, message);
+    if (!isOwner(connection.owner_tg_id)) return;
     await keepDialogueLine(connection, message);
     if (message.from?.id === connection.owner_tg_id) return;
     const after = toBusinessMessage(connection.id, message);
@@ -280,7 +314,7 @@ export function registerBusiness(bot: Bot<BotContext>, deps: { sql: Sql; config:
   bot.on("deleted_business_messages", async (ctx) => {
     const deleted = ctx.deletedBusinessMessages;
     const connection = await activeConnection(ctx.api, deleted.business_connection_id);
-    if (!connection) return;
+    if (!connection || !isOwner(connection.owner_tg_id)) return;
     const gone = await takeDeletedMessages(sql, connection.id, deleted.chat.id, deleted.message_ids);
     if (gone.length === 0) return;
     await tell(connection.owner_chat_id, deletedReport(chatName(deleted.chat), gone, timeZone));
