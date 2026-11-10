@@ -32,11 +32,12 @@ describe("zone names", () => {
     expect(clockWindow("16:20")).toEqual({ from: 970, to: 990 });
     expect(clockWindow("00:00")).toEqual({ from: 1420, to: 59 });
     expect(clockWindow("4 утра")).toBeNull();
-    const canada = ["America/St_Johns", "America/Halifax", "America/Toronto", "America/Winnipeg", "America/Edmonton", "America/Vancouver"];
-    // «14:42» at 19:42 UTC in November: Toronto alone.
-    expect(zonesShowing(canada, clockWindow("14:42")!, new Date("2026-11-06T19:42:00Z"))).toEqual(["America/Toronto"]);
-    // «3 часа дня» at 20:40 UTC: 15:40 in Toronto and 14:40 in Winnipeg both round to it, so it tells nothing.
-    expect(zonesShowing(canada, clockWindow("15:00")!, new Date("2026-11-06T20:40:00Z"))).toEqual(["America/Toronto", "America/Winnipeg"]);
+    // Zones with no daylight saving and no rule changes in sight, so the test holds whatever tzdata runs it.
+    const indonesia = ["Asia/Jakarta", "Asia/Makassar", "Asia/Jayapura"];
+    // «16:20» at 09:20 UTC: Jakarta alone.
+    expect(zonesShowing(indonesia, clockWindow("16:20")!, new Date("2026-11-06T09:20:00Z"))).toEqual(["Asia/Jakarta"]);
+    // «5 вечера» at 09:40 UTC is 16:40 in Jakarta and 17:40 in Makassar: both round to it, so it tells nothing.
+    expect(zonesShowing(indonesia, clockWindow("17:00")!, new Date("2026-11-06T09:40:00Z"))).toEqual(["Asia/Jakarta", "Asia/Makassar"]);
     // Past midnight: the window wraps.
     expect(zonesShowing(["Asia/Shanghai", "Europe/Warsaw"], clockWindow("00:00")!, new Date("2026-11-10T16:30:00Z"))).toEqual(["Asia/Shanghai"]);
     expect(utcOffset("Europe/Warsaw", new Date("2026-11-10T12:00:00Z"))).toBe("UTC+1");

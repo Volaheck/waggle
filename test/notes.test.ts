@@ -758,17 +758,18 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       const dana = await member(chat, "Dana");
       const eve = await member(chat, "Eve");
       const bob = await member(chat, "Bob");
-      const canada = "{America/St_Johns,America/Halifax,America/Toronto,America/Winnipeg,America/Edmonton,America/Vancouver}";
-      for (const [who, place] of [[dana, "Канада"], [eve, "Канада"], [bob, "Китай"]] as const) {
+      // Indonesia keeps its three zones all year, so this holds whatever tzdata runs it.
+      const indonesia = "{Asia/Jakarta,Asia/Makassar,Asia/Jayapura}";
+      for (const [who, place] of [[dana, "Индонезия"], [eve, "Индонезия"], [bob, "Китай"]] as const) {
         await proposeFact(sql, { chatId: chat, userId: who.id, kind: "timezone", value: place, confidence: 1, sourceMsgIds: [], source: "user" });
       }
-      await sql`UPDATE facts SET zones = ${canada} WHERE chat_id = ${chat} AND user_id IN (${dana.id}, ${eve.id})`;
+      await sql`UPDATE facts SET zones = ${indonesia} WHERE chat_id = ${chat} AND user_id IN (${dana.id}, ${eve.id})`;
       await sql`UPDATE facts SET zones = '{Asia/Shanghai}' WHERE chat_id = ${chat} AND user_id = ${bob.id}`;
       const at = new Date("2026-11-06T19:42:00Z");
       const lees = await say(chat, lee, "у меня 4 утра, а ты всё читаешь", { at });
-      const danas = await say(chat, dana, "а у меня 14:42, обед", { at });
-      // A bare hour at 20:40 UTC is 15:40 in Toronto and 14:40 in Winnipeg: it cannot tell them apart.
-      const eves = await say(chat, eve, "у меня 3 часа дня", { at: new Date("2026-11-06T20:40:00Z") });
+      const danas = await say(chat, dana, "а у меня 16:20, обед", { at: new Date("2026-11-06T09:20:00Z") });
+      // A bare hour at 09:40 UTC is 16:40 in Jakarta and 17:40 in Makassar: it cannot tell them apart.
+      const eves = await say(chat, eve, "у меня 5 вечера", { at: new Date("2026-11-06T09:40:00Z") });
       const bobs = await say(chat, bob, "у меня 9 вечера", { at });
       const forwarded = await say(chat, lee, "В Пекине сейчас 4 утра", { at, forward: true });
       const { client } = fakeModel({
@@ -776,8 +777,8 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
           ...EMPTY,
           facts_add: [
             fact(lee, "timezone", "04:00", [lees]),
-            fact(dana, "timezone", "14:42", [danas]),
-            fact(eve, "timezone", "15:00", [eves]),
+            fact(dana, "timezone", "16:20", [danas]),
+            fact(eve, "timezone", "17:00", [eves]),
             fact(bob, "timezone", "21:00", [bobs]),
             fact(lee, "timezone", "04:00", [forwarded]),
             fact(lee, "timezone", "4 утра", [lees]),
@@ -789,10 +790,10 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       const places = (userId: number) => sql`SELECT value, zones FROM facts WHERE chat_id = ${chat} AND user_id = ${userId} AND kind = 'timezone' ORDER BY id`;
       // A clock alone puts nothing on a card: no offset, no «4 утра», no «UTC+7» the model worked out itself.
       expect(await places(lee.id)).toEqual([]);
-      // «Канада» narrows to the one zone that showed 14:42 then, the message joining its sources.
-      expect(await places(dana.id)).toEqual([{ value: "Канада", zones: ["America/Toronto"] }]);
+      // «Индонезия» narrows to the one zone that showed 16:20 then, the message joining its sources.
+      expect(await places(dana.id)).toEqual([{ value: "Индонезия", zones: ["Asia/Jakarta"] }]);
       expect((await sql`SELECT source_msg_ids FROM facts WHERE chat_id = ${chat} AND user_id = ${dana.id}`)[0]).toEqual({ source_msg_ids: [danas] });
-      expect(await places(eve.id)).toEqual([{ value: "Канада", zones: canada.slice(1, -1).split(",") }]);
+      expect(await places(eve.id)).toEqual([{ value: "Индонезия", zones: indonesia.slice(1, -1).split(",") }]);
       // A clock that disagrees with a place of one zone leaves the place as it is.
       expect(await places(bob.id)).toEqual([{ value: "Китай", zones: ["Asia/Shanghai"] }]);
     });
