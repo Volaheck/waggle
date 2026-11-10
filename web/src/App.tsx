@@ -1,6 +1,9 @@
 import {
+  createContext,
   useCallback,
+  useContext,
   useEffect,
+  useMemo,
   useLayoutEffect,
   useRef,
   useState,
@@ -15,26 +18,37 @@ import {
   api,
   ApiError,
   chatFromLaunch,
+  deviceTimeZone,
   FACT_LABELS,
   getCurrentChat,
   haptic,
+  knownZones,
   openTelegram,
+  sameClock,
+  searchZones,
   screenFromLaunch,
   setCurrentChat,
   STATUSES,
   tg,
   tgAlert,
   tgConfirm,
+  usableZone,
+  zoneLabel,
   type ChatInfo,
   type ChronicleEntry,
   type Fact,
   type Memo,
   type PersonSummary,
   type Project,
+  type TimeZoneInfo,
 } from "./api";
 import { HexBackdrop, HexMark } from "./HexBackdrop";
 
 type Go = (to: string) => void;
+
+/** The zone the viewer's times are shown in: the one their card in this chat goes by, else the device's own. */
+const ZoneContext = createContext<{ zone: string | undefined; setZone: (zone: string | undefined) => void; seeded: number }>({ zone: undefined, setZone: () => {}, seeded: 0 });
+const useZone = () => useContext(ZoneContext).zone;
 
 // ---------- icons: one language with the landing — 24 grid, 1.8 stroke, round caps ----------
 
@@ -1324,6 +1338,7 @@ function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
   const { data, error, reload } = useLoad<ProjectResponse>(`/projects/${slug}`);
   // Whether this is the viewer's own project (authors can't vote for it) comes from their card, asked once.
   const viewer = useLoad<MeResponse>("/me", { once: true });
+  const timeZone = useZone();
   const [editing, setEditing] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [result, setResult] = useState<{ voted: boolean; votes: number } | null>(null);
@@ -1423,7 +1438,7 @@ function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
         )}
         <div className="stats">
           <Stat value={project.signals_count ?? project.recent_signals.length} label="signals" />
-          <Stat value={project.last_activity_at ? new Date(project.last_activity_at).toLocaleDateString("en-GB", { day: "numeric", month: "short" }) : "—"} label="active" />
+          <Stat value={project.last_activity_at ? new Date(project.last_activity_at).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone }) : "—"} label="active" />
           <Stat value={project.authors.length} label={project.authors.length === 1 ? "author" : "authors"} />
         </div>
         <div className="hero-actions">
@@ -1777,10 +1792,11 @@ const KIND_TONE: Record<ChronicleEntry["kind"], string> = {
 
 function ChronicleCard({ entry, index, compact }: { entry: ChronicleEntry; index: number; compact: boolean }) {
   const url = entry.url;
+  const timeZone = useZone();
   const when = new Date(entry.period_to);
   const stamp = compact
-    ? when.toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })
-    : when.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+    ? when.toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone })
+    : when.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone });
   return (
     <Card index={index} tap={url !== null} className="entry">
       <div className="entry-head">
@@ -1839,29 +1855,37 @@ const DAYS = ["1", "3", "7", "30"] as const;
 type Days = (typeof DAYS)[number];
 const PERIOD: Record<Days, string> = { "1": "24 hours", "3": "3 days", "7": "week", "30": "month" };
 
-const dayKey = (date: Date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+/** YYYY-MM-DD in the viewer's zone. */
+const dayKey = (date: Date, timeZone: string | undefined) => date.toLocaleDateString("en-CA", { timeZone });
 
-function dayLabel(date: Date): string {
-  const now = new Date();
-  if (dayKey(date) === dayKey(now)) return "today";
-  if (dayKey(date) === dayKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))) return "yesterday";
-  return date.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
+/** The day before a YYYY-MM-DD. */
+function dayBefore(key: string): string {
+  const [year, month, day] = key.split("-").map(Number) as [number, number, number];
+  return new Date(Date.UTC(year, month - 1, day - 1)).toISOString().slice(0, 10);
 }
 
-/** Local days, newest first; inside a day the chronicler's importance order stays. */
-function groupByDay(entries: ChronicleEntry[]): { key: string; label: string; entries: ChronicleEntry[] }[] {
+function dayLabel(date: Date, timeZone: string | undefined): string {
+  const today = dayKey(new Date(), timeZone);
+  if (dayKey(date, timeZone) === today) return "today";
+  if (dayKey(date, timeZone) === dayBefore(today)) return "yesterday";
+  return date.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", timeZone });
+}
+
+/** The viewer's days, newest first; inside a day the chronicler's importance order stays. */
+function groupByDay(entries: ChronicleEntry[], timeZone: string | undefined): { key: string; label: string; entries: ChronicleEntry[] }[] {
   const groups = new Map<string, { key: string; label: string; entries: ChronicleEntry[] }>();
   for (const entry of entries) {
     const date = new Date(entry.period_to);
-    const key = dayKey(date);
+    const key = dayKey(date, timeZone);
     const group = groups.get(key);
     if (group) group.entries.push(entry);
-    else groups.set(key, { key, label: dayLabel(date), entries: [entry] });
+    else groups.set(key, { key, label: dayLabel(date, timeZone), entries: [entry] });
   }
   return [...groups.values()].sort((a, b) => b.key.localeCompare(a.key));
 }
 
 function ChronicleScreen() {
+  const timeZone = useZone();
   const [days, setDays] = useRemembered<Days>("chronicle.days", "3");
   const { data, error, reload, pending, dataPath } = useLoad<{ entries: ChronicleEntry[] }>(`/chronicle?days=${days}`);
   if (!data && error) return <LoadState error={error} retry={reload} skeleton="cards" />;
@@ -1903,7 +1927,7 @@ function ChronicleScreen() {
               }
             />
           ) : (
-            groupByDay(entries).map((group) => {
+            groupByDay(entries, timeZone).map((group) => {
               const offset = shown;
               shown += group.entries.length;
               return (
@@ -1935,17 +1959,18 @@ const NOTE_ERRORS: Record<string, string> = {
   forbidden_project: "only the project’s authors write notes on it",
 };
 
-const noteDate = (iso: string) => new Date(iso).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+const noteDate = (iso: string, timeZone: string | undefined) => new Date(iso).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone });
 
 /** Notes people wrote themselves, newest first, each dated, with a delete button where the viewer may use it. */
 function NoteList({ memos, canDelete, onDelete, busy, byline }: { memos: Memo[]; canDelete: (memo: Memo) => boolean; onDelete: (memo: Memo) => void; busy: number | null; byline?: (memo: Memo) => string | null }) {
+  const timeZone = useZone();
   return (
     <>
       {memos.map((memo) => (
         <div key={memo.id} className="edit-row note-row">
           <div className="grow">
             <span lang={langOf(memo.text)}>{memo.text}</span>
-            <span className="note-meta">{[byline?.(memo), noteDate(memo.created_at)].filter(Boolean).join(" · ")}</span>
+            <span className="note-meta">{[byline?.(memo), noteDate(memo.created_at, timeZone)].filter(Boolean).join(" · ")}</span>
           </div>
           {canDelete(memo) && (
             <div className="row-actions">
@@ -2024,6 +2049,127 @@ interface MeResponse {
   facts: Fact[];
   projects: Project[];
   memos?: Memo[];
+  /** None for someone who opted out. */
+  time_zone?: TimeZoneInfo | null;
+}
+
+const CLOCK_FROM: Record<TimeZoneInfo["from"], string> = {
+  chat: "you set it in the chat",
+  app: "you set it here",
+  device: "taken from your device",
+  card: "from the place on your card",
+  chat_zone: "the chat’s — you haven’t set one",
+};
+
+/** «06:30». */
+const clockNow = (zone: string) => new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: usableZone(zone) });
+
+/**
+ * The zone the member's times go by: the one they chose or their device gave, else the place on their card, else the
+ * chat's. A change shows a toast with Undo, the Mini App's receipt.
+ */
+function TimeZoneSection({ info, onChanged, onToast }: { info: TimeZoneInfo; onChanged: () => void; onToast: (toast: ToastState) => void }) {
+  const { setZone } = useContext(ZoneContext);
+  const [picking, setPicking] = useState(false);
+  const [query, setQuery] = useState("");
+  const [busy, setBusy] = useState(false);
+  // The clock above the zone keeps time while the card is open.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => setTick((tick) => tick + 1), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const zones = useMemo(knownZones, []);
+  const device = usableZone(deviceTimeZone());
+  const found = useMemo(() => searchZones(query, zones), [query, zones]);
+
+  type Before = { zone: string | null; source: TimeZoneInfo["source"]; set_at: string | null };
+  const put = async (zone: string | null, restore?: Before) => {
+    setBusy(true);
+    try {
+      const result = await api<{ before: Before | null; time_zone: TimeZoneInfo | null }>("/me/time-zone", {
+        method: "PUT",
+        body: restore ? { zone, source: restore.source, set_at: restore.set_at } : { zone },
+      });
+      haptic("success");
+      setZone(usableZone(result.time_zone?.zone));
+      onChanged();
+      return result;
+    } catch {
+      haptic("error");
+      onToast({ id: Date.now(), text: "Couldn’t update — try again" });
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  };
+  const choose = async (zone: string | null) => {
+    const result = await put(zone);
+    if (!result) return;
+    setPicking(false);
+    setQuery("");
+    const before = result.before;
+    onToast({ id: Date.now(), text: zone ? `Time zone: ${zoneLabel(zone)}` : "Time zone cleared", undo: before ? () => void put(before.zone, before) : undefined });
+  };
+
+  const place = info.place ? `“${info.place}”` : "";
+  const line = info.unclear ? `${place} spans ${info.unclear} time zones — pick yours` : info.from === "card" ? `${CLOCK_FROM.card}: ${place}` : CLOCK_FROM[info.from];
+  // The device's zone is offered until the chosen one keeps its time: a clock that only falls back to it is not set.
+  const deviceOffered = device !== undefined && !(info.chosen && sameClock(device, info.chosen));
+  const offers = [...new Set([...(info.unclear ? info.choices : []), ...(deviceOffered ? [device] : [])])];
+  return (
+    <Card className="form">
+      <div className="tz-now">
+        <span className="tz-time">{clockNow(info.zone)}</span>
+        <span className="tz-zone">{zoneLabel(info.zone)}</span>
+      </div>
+      <div className={cx("hint", info.unclear !== null && "tz-unclear")}>{line}</div>
+      {offers.length > 0 && (
+        <div className="tz-offers" role="group" aria-label="Suggested time zones">
+          {offers.map((zone) => (
+            <button key={zone} className="pick" disabled={busy} onClick={() => void choose(zone)}>
+              {zone === device && !info.choices.includes(zone) ? `This device: ${zoneLabel(zone)}` : zoneLabel(zone)}
+            </button>
+          ))}
+        </div>
+      )}
+      {picking ? (
+        <>
+          <label className="field">
+            <span className="field-label">Find a zone</span>
+            <input className="input" placeholder="e.g. Toronto, Jakarta, Warsaw" enterKeyHint="search" autoFocus value={query} onChange={(event) => setQuery(event.target.value)} />
+          </label>
+          {found.length > 0 && (
+            <div className="tz-found">
+              {found.map((zone) => (
+                <button key={zone} className="pick" disabled={busy} onClick={() => void choose(zone)}>
+                  {zoneLabel(zone)}
+                </button>
+              ))}
+            </div>
+          )}
+          {query.trim() && found.length === 0 && <div className="hint">No such zone — try the nearest big city.</div>}
+          <div className="form-actions">
+            <button className="btn outline small" onClick={() => setPicking(false)}>
+              Cancel
+            </button>
+          </div>
+        </>
+      ) : (
+        <div className="form-actions">
+          <button className="btn small" disabled={busy} onClick={() => setPicking(true)}>
+            Choose a zone
+          </button>
+          {info.chosen && (
+            <button className="btn outline small" disabled={busy} onClick={() => void choose(null)}>
+              Clear
+            </button>
+          )}
+        </div>
+      )}
+      <div className="hint">“Tomorrow” and “tonight” in your messages go by it. You can also ask the bot in the chat: “set my time zone to Toronto”.</div>
+    </Card>
+  );
 }
 
 const MANUAL_KINDS = ["role", "stack", "expertise", "interest", "looking_for", "can_help", "link", "timezone"] as const;
@@ -2073,6 +2219,19 @@ function FactGroups({ facts, actions }: { facts: Fact[]; actions: (fact: Fact) =
 
 function MeScreen({ go }: { go: Go }) {
   const { data, error, reload } = useLoad<MeResponse>("/me");
+  const { seeded, setZone } = useContext(ZoneContext);
+  // A device's zone that lands while the card is open shows on it.
+  const seenSeed = useRef(seeded);
+  useEffect(() => {
+    if (seeded === seenSeed.current) return;
+    seenSeed.current = seeded;
+    reload();
+  }, [seeded, reload]);
+  // Every fresh card says which zone the other screens show times in: a change made in the chat arrives here too.
+  const cardZone = data ? (data.time_zone?.zone ?? null) : undefined;
+  useEffect(() => {
+    if (cardZone !== undefined) setZone(usableZone(cardZone));
+  }, [cardZone, setZone]);
   const [draft, setDraft] = useState<string | null>(null);
   const [kind, setKind] = useState<ManualKind>("stack");
   const [value, setValue] = useState("");
@@ -2216,6 +2375,12 @@ function MeScreen({ go }: { go: Go }) {
               )}
             </Card>
           </Section>
+
+          {data.time_zone && (
+            <Section label="time zone" index={4}>
+              <TimeZoneSection info={data.time_zone} onChanged={reload} onToast={setToast} />
+            </Section>
+          )}
 
           <Section label="notes" index={4}>
             <Card className="dossier">
@@ -2447,6 +2612,11 @@ export function App() {
   useTelegramTheme();
   const chats = useLoad<{ chats: ChatInfo[]; current: string | null }>("/chats");
   const [chat, setChat] = useState<string | null>(chatFromLaunch());
+  const [zone, setZone] = useState<string | undefined>();
+  // Bumped when the device's zone lands on the card, so a card already on screen shows it.
+  const [seededTimes, setSeededTimes] = useState(0);
+  const zoneValue = useMemo(() => ({ zone, setZone, seeded: seededTimes }), [zone, seededTimes]);
+  const seeded = useRef(new Set<string>());
 
   useEffect(() => {
     tg?.ready();
@@ -2476,6 +2646,38 @@ export function App() {
   const [, section, param] = path.split("/");
   const known = chats.data?.chats.some((candidate) => candidate.key === chat) ?? false;
   const ready = chats.data !== null && known;
+
+  // The first visit takes the device's zone onto a card that never had one (the server keeps one already there), and
+  // every visit, and every return to the app, learns which zone this chat shows the member's times in. A request that
+  // fails is made again on the next return; until then the device's own clock shows the times.
+  useEffect(() => {
+    if (!ready || !chat) return;
+    let current = true;
+    const sync = () => {
+      const first = !seeded.current.has(chat);
+      const request = first
+        ? api<{ seeded?: boolean; time_zone: TimeZoneInfo | null }>("/me/time-zone/device", { method: "POST", body: { zone: deviceTimeZone() } })
+        : api<{ seeded?: boolean; time_zone: TimeZoneInfo | null }>("/me/time-zone");
+      request
+        .then((result) => {
+          if (!current) return;
+          seeded.current.add(chat);
+          setZone(usableZone(result.time_zone?.zone));
+          if (result.seeded) setSeededTimes((times) => times + 1);
+        })
+        .catch(() => undefined);
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") sync();
+    };
+    setZone(undefined);
+    sync();
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      current = false;
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [ready, chat]);
   // The chat the effect above is settling on; the switcher must not open just because that effect hasn't run yet.
   const settled = chats.data && !known ? chats.data.current : chat;
   let screen: ReactNode;
@@ -2492,47 +2694,49 @@ export function App() {
 
   const activeTab = section === "u" ? "/people" : section === "p" ? "/projects" : `/${section || "people"}`;
   return (
-    <div className="app">
-      <HexBackdrop />
-      <header className="topbar">
-        <span className="brand">
-          <HexMark />
-          waggle
-        </span>
-        {chats.data && (
-          <ChatSwitcher
-            chats={chats.data.chats}
-            current={settled}
-            onPick={(key) => {
-              setCurrentChat(key);
-              setChat(key);
-              go("/people");
-            }}
-          />
-        )}
-      </header>
-      <main key={`${chat}:${path}`} className={cx("screen", kind === "back" && "instant")}>
-        {screen}
-      </main>
-      {ready && (
-        <nav className="tabs" aria-label="Sections">
-          {TABS.map(([to, icon, label]) => (
-            <button
-              key={to}
-              className={cx("tab", activeTab === to && "active")}
-              aria-current={activeTab === to ? "page" : undefined}
-              onClick={() => {
-                haptic("select");
-                if (activeTab === to && depth === 1) window.scrollTo({ top: 0, behavior: reducedMotion() ? "auto" : "smooth" });
-                else go(to);
+    <ZoneContext.Provider value={zoneValue}>
+      <div className="app">
+        <HexBackdrop />
+        <header className="topbar">
+          <span className="brand">
+            <HexMark />
+            waggle
+          </span>
+          {chats.data && (
+            <ChatSwitcher
+              chats={chats.data.chats}
+              current={settled}
+              onPick={(key) => {
+                setCurrentChat(key);
+                setChat(key);
+                go("/people");
               }}
-            >
-              {icon}
-              {label}
-            </button>
-          ))}
-        </nav>
-      )}
-    </div>
+            />
+          )}
+        </header>
+        <main key={`${chat}:${path}`} className={cx("screen", kind === "back" && "instant")}>
+          {screen}
+        </main>
+        {ready && (
+          <nav className="tabs" aria-label="Sections">
+            {TABS.map(([to, icon, label]) => (
+              <button
+                key={to}
+                className={cx("tab", activeTab === to && "active")}
+                aria-current={activeTab === to ? "page" : undefined}
+                onClick={() => {
+                  haptic("select");
+                  if (activeTab === to && depth === 1) window.scrollTo({ top: 0, behavior: reducedMotion() ? "auto" : "smooth" });
+                  else go(to);
+                }}
+              >
+                {icon}
+                {label}
+              </button>
+            ))}
+          </nav>
+        )}
+      </div>
+    </ZoneContext.Provider>
   );
 }

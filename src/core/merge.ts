@@ -60,8 +60,8 @@ export async function mergeSeedUser(sql: Sql, seedUserId: number, intoUserId: nu
     if (seed.tg_id !== null) throw new Error("This card is already linked to a Telegram account");
 
     await tx`
-      INSERT INTO members (chat_id, user_id, tagline, tagline_manual, opted_out, first_seen_at, last_message_at, left_at)
-      SELECT chat_id, ${intoUserId}, tagline, tagline_manual, opted_out, first_seen_at, last_message_at, left_at
+      INSERT INTO members (chat_id, user_id, tagline, tagline_manual, opted_out, first_seen_at, last_message_at, left_at, time_zone, time_zone_source, time_zone_set_at)
+      SELECT chat_id, ${intoUserId}, tagline, tagline_manual, opted_out, first_seen_at, last_message_at, left_at, time_zone, time_zone_source, time_zone_set_at
       FROM members WHERE user_id = ${seedUserId}
       ON CONFLICT (chat_id, user_id) DO UPDATE SET
         tagline = CASE WHEN members.opted_out OR excluded.opted_out THEN NULL
@@ -70,7 +70,12 @@ export async function mergeSeedUser(sql: Sql, seedUserId: number, intoUserId: nu
         tagline_manual = NOT (members.opted_out OR excluded.opted_out) AND (members.tagline_manual OR excluded.tagline_manual),
         opted_out = members.opted_out OR excluded.opted_out,
         first_seen_at = least(members.first_seen_at, excluded.first_seen_at),
-        last_message_at = greatest(members.last_message_at, excluded.last_message_at)`;
+        last_message_at = greatest(members.last_message_at, excluded.last_message_at),
+        time_zone = CASE WHEN members.opted_out OR excluded.opted_out THEN NULL WHEN members.time_zone IS NULL THEN excluded.time_zone ELSE members.time_zone END,
+        time_zone_source = CASE WHEN members.opted_out OR excluded.opted_out THEN NULL WHEN members.time_zone IS NULL THEN excluded.time_zone_source ELSE members.time_zone_source END,
+        time_zone_set_at = CASE WHEN members.opted_out OR excluded.opted_out THEN NULL
+                                WHEN members.time_zone IS NULL AND excluded.time_zone IS NOT NULL THEN excluded.time_zone_set_at
+                                ELSE coalesce(members.time_zone_set_at, excluded.time_zone_set_at) END`;
     await tx`
       UPDATE facts f SET user_id = ${intoUserId}
       WHERE f.user_id = ${seedUserId}

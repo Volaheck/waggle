@@ -72,7 +72,7 @@ Notes (notes) — one short line each, naming the people in it by their names fr
 Rules:
 - Messages addressed to the bot (↩bot, mentioning it or answered by it) give only bouts, bait, corrections and consent objections. Forwarded posts give no note: they say nothing about whoever forwarded them.
 - person and people are refs; the person must be the author of one of the source messages, except in a correction or a bit.
-- due_at — YYYY-MM-DD: when a prediction can be checked or a claim falls due, worked out from the message's date (the far end of a range); null when it gives none.
+- due_at — YYYY-MM-DD: when a prediction can be checked or a claim falls due, worked out from the message's date (the far end of a range); null when it gives none. The message's date is the line above it, or its author's own day when the message shows one ([123, their day …]): a «tomorrow» from someone on another day than the chat is their tomorrow.
 - <notes> lists the current notes. When one changes (a claim kept or dropped, a prediction settled, a new twist of a bit, a changed stance), write it anew with replaces = its number (n7 → 7) instead of adding another; never repeat a note that still holds.
 - Never a note on politics, war or countries, nationality or ethnicity, religion, health (sleep and mental state included), personal money (income, debts, savings, wealth, any amounts, banking), jobs, employers and career changes, private life, family, dating or orientation, addresses, citizenship or documents, death, conflicts between members, logins, passwords or other secrets.
 - The chat is full of irony and hyperbole: a one-off remark is not a stance, and a joke is not a claim.

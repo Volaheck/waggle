@@ -331,6 +331,16 @@ select.input { appearance: none; -webkit-appearance: none; padding-right: 38px; 
 .field-foot + .form-actions { margin-top: 8px; }
 .form-error { margin-top: 10px; font: 12px/1.45 var(--font-mono); color: var(--danger-ink); }
 .form-error.with-action { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.tz-now { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; margin-bottom: 4px; }
+.tz-time { font: 700 26px/1.1 var(--font-mono); font-variant-numeric: tabular-nums; color: var(--text); }
+.tz-zone { font: 600 12px var(--font-mono); color: var(--muted); overflow-wrap: anywhere; }
+.tz-unclear { color: var(--neon-ink); }
+.tz-offers, .tz-found { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+.tz-found { max-height: 220px; overflow-y: auto; margin-top: -4px; }
+.tz-offers .pick, .tz-found .pick { text-transform: none; letter-spacing: 0; }
+.form .hint + .form-actions, .tz-offers + .form-actions { margin-top: 12px; }
+.form-actions + .hint { margin-top: 12px; }
+.form .hint + .field { margin-top: 12px; }
 .saved { display: inline-flex; align-items: center; gap: 6px; font: 600 11px var(--font-mono); letter-spacing: .08em; text-transform: uppercase; color: var(--green); }
 .saved svg { width: 14px; height: 14px; }
 .pick { flex: none; display: inline-flex; align-items: center; gap: 6px; min-height: 34px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: 9px; background: transparent; color: var(--muted); font: 600 11px var(--font-mono); letter-spacing: .06em; text-transform: uppercase; cursor: pointer; transition: border-color .15s ease, background-color .15s ease, color .15s ease; }

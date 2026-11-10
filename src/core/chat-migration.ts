@@ -77,14 +77,18 @@ async function carryStanding(tx: Queryable, oldChatId: number, newChatId: number
 /** Moves everything stored under the old id. Rows the new id already has are merged, never duplicated; a rerun moves nothing. */
 async function moveChatData(tx: Queryable, from: number, to: number): Promise<ChatMigration["moved"]> {
   const members = await tx`
-    INSERT INTO members (chat_id, user_id, tagline, tagline_manual, opted_out, first_seen_at, last_message_at, left_at)
-    SELECT ${to}, user_id, tagline, tagline_manual, opted_out, first_seen_at, last_message_at, left_at FROM members WHERE chat_id = ${from}
+    INSERT INTO members (chat_id, user_id, tagline, tagline_manual, opted_out, first_seen_at, last_message_at, left_at, time_zone, time_zone_source, time_zone_set_at)
+    SELECT ${to}, user_id, tagline, tagline_manual, opted_out, first_seen_at, last_message_at, left_at, time_zone, time_zone_source, time_zone_set_at FROM members WHERE chat_id = ${from}
     ON CONFLICT (chat_id, user_id) DO UPDATE SET
       tagline = CASE WHEN members.tagline IS NULL OR (NOT members.tagline_manual AND excluded.tagline_manual) THEN excluded.tagline ELSE members.tagline END,
       tagline_manual = members.tagline_manual OR excluded.tagline_manual,
       opted_out = members.opted_out OR excluded.opted_out,
       first_seen_at = least(members.first_seen_at, excluded.first_seen_at),
-      last_message_at = greatest(members.last_message_at, excluded.last_message_at)`;
+      last_message_at = greatest(members.last_message_at, excluded.last_message_at),
+      time_zone = CASE WHEN members.time_zone IS NULL THEN excluded.time_zone ELSE members.time_zone END,
+      time_zone_source = CASE WHEN members.time_zone IS NULL THEN excluded.time_zone_source ELSE members.time_zone_source END,
+      time_zone_set_at = CASE WHEN members.time_zone IS NULL AND excluded.time_zone IS NOT NULL THEN excluded.time_zone_set_at
+                              ELSE coalesce(members.time_zone_set_at, excluded.time_zone_set_at) END`;
   await tx`DELETE FROM members WHERE chat_id = ${from}`;
 
   const messages = await tx`
@@ -122,6 +126,7 @@ async function moveChatData(tx: Queryable, from: number, to: number): Promise<Ch
   await tx`DELETE FROM facts f USING members m WHERE f.chat_id = ${to} AND m.chat_id = ${to} AND m.user_id = f.user_id AND m.opted_out`;
   await tx`DELETE FROM rejected_facts r USING members m WHERE r.chat_id = ${to} AND m.chat_id = ${to} AND m.user_id = r.user_id AND m.opted_out`;
   await tx`UPDATE members SET tagline = NULL, tagline_manual = false WHERE chat_id = ${to} AND opted_out AND tagline IS NOT NULL`;
+  await tx`UPDATE members SET time_zone = NULL, time_zone_source = NULL, time_zone_set_at = NULL WHERE chat_id = ${to} AND opted_out AND time_zone IS NOT NULL`;
 
   // Projects keep their ids, so a project's aliases only change chats; topics keep theirs too, so do the notes' links to them.
   await moveAliases(tx, from, to);

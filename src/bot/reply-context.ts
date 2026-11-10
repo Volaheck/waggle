@@ -18,6 +18,7 @@ import {
 import { slugify, transliterateName, truncate } from "../core/text.js";
 import { recurringThemes, wordTerms, type Theme } from "../core/themes.js";
 import { peopleOfChat, SERVICE_TG_IDS, type Person } from "../core/users.js";
+import { chatClocks, isoDayIn, localDay, localStamp, localTimeOf, offsetAt, zoneGap, zoneLabel, type MemberClock } from "../core/zones.js";
 import { skippedMessageIds } from "../worker/extract.js";
 import { realReply } from "./kit.js";
 
@@ -175,6 +176,8 @@ export interface Clock {
   timezone: string;
   /** YYYY-MM-DD in the display timezone. */
   today: string;
+  /** The zones of the members whose own clock is known: their messages show their time next to the chat's. */
+  authors?: Map<number, string>;
 }
 
 export const dayOf = (date: Date, timeZone: string) => date.toLocaleDateString("en-CA", { timeZone });
@@ -189,6 +192,13 @@ export function dateLabel(date: Date, clock: Clock): string {
 function timeLabel(date: Date, clock: Clock): string {
   const time = date.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: clock.timezone });
   return dayOf(date, clock.timezone) === clock.today ? time : `${dateLabel(date, clock)} ${time}`;
+}
+
+/** «, Wed 11 Nov 06:30 their time» for an author whose clock differs from the chat's then; nothing otherwise. */
+export function theirTime(date: Date, zone: string | undefined, chatZone: string): string {
+  if (!zone || offsetAt(zone, date) === offsetAt(chatZone, date)) return "";
+  const day = isoDayIn(date, zone) === isoDayIn(date, chatZone) ? "" : `${localDay(date, zone)} `;
+  return `, ${day}${localTimeOf(date, zone)} their time`;
 }
 
 export interface ContextMessage {
@@ -211,7 +221,8 @@ export function messageLine(row: ContextMessage, clock: Clock, max: number): str
   const forwarded = row.is_forward ? " [forwarded]" : "";
   const media = row.media_type ? ` [${row.media_type}]` : "";
   const text = line(row.text, max);
-  return `[${row.msg_id} ${timeLabel(row.sent_at, clock)}] ${author}${reply}${forwarded}${media}${text ? `: ${text}` : ""}`;
+  const theirs = row.from_bot || row.user_id === null ? "" : theirTime(row.sent_at, clock.authors?.get(row.user_id), clock.timezone);
+  return `[${row.msg_id} ${timeLabel(row.sent_at, clock)}${theirs}] ${author}${reply}${forwarded}${media}${text ? `: ${text}` : ""}`;
 }
 
 interface WaitingMessage extends ContextMessage {
@@ -375,7 +386,7 @@ export function aboutYouBlock(input: {
     "<about_you>",
     `You are ${safe(me.first_name)} (@${me.username}), the chat's chronicler bot; this answer is written by ${input.model}.`,
     owners.length ? `Your ${owners.length > 1 ? "owners, who built you and pay" : "owner, who built you and pays"} for you: ${owners.join("; ")}.` : "",
-    "You read the chat and keep the members' cards, the project catalog with its rating and the chronicle, and you answer when someone mentions you or replies to you. A member changes their own card, tagline, names and notes (about themselves or on a project of theirs) by asking you plainly in the chat: you do it and post a receipt with ↩️ Undo, and ↪️ Redo after an Undo; the Mini App (/app) does the same. Nobody changes anyone else's data, a project's catalog entry, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets. /forgetme erases what you know about a person.",
+    "You read the chat and keep the members' cards, the project catalog with its rating and the chronicle, and you answer when someone mentions you or replies to you. A member changes their own card, tagline, time zone, names and notes (about themselves or on a project of theirs) by asking you plainly in the chat: you do it and post a receipt with ↩️ Undo, and ↪️ Redo after an Undo; the Mini App (/app) does the same. Nobody changes anyone else's data, a project's catalog entry, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets. /forgetme erases what you know about a person.",
     entry
       ? `In the catalog you are the project ${safe(entry.project.name)}: #${entry.rank} of ${entry.total}, ${entry.project.score} rating points, ${entry.project.votes} vote(s).`
       : "",
@@ -666,19 +677,57 @@ function inFocusBlock(input: {
     : "";
 }
 
+const CLOCK_SOURCES: Record<MemberClock["source"], string> = {
+  chat: "they set it in the chat",
+  app: "they set it in the Mini App",
+  device: "from their device",
+  card: "from the place on their card",
+  chat_zone: "the chat's",
+};
+
+/** The day after `at` in a zone: «Thu 12 Nov». */
+function nextDay(at: Date, zone: string): string {
+  const [year, month, day] = isoDayIn(at, zone).split("-").map(Number) as [number, number, number];
+  return localDay(new Date(Date.UTC(year, month - 1, day + 1, 12)), "UTC");
+}
+
+/**
+ * The time now for the chat and for each person the question is about, by their own clock, with their today and
+ * tomorrow: what «завтра» means in their words. A place on a card that spans several zones leaves the clock unclear.
+ */
+export function localTimesBlock(focus: { person: Person; reason: FocusReason }[], clocks: Map<number, MemberClock>, chatZone: string, now: Date): string {
+  const chat = `- the chat: ${localStamp(now, chatZone)}, ${chatZone}; today ${localDay(now, chatZone)}, tomorrow ${nextDay(now, chatZone)}`;
+  const people = focus
+    .filter(({ person }) => !person.opted_out)
+    .map(({ person, reason }) => {
+      const who = `- ${safe(person.display_name)}${person.username ? ` (@${person.username})` : ""}, ${reason}`;
+      const clock = clocks.get(person.id);
+      if (clock?.unclear && clock.place) {
+        return `${who}: unknown: their card says «${safe(line(clock.place, 60))}», which spans ${clock.unclear} time zones, and they have set none, so the chat's time stands in; «поставь мне пояс <город>» sets theirs`;
+      }
+      if (!clock || clock.source === "chat_zone") return `${who}: the chat's time (no zone of their own)`;
+      const source = clock.source === "card" && clock.place ? `${CLOCK_SOURCES.card}, «${safe(line(clock.place, 60))}»` : CLOCK_SOURCES[clock.source];
+      const gap = zoneGap(clock.zone, chatZone, now);
+      return `${who}: ${localStamp(now, clock.zone)}, ${zoneLabel(clock.zone)} (${source}), ${gap ? `${gap} the chat` : "the chat's time"}; their today ${localDay(now, clock.zone)}, their tomorrow ${nextDay(now, clock.zone)}`;
+    });
+  return `<local_times note="the time now by each one's own clock; the days and times people write («завтра», «вечером», «в 10») are theirs">\n${[chat, ...people].join("\n")}\n</local_times>`;
+}
+
 /**
  * Everything the app knows about the chat, as the reply prompt's data: the chat's memory first, the same for every
  * question, then what the chronicler has not processed yet, then all that depends on the question.
  */
 export async function buildReplyContext(sql: Sql, question: Question, options: ReplyContextOptions): Promise<PromptPart[]> {
   const { chatId, message, me } = question;
-  const clock: Clock = { timezone: options.timezone, today: dayOf(new Date(), options.timezone) };
+  const now = new Date();
+  const clock: Clock = { timezone: options.timezone, today: dayOf(now, options.timezone) };
   const asked = questionText(message, me);
   const aboutConversation = refersToConversation(asked);
   const replied = realReply(message);
   // Messages the chronicler skipped because the model refused them are kept out here too.
   const skipped = await skippedMessageIds(sql, chatId);
-  const [people, facts, projects, chronicle, latest, waiting, chain, aliases, former, owners, chatNotes] = await Promise.all([
+  const [clocks, people, facts, projects, chronicle, latest, waiting, chain, aliases, former, owners, chatNotes] = await Promise.all([
+    chatClocks(sql, chatId, options.timezone),
     peopleOfChat(sql, chatId),
     sql<{ user_id: number; kind: string; value: string }[]>`
       SELECT user_id, kind, value FROM facts
@@ -723,6 +772,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
       LIMIT 100`,
   ]);
 
+  clock.authors = new Map([...clocks].filter(([, own]) => own.source !== "chat_zone").map(([userId, own]) => [userId, own.zone]));
   const inContext = people.slice(0, MAX_MEMBERS);
   const aliasesOf = groupBy(
     aliases.filter((alias) => alias.user_id !== null),
@@ -956,6 +1006,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
       names,
       clock,
     }),
+    localTimesBlock(focusPeople, clocks, options.timezone, now),
     aboutConversation
       ? `<current_conversation note="everything since the last pause of 25 minutes or more, oldest first">\n${conversationLines.join("\n") || "(none)"}\n</current_conversation>`
       : `<recent_messages>\n${conversationLines.join("\n") || "(none)"}\n</recent_messages>`,

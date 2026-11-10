@@ -15,6 +15,7 @@ import {
 import { addUserProject, canEditProject, projectsOfUser, updateProject, type ProjectFields } from "../core/projects.js";
 import { escapeHtml, extractUrls, isRepoHost, safeHttpUrl } from "../core/text.js";
 import { forgetUser, getPerson, setOptOut, setTagline } from "../core/users.js";
+import { localTimeOf, memberClock, zoneLabel, type MemberClock } from "../core/zones.js";
 import { countOf, factsWithSources, personCard, userHeader } from "./format.js";
 import {
   decodeChat,
@@ -68,6 +69,21 @@ export interface ProfileHandlers {
     scope: Scope,
     edit?: boolean,
   ) => Promise<void>;
+}
+
+const CLOCK_FROM: Record<MemberClock["source"], string> = {
+  chat: "you set it in the chat",
+  app: "you set it in the Mini App",
+  device: "taken from your device",
+  card: "from the place on your card",
+  chat_zone: "the chat's: you haven't set one",
+};
+
+/** «🕐 Time zone: Asia/Shanghai, 06:30 now (from the place on your card: «Китай»)». */
+function clockLine(clock: MemberClock): string {
+  const place = clock.place ? `«${escapeHtml(clock.place)}»` : "";
+  const from = clock.unclear ? `${place} spans ${clock.unclear} time zones: tell me your city in the chat or pick one in /app` : clock.source === "card" ? `${CLOCK_FROM.card}: ${place}` : CLOCK_FROM[clock.source];
+  return `🕐 Time zone: ${escapeHtml(zoneLabel(clock.zone))}, ${localTimeOf(new Date(), clock.zone)} now (${from})`;
 }
 
 export function registerProfile(kit: BotKit): ProfileHandlers {
@@ -183,7 +199,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
 
   async function knowledgeScreen(ctx: BotContext, scope: Scope, edit: boolean) {
     const { person, chatId, user } = scope;
-    const [facts, memos] = await Promise.all([ownFacts(sql, chatId, user.id), ownMemos(sql, chatId, user.id)]);
+    const [facts, memos, clock] = await Promise.all([ownFacts(sql, chatId, user.id), ownMemos(sql, chatId, user.id), memberClock(sql, chatId, user.id, kit.config.DISPLAY_TIMEZONE)]);
     const [stats] = await sql<{ messages: number; first: Date | null }[]>`
       SELECT count(*)::int AS messages, min(sent_at) AS first FROM messages WHERE chat_id = ${chatId} AND user_id = ${user.id}`;
     const text = [
@@ -191,7 +207,8 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
       person.tagline
         ? `One-liner: ${escapeHtml(person.tagline)}${person.tagline_manual ? " ✍️" : ""}`
         : "No one-liner",
-      `Messages in the archive of ${await chatTitle(chatId)}: ${stats?.messages ?? 0}${stats?.first ? ` (since ${stats.first.toLocaleDateString("en-GB")})` : ""}`,
+      clockLine(clock),
+      `Messages in the archive of ${await chatTitle(chatId)}: ${stats?.messages ?? 0}${stats?.first ? ` (since ${stats.first.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: clock.zone })})` : ""}`,
       "",
       "<b>Facts</b> (✍️ — added by you, 🙈 — hidden, numbers — source messages):",
       factsWithSources(facts, chatId),

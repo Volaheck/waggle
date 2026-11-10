@@ -35,6 +35,8 @@ const EnvSchema = z.object({
   MONTHLY_LLM_BUDGET_USD: z.coerce.number().default(60),
   /** Default cap per chat, for the same; an owner can set another one for a chat. */
   CHAT_MONTHLY_BUDGET_USD: z.coerce.number().default(20),
+  /** Places the places on cards and in requests in their time zones («Китай» → Asia/Shanghai). */
+  PLACE_ZONES_MODEL: z.string().default("claude-haiku-5-5"),
   /** The model that answers members who mention the bot or reply to it. */
   REPLY_MODEL: z.string().default("claude-haiku-5-5"),
   /** Cap for those answers across all chats, on top of the caps above; 0 turns them off. */

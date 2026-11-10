@@ -54,6 +54,7 @@ if (relinked) console.log(`[extract] relinked ${relinked} chronicle topic(s) tha
 for (const [name, model] of [
   ["EXTRACTION_MODEL", config.EXTRACTION_MODEL],
   ["REPLY_MODEL", config.REPLY_MODEL],
+  ["PLACE_ZONES_MODEL", config.PLACE_ZONES_MODEL],
   ["REPLY_PREMIUM_MODEL", config.REPLY_PREMIUM_MODEL],
 ] as const) {
   if (config.ANTHROPIC_API_KEY && !isPricedModel(model)) console.warn(`[llm] no price known for ${name} “${model}”: its calls are counted at the highest known rates`);
@@ -79,6 +80,7 @@ const app = createApi({
   webDistDir: config.WEB_DIST_DIR,
   devLogin,
   avatars: new AvatarCache(bot.api, config.BOT_TOKEN),
+  chatZone: config.DISPLAY_TIMEZONE,
 });
 
 const webhook = config.BOT_MODE === "webhook" ? telegramWebhook(bot, config.WEBHOOK_SECRET!) : undefined;

@@ -153,10 +153,12 @@ export async function proposeFact(sql: Queryable, fact: ProposedFact): Promise<P
       const nextStatus = fact.source === "user" ? "manual" : existing.status === "deprecated" ? "auto" : existing.status;
       // A person's own wording replaces the chronicler's; otherwise the existing wording stays.
       const nextValue = fact.source === "user" ? value : existing.value;
+      // A place worded anew is placed in its time zones anew (src/core/zones.ts).
       await tx`
         UPDATE facts
         SET confidence = ${nextConfidence}, source_msg_ids = ${mergedSources}, status = ${nextStatus},
-            value = ${nextValue}, value_norm = ${normalizeValue(nextValue)}, updated_at = now()
+            value = ${nextValue}, value_norm = ${normalizeValue(nextValue)}, updated_at = now(),
+            zones = CASE WHEN value = ${nextValue} THEN zones END
         WHERE id = ${existing.id}`;
       return "reinforced";
     }
@@ -314,7 +316,8 @@ export async function rewriteFact(sql: Queryable, factId: number, value: string,
     } else {
       if (twin) await tx`DELETE FROM facts WHERE id = ${twin.id}`;
       await tx`
-        UPDATE facts SET value = ${next}, value_norm = ${nextNorm}, source_msg_ids = ${unionSources(fact.source_msg_ids, sourceMsgIds)}, updated_at = now()
+        UPDATE facts SET value = ${next}, value_norm = ${nextNorm}, source_msg_ids = ${unionSources(fact.source_msg_ids, sourceMsgIds)}, updated_at = now(),
+               zones = CASE WHEN value = ${next} THEN zones END
         WHERE id = ${factId}`;
     }
     await tx`
@@ -364,7 +367,8 @@ export async function mergeFacts(sql: Queryable, factIds: number[], value: strin
       }
     } else {
       await tx`
-        UPDATE facts SET value = ${next}, value_norm = ${nextNorm}, source_msg_ids = ${sources}, confidence = ${confidence}, updated_at = now()
+        UPDATE facts SET value = ${next}, value_norm = ${nextNorm}, source_msg_ids = ${sources}, confidence = ${confidence}, updated_at = now(),
+               zones = CASE WHEN value = ${next} THEN zones END
         WHERE id = ${keeper.id}`;
     }
     await tx`

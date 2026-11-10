@@ -140,6 +140,57 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
     });
   });
 
+  describe("time zones", () => {
+    it("take the device's zone once onto an empty card, and a zone the member picks over it, with an Undo", async () => {
+      const zed = await person(9150, "Zed", [A]);
+      const app = createApi({ sql, botToken: TOKEN, adminTgIds: [], isMember: async () => true, webDistDir: "web/dist", chatZone: "Europe/Warsaw" });
+      const as = { ...auth(9150, "Zed"), "x-chat-id": key(A), "content-type": "application/json" };
+      type Zone = { chosen: string | null; source: string | null; zone: string; from: string };
+      const me = async () => ((await (await app.request("/api/me", { headers: as })).json()) as { time_zone: Zone }).time_zone;
+      const device = (zone: string) => app.request("/api/me/time-zone/device", { method: "POST", headers: as, body: JSON.stringify({ zone }) });
+      const put = (body: unknown) => app.request("/api/me/time-zone", { method: "PUT", headers: as, body: JSON.stringify(body) });
+
+      expect(await me()).toMatchObject({ chosen: null, zone: "Europe/Warsaw", from: "chat_zone" });
+      expect(await (await device("Asia/Jakarta")).json()).toMatchObject({ seeded: true, time_zone: { zone: "Asia/Jakarta", from: "device" } });
+      // From then on the device changes nothing, even from somewhere else.
+      expect(await (await device("Europe/Berlin")).json()).toMatchObject({ seeded: false, time_zone: { zone: "Asia/Jakarta" } });
+      expect(await (await device("Mars/Olympus")).json()).toMatchObject({ seeded: false });
+
+      expect((await put({ zone: "Mars/Olympus" })).status).toBe(422);
+      const picked = (await (await put({ zone: "america/toronto" })).json()) as { before: { zone: string; source: string }; time_zone: Zone };
+      expect(picked.before).toMatchObject({ zone: "Asia/Jakarta", source: "device" });
+      expect(picked.time_zone).toMatchObject({ chosen: "America/Toronto", source: "app", from: "app" });
+      expect(await (await device("Asia/Tokyo")).json()).toMatchObject({ seeded: false, time_zone: { zone: "America/Toronto" } });
+      // The toast's Undo puts back what was there, the device's zone included.
+      await put(picked.before);
+      expect(await me()).toMatchObject({ chosen: "Asia/Jakarta", source: "device" });
+      await put({ zone: null });
+      expect(await me()).toMatchObject({ chosen: null, from: "chat_zone" });
+      // Cleared by hand, it stays clear: the device does not put its zone back.
+      expect(await (await device("Asia/Tokyo")).json()).toMatchObject({ seeded: false, time_zone: { chosen: null } });
+
+      await setOptOut(sql, zed.id, true, A);
+      expect((await put({ zone: "Asia/Tokyo" })).status).toBe(409);
+      expect(await (await device("Asia/Tokyo")).json()).toEqual({ seeded: false, time_zone: null });
+      expect(await me()).toBeNull();
+      expect((await sql`SELECT time_zone FROM members WHERE chat_id = ${A} AND user_id = ${zed.id}`)[0]).toEqual({ time_zone: null });
+    });
+
+    it("let an Undo of a pick put back a card that never had a zone, which the device may still fill", async () => {
+      await person(9151, "Yan", [A]);
+      const app = createApi({ sql, botToken: TOKEN, adminTgIds: [], isMember: async () => true, webDistDir: "web/dist", chatZone: "Europe/Warsaw" });
+      const as = { ...auth(9151, "Yan"), "x-chat-id": key(A), "content-type": "application/json" };
+      const put = (body: unknown) => app.request("/api/me/time-zone", { method: "PUT", headers: as, body: JSON.stringify(body) });
+      const picked = (await (await put({ zone: "Asia/Tokyo" })).json()) as { before: { zone: null; source: null; set_at: null } };
+      expect(picked.before).toEqual({ zone: null, source: null, set_at: null });
+      await put(picked.before);
+      const seeded = await app.request("/api/me/time-zone/device", { method: "POST", headers: as, body: JSON.stringify({ zone: "Asia/Jakarta" }) });
+      expect(await seeded.json()).toMatchObject({ seeded: true, time_zone: { chosen: "Asia/Jakarta", source: "device" } });
+      const light = (await (await app.request("/api/me/time-zone", { headers: as })).json()) as { time_zone: { zone: string } };
+      expect(light.time_zone.zone).toBe("Asia/Jakarta");
+    });
+  });
+
   describe("adding projects by hand", () => {
     it("never takes over another member's project by its name, slug or link", async () => {
       const created = await addUserProject(sql, { chatId: A, name: "Atlas", tagline: "Anna's tracker", links: { repo: "https://github.com/anna/atlas" }, actorUserId: ids.anna! });

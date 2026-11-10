@@ -227,6 +227,118 @@ export interface ChronicleEntry {
   url: string | null;
 }
 
+/** The zone on the member's card in this chat, and the clock they go by (src/core/zones.ts). */
+export interface TimeZoneInfo {
+  /** The zone they chose or their device gave; null when there is none. */
+  chosen: string | null;
+  source: "chat" | "app" | "device" | null;
+  /** When it was set or cleared; null on a card that never had one. */
+  set_at: string | null;
+  /** The zone their times are shown in. */
+  zone: string;
+  from: "chat" | "app" | "device" | "card" | "chat_zone";
+  /** The place on their card the zone follows, or one that spans several zones. */
+  place: string | null;
+  /** How many zones that place spans, when it spans several. */
+  unclear: number | null;
+  /** Those zones, to pick from. */
+  choices: string[];
+  chat_zone: string;
+}
+
+/** The device's IANA zone; UTC when the runtime cannot tell. */
+export function deviceTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+/** A zone this browser can show times in; undefined (the device's own) for one it does not know. */
+export function usableZone(zone: string | null | undefined): string | undefined {
+  if (!zone) return undefined;
+  try {
+    new Intl.DateTimeFormat("en-GB", { timeZone: zone });
+    return zone;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Every zone this browser knows, for the picker; UTC always, though some browsers leave it out of their list. */
+export function knownZones(): string[] {
+  try {
+    if (typeof Intl.supportedValuesOf === "function") {
+      const zones = Intl.supportedValuesOf("timeZone");
+      return zones.includes("UTC") ? zones : ["UTC", ...zones];
+    }
+  } catch {
+    // An older runtime: the picker offers what the card and the device give.
+  }
+  return ["UTC"];
+}
+
+/** A zone as people read it: Etc/GMT-7 is UTC+7 (the Etc names count the other way round), anything else its name. */
+export function zoneLabel(zone: string): string {
+  const fixed = /^Etc\/(?:GMT|UTC)(?:([+-])(\d{1,2}))?$/.exec(zone);
+  if (!fixed) return zone;
+  if (!fixed[1] || fixed[2] === "0") return "UTC";
+  return `UTC${fixed[1] === "-" ? "+" : "−"}${fixed[2]}`;
+}
+
+/** Cities many browsers still list under an older name, with the names a zone may have. */
+const RENAMED: Record<string, string[]> = {
+  kyiv: ["Europe/Kyiv", "Europe/Kiev"],
+  kolkata: ["Asia/Kolkata", "Asia/Calcutta"],
+  "ho chi minh": ["Asia/Ho_Chi_Minh", "Asia/Saigon"],
+  kathmandu: ["Asia/Kathmandu", "Asia/Katmandu"],
+  yangon: ["Asia/Yangon", "Asia/Rangoon"],
+  nuuk: ["America/Nuuk", "America/Godthab"],
+  chuuk: ["Pacific/Chuuk", "Pacific/Truk"],
+  pohnpei: ["Pacific/Pohnpei", "Pacific/Ponape"],
+};
+
+/** UTC+7 or GMT-3 as a zone of its own, Etc/GMT-7 (the Etc names count the other way round); null for anything else. */
+function offsetZone(text: string): string | null {
+  const match = /^(?:utc|gmt)\s*(?:([+−–-])\s*(\d{1,2})(?::?00)?)?$/i.exec(text.trim());
+  if (!match) return null;
+  if (!match[1] || Number(match[2]) === 0) return "UTC";
+  const hours = Number(match[2]);
+  const east = match[1] === "+";
+  return hours > (east ? 14 : 12) ? null : `Etc/GMT${east ? "-" : "+"}${hours}`;
+}
+
+/** The zones a search finds: an offset written as one, cities known under an older name, then every name that holds the words. */
+export function searchZones(query: string, zones: string[]): string[] {
+  const words = query.trim().toLowerCase().replace(/[\s_]+/g, " ");
+  if (!words) return [];
+  const offset = offsetZone(words);
+  const renamed = Object.entries(RENAMED)
+    .filter(([city]) => city.startsWith(words) || words.startsWith(city))
+    .flatMap(([, names]) => names.find((name) => zones.includes(name)) ?? names.find((name) => usableZone(name)) ?? []);
+  const named = zones.filter((zone) => zone.toLowerCase().replace(/_/g, " ").includes(words));
+  return [...new Set([...(offset && usableZone(offset) ? [offset] : []), ...renamed, ...named])].slice(0, 30);
+}
+
+function offsetName(zone: string, at: Date): string {
+  return new Intl.DateTimeFormat("en-US", { timeZone: zone, timeZoneName: "longOffset" }).formatToParts(at).find((part) => part.type === "timeZoneName")?.value ?? "";
+}
+
+/** Whether two zones show the same time all year round, whatever their names (Europe/Kyiv and Europe/Kiev). */
+export function sameClock(a: string, b: string): boolean {
+  if (a === b) return true;
+  try {
+    const now = Date.now();
+    return [0, 1, 2, 3].every((quarter) => {
+      const at = new Date(now + quarter * 91 * 86_400_000);
+      return offsetName(a, at) === offsetName(b, at);
+    });
+  } catch {
+    return false;
+  }
+}
+
 export const FACT_LABELS: Record<string, string> = {
   role: "Role",
   stack: "Stack",

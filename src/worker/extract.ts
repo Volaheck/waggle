@@ -8,7 +8,7 @@ import type { StoredMessage } from "../core/messages.js";
 import { PROJECT_STATUSES, projectForSlug, renameProject, upsertProject, type UpsertResult } from "../core/projects.js";
 import { hasForbiddenTopic, slugify, truncate } from "../core/text.js";
 import type { Person } from "../core/users.js";
-import { batchDataFor, chatLanguageOf, isOwner, MESSAGE_COLUMNS, memberSources, messageBlocks, parseRef, skippedKey, type BatchData } from "./batch.js";
+import { batchDataFor, chatLanguageOf, isOwner, MESSAGE_COLUMNS, memberSources, memberZones, messageBlocks, parseRef, skippedKey, type BatchData } from "./batch.js";
 import { applyNotesResult, buildNotesPrompt, callNotesExtractor, NOTES_PURPOSE, type BatchDebate } from "./notes-extract.js";
 
 export { batchDataFor, MESSAGE_COLUMNS, skippedMessageIds, type BatchData, type PromptNote } from "./batch.js";
@@ -703,6 +703,7 @@ export async function runExtractionPass(deps: ExtractorDeps): Promise<PassResult
       if (!data) break;
       data.ownerTgIds = deps.config.ADMIN_TG_IDS ?? [];
       data.timezone = deps.config.DISPLAY_TIMEZONE;
+      data.zones = await memberZones(sql, chatId, deps.config.DISPLAY_TIMEZONE ?? "UTC");
       const batchIds = data.batch.map((message) => message.msg_id);
       firstMsgId ??= batchIds[0]!;
       lastMsgId = batchIds[batchIds.length - 1]!;

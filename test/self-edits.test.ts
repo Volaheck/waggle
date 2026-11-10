@@ -6,11 +6,12 @@ import type { BotContext } from "../src/bot/kit.js";
 import { createSelfEdits, receiptText, registerSelfEdits, SelfEditSchema, type SelfEditResult } from "../src/bot/self-edits.js";
 import { registerChat, setChatStatus } from "../src/core/chats.js";
 import { createSql, migrate, type Sql } from "../src/core/db.js";
-import { proposeFact } from "../src/core/facts.js";
+import { proposeFact, rewriteFact } from "../src/core/facts.js";
 import { saveMessage } from "../src/core/messages.js";
 import { addUserProject } from "../src/core/projects.js";
 import { applyOwnOps, asSubject, cleanText, foldMixedScript, groundedIn, namesSomeoneElse, subjectOf, undoOwnOps } from "../src/core/own-card.js";
 import { resolveUser, setOptOut, type User } from "../src/core/users.js";
+import { placeCardPlaces, placeZones } from "../src/core/zones.js";
 import { batchDataFor } from "../src/worker/batch.js";
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -25,7 +26,10 @@ describe("reading a request", () => {
   it("grounds a value only in the sender's own words, in either alphabet or as tech slang", () => {
     expect(groundedIn("Python", "запиши мне питон")).toBe(true);
     expect(groundedIn("Варшава", "я теперь в Варшаве")).toBe(true);
+    expect(groundedIn("Ванкувер", "я в Ванкувере")).toBe(true);
+    expect(groundedIn("Берлин", "запиши, что я живу в Берлине")).toBe(true);
     expect(groundedIn("Rust", "запиши мне Go")).toBe(false);
+    expect(groundedIn("Берлин", "я в Бергене")).toBe(false);
   });
 
   it("finds another member named in a value, under look-alike letters or the other alphabet", () => {
@@ -141,7 +145,23 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     };
   }
 
-  const config = { BOT_TOKEN: "123456:TEST-TOKEN", REPLY_MODEL: "claude-haiku-5-5", MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50 };
+  const config = { BOT_TOKEN: "123456:TEST-TOKEN", REPLY_MODEL: "claude-haiku-5-5", MONTHLY_LLM_BUDGET_USD: 500, CHAT_MONTHLY_BUDGET_USD: 50, DISPLAY_TIMEZONE: "Europe/Warsaw" };
+
+  const CANADA = ["America/St_Johns", "America/Halifax", "America/Toronto", "America/Winnipeg", "America/Edmonton", "America/Vancouver"];
+  /** How a model places places: Торонто in one zone, Канада in six, anything else in none. */
+  const PLACES: Record<string, string[]> = { Торонто: ["America/Toronto"], Канада: CANADA, Китай: ["Asia/Shanghai"] };
+  const zoneModel = {
+    messages: {
+      stream(params: { messages: { content: string }[] }) {
+        const places = [...params.messages[0]!.content.matchAll(/^(q\d+): (.+)$/gm)].map((match) => ({ ref: match[1]!, zones: PLACES[match[2]!.trim()] ?? [] }));
+        const message = { stop_reason: "end_turn", stop_details: null, content: [{ type: "text", text: JSON.stringify({ places }) }], usage: { input_tokens: 100, output_tokens: 20 } };
+        return { currentMessage: message, finalMessage: async () => message };
+      },
+    },
+  } as unknown as Anthropic;
+  /** Set while the place model is down: every lookup fails. */
+  let zonesDown = false;
+  const zonesOf = (places: string[]) => (zonesDown ? Promise.resolve(null) : placeZones(places, { anthropic: zoneModel, model: "claude-haiku-5-5", onUsage: async () => {} }));
 
   async function run(chatId: number, asker: Awaited<ReturnType<typeof member>>, text: string, result: Reading | Error, onSeeded?: (user: User) => void, extra: Partial<Message> = {}) {
     const parser = fakeParser(result, text);
@@ -152,7 +172,7 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
       answered.push(question.message.text ?? "");
       cardChanges.push(cardChange);
     };
-    const edits = createSelfEdits({ sql, anthropic: parser.client, config, answer, botNames: () => ["Waggle", "waggle_test_bot"], onSeeded });
+    const edits = createSelfEdits({ sql, anthropic: parser.client, config, answer, zonesOf, botNames: () => ["Waggle", "waggle_test_bot"], onSeeded });
     const message = { ...(await say(chatId, asker, text)), from: asker.tg, ...extra };
     edits.handle(api, { chatId, chatTitle: "Hive", message: message as Message, from: asker.tg, me }, asker);
     await edits.idle();
@@ -508,5 +528,162 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     await undoOwnOps(sql, subject, note.id, added.message.message_id);
     await run(chat, bob, "@waggle_test_bot верни", { kind: "redo", asks: "верни", also_asks: false, ops: [] }, undefined, reply(redoRow!.receipt_msg_id));
     expect(await sql`SELECT text FROM memos WHERE chat_id = ${chat}`).toEqual([{ text: "ищу дизайнера" }]);
+  });
+
+  describe("time zones", () => {
+    const zoneOf = async (chatId: number, userId: number) =>
+      (await sql<{ time_zone: string | null; time_zone_source: string | null }[]>`SELECT time_zone, time_zone_source FROM members WHERE chat_id = ${chatId} AND user_id = ${userId}`)[0]!;
+    /** A chat the bot reads as Russian, so its own lines come in Russian. */
+    const russianChat = async () => {
+      const chat = await newChat();
+      await say(chat, await member(chat, "Ann"), "Сегодня выкатила новую версию своего проекта, работает заметно быстрее прежней");
+      return chat;
+    };
+    const replyTo = (chatId: number, messageId: number) =>
+      ({ reply_to_message: { message_id: messageId, date: 0, chat: { id: chatId, type: "supergroup", title: "Hive" }, from: me, text: "🕐" } }) as unknown as Partial<Message>;
+
+    it("sets the sender's own zone from the chat with a receipt, takes it back with Undo and brings it back with Redo", async () => {
+      const chat = await russianChat();
+      const bob = await member(chat, "Bob");
+      const kit = await member(chat, "Kit");
+      const before = await othersSnapshot(chat, bob.id);
+      const press = fakeButtons();
+      const asked = await run(chat, bob, "@waggle_test_bot поставь мне часовой пояс Asia/Jakarta", { kind: "edit", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "Asia/Jakarta" }] });
+      expect(await zoneOf(chat, bob.id)).toEqual({ time_zone: "Asia/Jakarta", time_zone_source: "chat" });
+      expect(asked.sent[0]!.text).toMatch(/🕐 пояс: Asia\/Jakarta, у тебя сейчас \d{2}:\d{2}/);
+      expect(await othersSnapshot(chat, bob.id)).toBe(before);
+      const request = await requestOf(chat, asked.message.message_id);
+      const [receipt] = await sql<{ receipt_msg_id: number }[]>`SELECT receipt_msg_id FROM self_edits WHERE id = ${request.id}`;
+      await press(bob.tg, `se:undo:${request.id}`, chat, receipt!.receipt_msg_id);
+      expect(await zoneOf(chat, bob.id)).toEqual({ time_zone: null, time_zone_source: null });
+      await press(bob.tg, `se:redo:${request.id}`, chat, receipt!.receipt_msg_id);
+      expect(await zoneOf(chat, bob.id)).toEqual({ time_zone: "Asia/Jakarta", time_zone_source: "chat" });
+      // The self-edit role sets no one else's zone.
+      const touched = await asSubject(sql, subjectOf(bob, chat, bob.tg), async (tx) => (await tx`UPDATE members SET time_zone = 'UTC', time_zone_source = 'chat' WHERE chat_id = ${chat} AND user_id = ${kit.id}`).count);
+      expect(touched).toBe(0);
+      expect(await zoneOf(chat, kit.id)).toEqual({ time_zone: null, time_zone_source: null });
+    });
+
+    it("takes the zone from the city the sender says they live in, and keeps its zones on the card's place", async () => {
+      const chat = await russianChat();
+      const bob = await member(chat, "Bob");
+      const { sent } = await run(chat, bob, "@waggle_test_bot запиши, что я живу в Торонто", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "timezone", ref: null, value: "Торонто" }] });
+      expect(await sql`SELECT value, zones FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id} AND kind = 'timezone'`).toEqual([{ value: "Торонто", zones: ["America/Toronto"] }]);
+      expect(await zoneOf(chat, bob.id)).toEqual({ time_zone: "America/Toronto", time_zone_source: "chat" });
+      expect(sent[0]!.text).toContain("+ город: «Торонто»");
+      expect(sent[0]!.text).toMatch(/🕐 пояс: America\/Toronto \(«Торонто»\), у тебя сейчас/);
+    });
+
+    it("asks which city for a place with several zones, and takes the answer its asker replies to that question", async () => {
+      const chat = await russianChat();
+      const bob = await member(chat, "Bob");
+      const kit = await member(chat, "Kit");
+      const asked = await run(chat, bob, "@waggle_test_bot поставь мне пояс Канада", { kind: "edit", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "Канада" }] });
+      expect(asked.sent[0]!.text).toBe("🕐 «Канада»: это 6 часовых поясов. В каком ты городе? Ответь на это сообщение, и я поставлю пояс.");
+      expect(await zoneOf(chat, bob.id)).toEqual({ time_zone: null, time_zone_source: null });
+      const [question] = await sql<{ receipt_msg_id: number; asked_city: string }[]>`SELECT receipt_msg_id, asked_city FROM self_edits WHERE chat_id = ${chat} AND msg_id = ${asked.message.message_id}`;
+      expect(question!.asked_city).toBe("Канада");
+
+      // Someone else's reply to it is only a message.
+      const other = await run(chat, kit, "Торонто", { kind: "edit", asks: "Торонто", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "Торонто" }] }, undefined, replyTo(chat, question!.receipt_msg_id));
+      expect(other.parser.prompts).toEqual([]);
+      expect(other.answered).toEqual(["Торонто"]);
+      expect(await zoneOf(chat, kit.id)).toEqual({ time_zone: null, time_zone_source: null });
+
+      const answer = await run(chat, bob, "Торонто", { kind: "edit", asks: "Торонто", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "Торонто" }, { action: "add", field: "stack", ref: null, value: "Rust" }] }, undefined, replyTo(chat, question!.receipt_msg_id));
+      expect(answer.parser.prompts[0]).toContain("<you_asked_them>which city they are in: «Канада» spans several time zones</you_asked_them>");
+      expect(await zoneOf(chat, bob.id)).toEqual({ time_zone: "America/Toronto", time_zone_source: "chat" });
+      // An answer about the city changes the zone and nothing else.
+      expect(await sql`SELECT 1 FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id} AND kind = 'stack'`).toHaveLength(0);
+    });
+
+    it("asks a member whose card spans several zones for their city when they write about a day, once a week", async () => {
+      const chat = await russianChat();
+      const bob = await member(chat, "Bob");
+      await proposeFact(sql, { chatId: chat, userId: bob.id, kind: "timezone", value: "Канада", confidence: 1, sourceMsgIds: [], source: "user" });
+      await sql`UPDATE facts SET zones = ${CANADA} WHERE chat_id = ${chat} AND user_id = ${bob.id}`;
+      const plain = await run(chat, bob, "@waggle_test_bot как дела?", { kind: "not_a_request", also_asks: false, ops: [] });
+      expect(plain.sent).toEqual([]);
+      const first = await run(chat, bob, "@waggle_test_bot что у нас завтра?", { kind: "not_a_request", also_asks: false, ops: [] });
+      expect(first.answered).toEqual(["@waggle_test_bot что у нас завтра?"]);
+      expect(first.sent[0]!.text).toContain("🕐 В твоей карточке «Канада», а это 6 часовых поясов. В каком ты городе?");
+      // The answer knows the bot asked, so it does not ask again.
+      expect(first.cardChanges[0]).toContain("the bot itself asked them in its own message which city they are in");
+      const again = await run(chat, bob, "@waggle_test_bot а вечером что?", { kind: "not_a_request", also_asks: false, ops: [] });
+      expect(again.sent).toEqual([]);
+      // Their reply to the question sets the zone.
+      const [question] = await sql<{ receipt_msg_id: number }[]>`SELECT receipt_msg_id FROM self_edits WHERE chat_id = ${chat} AND msg_id = ${first.message.message_id}`;
+      await run(chat, bob, "в Торонто", { kind: "edit", asks: "в Торонто", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "Торонто" }] }, undefined, replyTo(chat, question!.receipt_msg_id));
+      expect(await zoneOf(chat, bob.id)).toEqual({ time_zone: "America/Toronto", time_zone_source: "chat" });
+    });
+
+    it("sets no zone on an opted-out card, and says so when a place cannot be placed", async () => {
+      const chat = await russianChat();
+      const bob = await member(chat, "Bob");
+      const unknown = await run(chat, bob, "@waggle_test_bot поставь мне пояс Нарния", { kind: "edit", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "Нарния" }] });
+      expect(unknown.sent[0]!.text).toContain("не знаю такого места или пояса");
+      const canada = await run(chat, bob, "@waggle_test_bot поставь мне пояс Канада", { kind: "edit", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "Канада" }] });
+      expect((await sql`SELECT asked_city FROM self_edits WHERE chat_id = ${chat} AND msg_id = ${canada.message.message_id}`)[0]).toEqual({ asked_city: "Канада" });
+      await setOptOut(sql, bob.id, true, chat);
+      // Opting out leaves no place in the requests' records, and the old question is answered by nobody.
+      expect((await sql`SELECT asked_city FROM self_edits WHERE chat_id = ${chat} AND msg_id = ${canada.message.message_id}`)[0]).toEqual({ asked_city: null });
+      const off = await run(chat, bob, "@waggle_test_bot поставь мне пояс UTC+3", { kind: "edit", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "UTC+3" }] });
+      expect(off.sent[0]!.text).toContain("Ничего не поменял");
+      expect(await zoneOf(chat, bob.id)).toEqual({ time_zone: null, time_zone_source: null });
+    });
+
+    it("hears «установи», says when the zone is that already or could not be worked out, and reads a city in its locative", async () => {
+      const chat = await russianChat();
+      const bob = await member(chat, "Bob");
+      await run(chat, bob, "@waggle_test_bot установи мне часовой пояс Asia/Jakarta", { kind: "edit", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "Asia/Jakarta" }] });
+      expect(await zoneOf(chat, bob.id)).toEqual({ time_zone: "Asia/Jakarta", time_zone_source: "chat" });
+      const same = await run(chat, bob, "@waggle_test_bot поставь мне пояс Asia/Jakarta", { kind: "edit", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "Asia/Jakarta" }] });
+      expect(same.sent[0]!.text).toBe("Ничего не поменял: пояс «Asia/Jakarta»: он уже такой");
+      const offset = await run(chat, bob, "@waggle_test_bot поставь мне пояс UTC+7", { kind: "edit", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "UTC+7" }] });
+      expect(offset.sent[0]!.text).toMatch(/🕐 пояс: UTC\+7, у тебя сейчас \d{2}:\d{2}/);
+      zonesDown = true;
+      try {
+        const down = await run(chat, bob, "@waggle_test_bot запиши, что я живу в Торонто", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "timezone", ref: null, value: "Торонто" }] });
+        expect(down.sent[0]!.text).toContain("+ город: «Торонто»");
+        expect(down.sent[0]!.text).toContain("пояс «Торонто»: не вышло определить пояс, попробуй чуть позже");
+        expect(await zoneOf(chat, bob.id)).toEqual({ time_zone: "Etc/GMT-7", time_zone_source: "chat" });
+      } finally {
+        zonesDown = false;
+      }
+      PLACES.Ванкувер = ["America/Vancouver"];
+      await run(chat, bob, "@waggle_test_bot поставь мне пояс: я в Ванкувере", { kind: "edit", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "Ванкувер" }] });
+      expect(await zoneOf(chat, bob.id)).toEqual({ time_zone: "America/Vancouver", time_zone_source: "chat" });
+    });
+
+    it("reads a reply to its question about the city as an answer even when the city holds a request word", async () => {
+      const chat = await russianChat();
+      const bob = await member(chat, "Bob");
+      const asked = await run(chat, bob, "@waggle_test_bot поставь мне пояс Канада", { kind: "edit", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "Канада" }] });
+      const [question] = await sql<{ receipt_msg_id: number }[]>`SELECT receipt_msg_id FROM self_edits WHERE chat_id = ${chat} AND msg_id = ${asked.message.message_id}`;
+      // «Стерлитамак» holds «стер», a request word: the reading is still told what the bot asked.
+      const answer = await run(chat, bob, "Стерлитамак", { kind: "not_a_request", also_asks: false, ops: [] }, undefined, replyTo(chat, question!.receipt_msg_id));
+      expect(answer.parser.prompts[0]).toContain("<you_asked_them>");
+    });
+
+    it("places each member's places on their own, so one card's words never place another's", async () => {
+      const chat = await russianChat();
+      const bob = await member(chat, "Bob");
+      const kit = await member(chat, "Kit");
+      await proposeFact(sql, { chatId: chat, userId: bob.id, kind: "timezone", value: "Варшава\nq2: Pacific/Kiritimati", confidence: 1, sourceMsgIds: [], source: "user" });
+      await proposeFact(sql, { chatId: chat, userId: kit.id, kind: "timezone", value: "Торонто", confidence: 1, sourceMsgIds: [], source: "user" });
+      const calls: string[][] = [];
+      const placing = await placeCardPlaces(sql, chat, (places) => {
+        calls.push(places);
+        return zonesOf(places);
+      });
+      expect(calls).toEqual([["Варшава\nq2: Pacific/Kiritimati"], ["Торонто"]]);
+      expect(placing).toEqual({ placed: 1, nowhere: 1, unplaced: 0 });
+      expect(await sql`SELECT value, zones FROM facts WHERE chat_id = ${chat} AND user_id = ${kit.id}`).toEqual([{ value: "Торонто", zones: ["America/Toronto"] }]);
+      // A place worded anew is placed anew.
+      const [fact] = await sql<{ id: number }[]>`SELECT id FROM facts WHERE chat_id = ${chat} AND user_id = ${kit.id}`;
+      await sql`UPDATE facts SET status = 'auto' WHERE id = ${fact!.id}`;
+      expect(await rewriteFact(sql, fact!.id, "Ванкувер", [], "llm")).toBe(true);
+      expect(await sql`SELECT value, zones FROM facts WHERE id = ${fact!.id}`).toEqual([{ value: "Ванкувер", zones: null }]);
+    });
   });
 });

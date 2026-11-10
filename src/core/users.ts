@@ -1,5 +1,6 @@
 import type { Queryable, Sql } from "./db.js";
 import { forgetNotes } from "./notes.js";
+import type { ChosenSource } from "./zones.js";
 
 /** Telegram's own accounts that post for linked channels, anonymous admins and channel identities: never people. */
 export const SERVICE_TG_IDS = [777000, 1087968824, 136817688];
@@ -27,6 +28,9 @@ export interface Member {
   first_seen_at: Date | null;
   last_message_at: Date | null;
   left_at: Date | null;
+  /** The IANA zone they chose or their device gave (src/core/zones.ts); null leaves their clock to their card or the chat. */
+  time_zone: string | null;
+  time_zone_source: ChosenSource | null;
 }
 
 /** A user as seen from one chat. */
@@ -46,7 +50,7 @@ export function fullName(identity: TelegramIdentity): string {
 const CLAIM_BY_NAME = false;
 
 const PERSON_COLUMNS = `u.id, u.tg_id, u.username, u.display_name, u.is_admin, u.dm_started, u.current_chat_id,
-  m.chat_id, m.user_id, m.tagline, m.tagline_manual, m.opted_out, m.first_seen_at, m.last_message_at, m.left_at`;
+  m.chat_id, m.user_id, m.tagline, m.tagline_manual, m.opted_out, m.first_seen_at, m.last_message_at, m.left_at, m.time_zone, m.time_zone_source`;
 
 /**
  * A seeded card (no account yet) the account may take over. By @username anywhere. By name only when the
@@ -191,7 +195,10 @@ export async function getUserByTgId(sql: Sql, tgId: number): Promise<User | unde
 async function applyOptOut(tx: Queryable, userId: number, optedOut: boolean, scope: number | null): Promise<void> {
   await tx`
     UPDATE members SET opted_out = ${optedOut}, tagline = CASE WHEN ${optedOut} THEN NULL ELSE tagline END,
-           tagline_manual = CASE WHEN ${optedOut} THEN false ELSE tagline_manual END
+           tagline_manual = CASE WHEN ${optedOut} THEN false ELSE tagline_manual END,
+           time_zone = CASE WHEN ${optedOut} THEN NULL ELSE time_zone END,
+           time_zone_source = CASE WHEN ${optedOut} THEN NULL ELSE time_zone_source END,
+           time_zone_set_at = CASE WHEN ${optedOut} THEN NULL ELSE time_zone_set_at END
     WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
   if (optedOut) {
     await tx`DELETE FROM facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
@@ -220,7 +227,7 @@ export async function setOptOut(sql: Sql, userId: number, optedOut: boolean, cha
 /** Opting out leaves nothing to confirm or undo, and no card values in the requests' records. */
 async function dropCardRequests(tx: Queryable, userId: number, chatId: number | null): Promise<void> {
   await tx`
-    UPDATE self_edits SET status = CASE WHEN status IN ('proposed', 'applied') THEN 'refused' ELSE status END, plan = NULL, applied = NULL
+    UPDATE self_edits SET status = CASE WHEN status IN ('proposed', 'applied') THEN 'refused' ELSE status END, plan = NULL, applied = NULL, asked_city = NULL
     WHERE user_id = ${userId} AND (${chatId}::bigint IS NULL OR chat_id = ${chatId}::bigint)`;
 }
 

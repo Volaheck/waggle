@@ -7,6 +7,7 @@ import { maskPersonalData } from "../core/privacy.js";
 import type { ProjectStatus } from "../core/projects.js";
 import { truncate } from "../core/text.js";
 import { peopleOfChat, type Person } from "../core/users.js";
+import { chatClocks, isoDayIn } from "../core/zones.js";
 
 /**
  * A batch of a chat's messages with what the chronicler is shown along with it, and how the messages read in a prompt.
@@ -47,6 +48,14 @@ export interface BatchData {
   ownerTgIds?: number[];
   /** For the date lines among the messages; UTC when not set. */
   timezone?: string;
+  /** The zones of members whose own clock is known: a message of theirs sent on another day of theirs says so. */
+  zones?: Map<number, string>;
+}
+
+/** The members' own zones, for BatchData.zones: those whose clock is not just the chat's. */
+export async function memberZones(sql: Sql, chatId: number, chatZone: string): Promise<Map<number, string>> {
+  const clocks = await chatClocks(sql, chatId, chatZone);
+  return new Map([...clocks].filter(([, clock]) => clock.source !== "chat_zone").map(([userId, clock]) => [userId, clock.zone]));
 }
 
 export const MESSAGE_COLUMNS = "chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, reply_to_bot, is_forward, forward_source, media_type, from_bot";
@@ -170,15 +179,21 @@ function formatMessage(message: StoredMessage, users: Map<number, Person>): stri
 
 export const isoDay = (date: Date, timeZone: string) => date.toLocaleDateString("en-CA", { timeZone });
 
-/** The messages, each day opened by a line with its date, so a deadline or a forecast can be dated. */
-export function messageLines(messages: StoredMessage[], users: Map<number, Person>, timeZone: string): string[] {
+/**
+ * The messages, each day opened by a line with its date, so a deadline or a forecast can be dated. A message whose
+ * author lives on another day just then carries theirs: their «завтра» counts from it.
+ */
+export function messageLines(messages: StoredMessage[], users: Map<number, Person>, timeZone: string, zones?: Map<number, string>): string[] {
   const lines: string[] = [];
   let day = "";
   for (const message of messages) {
     const today = isoDay(message.sent_at, timeZone);
     if (today !== day) lines.push(`--- ${today}, ${message.sent_at.toLocaleDateString("en-US", { weekday: "long", timeZone })} ---`);
     day = today;
-    lines.push(formatMessage(message, users));
+    const own = message.user_id !== null && !message.from_bot ? zones?.get(message.user_id) : undefined;
+    const theirs = own ? isoDayIn(message.sent_at, own) : today;
+    const line = formatMessage(message, users);
+    lines.push(theirs === today ? line : line.replace(/^\[(\d+)\]/, `[$1, their day ${theirs}, ${message.sent_at.toLocaleDateString("en-US", { weekday: "long", timeZone: own })}]`));
   }
   return lines;
 }
@@ -188,8 +203,8 @@ export function messageBlocks(data: BatchData): string[] {
   const users = new Map(data.users.map((user) => [user.id, user]));
   const timeZone = data.timezone ?? "UTC";
   return [
-    `<context>\n${messageLines(data.context, users, timeZone).join("\n") || "(none)"}\n</context>`,
-    `<new_messages>\n${messageLines(data.batch, users, timeZone).join("\n")}\n</new_messages>`,
+    `<context>\n${messageLines(data.context, users, timeZone, data.zones).join("\n") || "(none)"}\n</context>`,
+    `<new_messages>\n${messageLines(data.batch, users, timeZone, data.zones).join("\n")}\n</new_messages>`,
   ];
 }
 

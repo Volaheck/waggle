@@ -14,6 +14,7 @@ import { mergeSeedUser } from "../src/core/merge.js";
 import { saveBotMessage, saveMessage } from "../src/core/messages.js";
 import { CONSENT, dueDate, saveNote, type NoteInput } from "../src/core/notes.js";
 import { addUserProject } from "../src/core/projects.js";
+import { proposeFact } from "../src/core/facts.js";
 import { canonicalTerm, recurringThemes, termsOf, textTerms, themesMatching } from "../src/core/themes.js";
 import { hasForbiddenTopic } from "../src/core/text.js";
 import { forgetUser, resolveUser, setOptOut, setTagline, type User } from "../src/core/users.js";
@@ -751,6 +752,36 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
   });
 
   describe("the answer context", () => {
+    it("knows whose «завтра» it is: each one's own clock, their today and tomorrow, and their messages in their time", async () => {
+      const chat = await newChat();
+      const lee = await member(chat, "Lee");
+      const dana = await member(chat, "Dana");
+      const bob = await member(chat, "Bob");
+      await proposeFact(sql, { chatId: chat, userId: lee.id, kind: "timezone", value: "Китай", confidence: 1, sourceMsgIds: [], source: "user" });
+      await proposeFact(sql, { chatId: chat, userId: dana.id, kind: "timezone", value: "Канада", confidence: 1, sourceMsgIds: [], source: "user" });
+      await sql`UPDATE facts SET zones = '{Asia/Shanghai}' WHERE chat_id = ${chat} AND user_id = ${lee.id}`;
+      await sql`UPDATE facts SET zones = '{America/St_Johns,America/Halifax,America/Toronto,America/Winnipeg,America/Edmonton,America/Vancouver}' WHERE chat_id = ${chat} AND user_id = ${dana.id}`;
+      await say(chat, lee, "завтра выкачу релиз", { at: new Date(Date.now() - HOUR) });
+      await say(chat, bob, "посмотрим", { at: new Date(Date.now() - HOUR / 2) });
+
+      const context = await buildReplyContext(sql, asking(chat, lee, "@waggle_test_bot что у меня завтра? и как там Dana?"), {
+        timezone: "Europe/Warsaw", model: "claude-opus-5-5", ownerTgIds: [OWNER], recentAnswers: [], insultMotif: "the scrolls are sealed",
+      }).then(promptText);
+      const times = block(context, "local_times")!;
+      const shanghai = (at: Date) => new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Shanghai", weekday: "short", day: "numeric", month: "short" }).format(at);
+      const [year, month, day] = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Shanghai" }).split("-").map(Number) as [number, number, number];
+      const tomorrow = new Intl.DateTimeFormat("en-GB", { timeZone: "UTC", weekday: "short", day: "numeric", month: "short" }).format(new Date(Date.UTC(year, month - 1, day + 1, 12)));
+      expect(times).toMatch(/^- the chat: \w{3} \d{1,2} \w{3}, \d{2}:\d{2}, Europe\/Warsaw; today /);
+      expect(times).toContain(`- Lee, asking: `);
+      expect(times).toMatch(/Asia\/Shanghai \(from the place on their card, «Китай»\), \d+ h ahead of the chat/);
+      expect(times).toContain(`their today ${shanghai(new Date())}, their tomorrow ${tomorrow}`);
+      expect(times).toContain("- Dana, named: unknown: their card says «Канада», which spans 6 time zones, and they have set none, so the chat's time stands in; «поставь мне пояс <город>» sets theirs");
+      // Lee's message carries Lee's own time; Bob's, in the chat's zone, only the chat's.
+      const recent = block(context, "recent_messages")!;
+      expect(recent).toMatch(/\[\d+ \d{2}:\d{2}, (?:\w{3} \d{1,2} \w{3} )?\d{2}:\d{2} their time\] Lee: завтра выкачу релиз/);
+      expect(recent).toMatch(/\[\d+ \d{2}:\d{2}\] Bob: посмотрим/);
+    });
+
     it("gives the people in focus their private notes and keeps the running jokes and corrections at hand, never an objection", async () => {
       const chat = await newChat();
       const kit = await member(chat, "Kit");

@@ -11,6 +11,7 @@ import { addUserProject, canEditProject, getProjectBySlug, hideProject, listProj
 import { topChronicle, topLimitFor } from "../core/chronicle.js";
 import { addMemo, canNoteProject, deleteMemo, MAX_MEMO_CHARS, memosOf, ownMemos, projectMemos } from "../core/memos.js";
 import { cleanText, memoProblem, othersOf } from "../core/own-card.js";
+import { CHOSEN_SOURCES, memberClock, seedDeviceZone, setChosenZone, zoneName, type ChosenSource } from "../core/zones.js";
 import { messageLink, safeHttpUrl, truncate } from "../core/text.js";
 import { approvedChats, chatsOfUser, setCurrentChat, type Chat } from "../core/chats.js";
 import { ensureMember, getPerson, peopleOfChat, resolveUser, setOptOut, setTagline, type Person, type User } from "../core/users.js";
@@ -30,6 +31,8 @@ export interface ApiDeps {
   devLogin?: { token: string; loginAs: string };
   /** Members' Telegram profile photos; without it every avatar falls back to the initial. */
   avatars?: AvatarCache;
+  /** The chat's zone, every clock's fallback (DISPLAY_TIMEZONE); UTC when not given. */
+  chatZone?: string;
 }
 
 type Env = { Variables: { user: User; chatId: number; person: Person } };
@@ -88,6 +91,7 @@ function publicUser(user: Person) {
 
 export function createApi(deps: ApiDeps): Hono<Env> {
   const { sql } = deps;
+  const chatZone = deps.chatZone ?? "UTC";
   const app = new Hono<Env>();
   // Owners are exactly the configured list; a stored is_admin flag grants nothing.
   const isOwner = (user: User) => user.tg_id !== null && deps.adminTgIds.includes(user.tg_id);
@@ -200,17 +204,71 @@ export function createApi(deps: ApiDeps): Hono<Env> {
       }),
     });
 
+  /**
+   * The zone on the member's card, if any, and the clock they go by: that zone, the place on their card, or the chat's.
+   * None for someone who opted out: their device's own clock shows their times.
+   */
+  const timeZoneOf = async (c: Context<Env>) => {
+    const chatId = c.get("chatId");
+    const userId = c.get("user").id;
+    const [member] = await sql<{ opted_out: boolean }[]>`SELECT opted_out FROM members WHERE chat_id = ${chatId} AND user_id = ${userId}`;
+    if (!member || member.opted_out) return null;
+    const [[chosen], clock] = await Promise.all([
+      sql<{ time_zone: string | null; time_zone_source: ChosenSource | null; time_zone_set_at: Date | null }[]>`
+        SELECT time_zone, time_zone_source, time_zone_set_at FROM members WHERE chat_id = ${chatId} AND user_id = ${userId}`,
+      memberClock(sql, chatId, userId, chatZone),
+    ]);
+    return {
+      chosen: chosen?.time_zone ?? null,
+      source: chosen?.time_zone_source ?? null,
+      set_at: chosen?.time_zone_set_at ?? null,
+      zone: clock.zone,
+      from: clock.source,
+      place: clock.place,
+      unclear: clock.unclear,
+      choices: clock.choices,
+      chat_zone: chatZone,
+    };
+  };
+
   api.get("/me", async (c) => {
     const user = c.get("user");
     const person = c.get("person");
     const chatId = c.get("chatId");
-    const [facts, projects, memos] = await Promise.all([ownFacts(sql, chatId, user.id), projectsOfUser(sql, chatId, user.id), ownMemos(sql, chatId, user.id)]);
+    const [facts, projects, memos, timeZone] = await Promise.all([ownFacts(sql, chatId, user.id), projectsOfUser(sql, chatId, user.id), ownMemos(sql, chatId, user.id), timeZoneOf(c)]);
     return c.json({
       user: { ...personPayload(person), tagline: person.tagline, tagline_manual: person.tagline_manual, is_admin: isOwner(user) },
       facts: facts.map(withSources(c)),
       projects,
       memos,
+      time_zone: timeZone,
     });
+  });
+
+  api.get("/me/time-zone", async (c) => c.json({ time_zone: await timeZoneOf(c) }));
+
+  // A zone the member picks (or clears with null); `source` and `set_at` put back exactly what an Undo restores.
+  api.put("/me/time-zone", async (c) => {
+    const user = c.get("user");
+    const body = z
+      .object({ zone: z.string().trim().max(64).nullable(), source: z.enum(CHOSEN_SOURCES).nullable().optional(), set_at: z.string().datetime({ offset: true }).nullable().optional() })
+      .safeParse(await c.req.json());
+    if (!body.success) return c.json({ error: "bad_request" }, 400);
+    if (c.get("person").opted_out) return c.json({ error: "opted_out" }, 409);
+    const zone = body.data.zone === null ? null : zoneName(body.data.zone);
+    if (body.data.zone !== null && zone === null) return c.json({ error: "bad_zone" }, 422);
+    const setAt = body.data.set_at === undefined ? undefined : body.data.set_at === null ? null : new Date(body.data.set_at);
+    const before = await setChosenZone(sql, c.get("chatId"), user.id, { zone, source: body.data.source ?? "app", set_at: setAt }, user.id);
+    return c.json({ before, time_zone: await timeZoneOf(c) });
+  });
+
+  // The device's zone, on the first visit of a member with no zone on their card; a zone this server does not know is no error.
+  api.post("/me/time-zone/device", async (c) => {
+    const body = z.object({ zone: z.string().trim().max(64) }).safeParse(await c.req.json());
+    if (!body.success) return c.json({ error: "bad_request" }, 400);
+    const zone = zoneName(body.data.zone);
+    const seeded = zone !== null && !c.get("person").opted_out && (await seedDeviceZone(sql, c.get("chatId"), c.get("user").id, zone));
+    return c.json({ seeded, time_zone: await timeZoneOf(c) });
   });
 
   api.patch("/me", async (c) => {

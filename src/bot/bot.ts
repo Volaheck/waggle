@@ -20,12 +20,13 @@ import {
 } from "../core/chats.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
-import { monthSpendUsd, PREMIUM_REPLY_PURPOSE } from "../core/llm.js";
+import { chatEndUserId, monthSpendUsd, PREMIUM_REPLY_PURPOSE, recordUsage } from "../core/llm.js";
 import { mergeSeedUser, rankCards, unlinkedCards, type UnlinkedCard } from "../core/merge.js";
 import { saveMessage, updateEditedMessage } from "../core/messages.js";
 import { catchupFor } from "../core/chronicle.js";
 import { escapeHtml, nameKey, truncate } from "../core/text.js";
 import { accountByUsername, fullName, getUser, markLeft, SERVICE_TG_IDS, type User } from "../core/users.js";
+import { memberClock, PLACE_ZONES_PURPOSE, PLACE_ZONES_TIMEOUT_MS, placeZones } from "../core/zones.js";
 import { nextConsolidationRetryAt } from "../worker/consolidate.js";
 import { lastSuccessfulRunAt, passDueAt, pendingStats } from "../worker/extract.js";
 import { setIdeaStatus, type IdeaStatus } from "../worker/ideas.js";
@@ -190,6 +191,14 @@ export function createBot(deps: BotDeps): {
           anthropic: deps.anthropic,
           config,
           answer: (api, question, cardChange) => answers.answer(api, question, cardChange),
+          zonesOf: (places, chatId) =>
+            placeZones(places, {
+              anthropic: deps.anthropic!,
+              model: config.PLACE_ZONES_MODEL,
+              onUsage: (usage) => recordUsage(sql, PLACE_ZONES_PURPOSE, config.PLACE_ZONES_MODEL, usage, chatId),
+              signal: AbortSignal.timeout(PLACE_ZONES_TIMEOUT_MS),
+              endUserId: chatEndUserId(config.BOT_TOKEN, chatId),
+            }),
           botNames: () => [bot.botInfo.first_name, bot.botInfo.username],
           onSeeded: (user) => askOwnersAboutSeed(user, `asks to change the imported card they took over by its ${user.linked_by === "name" ? "name" : "@username"}`),
         })
@@ -729,7 +738,9 @@ export function createBot(deps: BotDeps): {
 
   async function runCatchup(ctx: BotContext, scope: Scope, hours?: number) {
     const data = await catchupFor(sql, scope.chatId, scope.person, hours);
-    const html = catchupHtml(data, await kit.usersById(), scope.chatId, config.EXTRACTION_INTERVAL_HOURS, config.DISPLAY_TIMEZONE);
+    // «Since 10 Nov, 23:30» is the reader's own time.
+    const clock = await memberClock(sql, scope.chatId, scope.person.id, config.DISPLAY_TIMEZONE);
+    const html = catchupHtml(data, await kit.usersById(), scope.chatId, config.EXTRACTION_INTERVAL_HOURS, clock.zone);
     const keyboard = new InlineKeyboard().text("📜 Full chronicle", "ch:3:0");
     await ctx.api.sendMessage(scope.user.tg_id!, clampTelegram(html), { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: keyboard });
   }

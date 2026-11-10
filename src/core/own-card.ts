@@ -7,6 +7,7 @@ import { maskPersonalData } from "./privacy.js";
 import { canonicalStackValue, splitStackValue } from "./stack.js";
 import { hasForbiddenTopic, nameKey, normalizeValue, safeHttpUrl, transliterateName } from "./text.js";
 import { SERVICE_TG_IDS, type User } from "./users.js";
+import type { ChosenSource } from "./zones.js";
 
 /**
  * A member changes their own card by asking the bot. Whose card it is comes from Telegram's authenticated sender and
@@ -44,15 +45,17 @@ export async function asSubject<T>(sql: Sql, subject: Subject, work: (tx: Querya
 export type OwnField = FactKind;
 
 export type OwnOp =
-  | { action: "add"; field: OwnField; value: string }
+  | { action: "add"; field: OwnField; value: string; zones?: string[] }
   | { action: "remove"; factId: number }
-  | { action: "replace"; factId: number; field: OwnField; value: string }
+  | { action: "replace"; factId: number; field: OwnField; value: string; zones?: string[] }
   | { action: "set_tagline"; value: string }
   | { action: "clear_tagline" }
   | { action: "add_alias"; value: string }
   | { action: "remove_alias"; aliasId: number }
   | { action: "add_memo"; projectId: number | null; projectName: string | null; text: string }
-  | { action: "remove_memo"; memoId: number; projectName: string | null };
+  | { action: "remove_memo"; memoId: number; projectName: string | null }
+  | { action: "set_zone"; zone: string; place: string }
+  | { action: "clear_zone" };
 
 export interface OwnFact {
   id: number;
@@ -76,6 +79,8 @@ export interface OwnCard {
   memos: OwnMemo[];
   /** The projects they are an author of: the only ones they may write a note on. */
   projects: { id: number; name: string }[];
+  /** The time zone they chose or their device gave, if any. */
+  zone: { zone: string; source: ChosenSource } | null;
 }
 
 /** The subject's own visible card: what they may name in a request. */
@@ -86,7 +91,8 @@ export async function ownCard(sql: Sql, subject: Subject): Promise<OwnCard> {
       WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} AND status IN ('auto', 'manual')
       ORDER BY array_position(${[...FACT_KINDS]}::text[], kind), id`,
     sql<{ id: number; alias: string }[]>`SELECT id, alias FROM aliases WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} ORDER BY id`,
-    sql<{ tagline: string | null; opted_out: boolean }[]>`SELECT tagline, opted_out FROM members WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId}`,
+    sql<{ tagline: string | null; opted_out: boolean; time_zone: string | null; time_zone_source: ChosenSource | null }[]>`
+      SELECT tagline, opted_out, time_zone, time_zone_source FROM members WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId}`,
     sql<OwnMemo[]>`
       SELECT n.id, n.project_id, p.name AS project_name, n.text FROM memos n LEFT JOIN projects p ON p.id = n.project_id
       WHERE n.chat_id = ${subject.chatId} AND n.user_id = ${subject.userId} AND (n.project_id IS NULL OR NOT p.hidden)
@@ -95,7 +101,8 @@ export async function ownCard(sql: Sql, subject: Subject): Promise<OwnCard> {
       SELECT p.id, p.name FROM projects p JOIN project_members pm ON pm.project_id = p.id
       WHERE p.chat_id = ${subject.chatId} AND pm.user_id = ${subject.userId} AND NOT p.hidden ORDER BY p.name, p.id`,
   ]);
-  return { facts, aliases, tagline: member?.tagline ?? null, optedOut: member?.opted_out ?? true, memos, projects };
+  const zone = member?.time_zone && member.time_zone_source ? { zone: member.time_zone, source: member.time_zone_source } : null;
+  return { facts, aliases, tagline: member?.tagline ?? null, optedOut: member?.opted_out ?? true, memos, projects, zone };
 }
 
 /** One form of a text for every check: NFKC, no invisible or tag characters, collapsed spaces. */
@@ -143,8 +150,14 @@ function variants(word: string): string[] {
 export function groundedIn(value: string, senderText: string): boolean {
   const said = wordsOf(foldMixedScript(senderText)).flatMap(variants);
   const forms = new Set(said);
-  // An inflected Russian word counts when it differs from the value's word only in its ending («Варшаве» for «Варшава»).
-  const inflected = (word: string) => word.length >= 5 && said.some((form) => form.length >= 5 && form.slice(0, -2) === word.slice(0, -2) && Math.abs(form.length - word.length) <= 2);
+  // An inflected Russian word counts when it differs from the value's word only in its ending: «Варшаве» for «Варшава»,
+  // «Берлине» for «Берлин».
+  const inflected = (word: string) =>
+    said.some(
+      (form) =>
+        (word.length >= 5 && form.length >= 5 && form.slice(0, -2) === word.slice(0, -2) && Math.abs(form.length - word.length) <= 2) ||
+        (word.length >= 3 && form.startsWith(word) && form.length - word.length <= 2),
+    );
   return wordsOf(foldMixedScript(value)).every((word) => variants(word).some((form) => forms.has(form)) || inflected(word));
 }
 
@@ -236,7 +249,14 @@ export type Applied =
   | { kind: "alias_added"; aliasId: number; value: string; unrejected: boolean }
   | { kind: "alias_removed"; row: AliasRow }
   | { kind: "memo_added"; memoId: number; projectId: number | null; projectName: string | null; text: string }
-  | { kind: "memo_removed"; row: MemoRow; projectName: string | null };
+  | { kind: "memo_removed"; row: MemoRow; projectName: string | null }
+  | { kind: "zone"; before: ZoneState; value: string | null; place: string | null };
+
+interface ZoneState {
+  time_zone: string | null;
+  time_zone_source: ChosenSource | null;
+  time_zone_set_at: Date | null;
+}
 
 interface MemoRow {
   id: number;
@@ -258,6 +278,7 @@ interface FactRow {
   confidence: number;
   status: string;
   source_msg_ids: number[];
+  zones?: string[] | null;
 }
 
 interface AliasRow {
@@ -275,7 +296,7 @@ async function log(tx: Queryable, subject: Subject, entity: string, entityId: nu
     VALUES (${entity}, ${entityId}, ${op}, ${before === null ? null : tx.json(before as never)}, ${after === null ? null : tx.json(after as never)}, 'user', ${subject.userId}, ${[msgId]})`;
 }
 
-async function addFact(tx: Queryable, subject: Subject, kind: FactKind, raw: string, msgId: number): Promise<Applied[]> {
+async function addFact(tx: Queryable, subject: Subject, kind: FactKind, raw: string, msgId: number, zones?: string[]): Promise<Applied[]> {
   const parts = kind === "stack" ? splitStackValue(raw) : [raw];
   const applied: Applied[] = [];
   for (const part of parts) {
@@ -286,10 +307,12 @@ async function addFact(tx: Queryable, subject: Subject, kind: FactKind, raw: str
     if (!norm) continue;
     const [before] = await tx<{ status: string; value: string; confidence: number }[]>`
       SELECT status, value, confidence FROM facts WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} AND kind = ${kind} AND value_norm = ${norm}`;
+    const placed = kind === "timezone" && zones ? zones : null;
     const [row] = await tx<{ id: number }[]>`
-      INSERT INTO facts (chat_id, user_id, kind, value, value_norm, confidence, status, source_msg_ids)
-      VALUES (${subject.chatId}, ${subject.userId}, ${kind}, ${value}, ${norm}, 1, 'manual', ${[msgId]})
-      ON CONFLICT (chat_id, user_id, kind, value_norm) DO UPDATE SET status = 'manual', value = excluded.value, confidence = 1, updated_at = now()
+      INSERT INTO facts (chat_id, user_id, kind, value, value_norm, confidence, status, source_msg_ids, zones)
+      VALUES (${subject.chatId}, ${subject.userId}, ${kind}, ${value}, ${norm}, 1, 'manual', ${[msgId]}, ${placed})
+      ON CONFLICT (chat_id, user_id, kind, value_norm) DO UPDATE SET status = 'manual', value = excluded.value, confidence = 1, updated_at = now(),
+        zones = coalesce(excluded.zones, facts.zones)
       RETURNING id`;
     const unrejected = (await tx`DELETE FROM rejected_facts WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} AND kind = ${kind} AND value_norm = ${norm}`).count > 0;
     await log(tx, subject, "fact", row!.id, "add", before ?? null, { kind, value }, msgId);
@@ -301,7 +324,7 @@ async function addFact(tx: Queryable, subject: Subject, kind: FactKind, raw: str
 async function removeFact(tx: Queryable, subject: Subject, factId: number, msgId: number): Promise<Applied[]> {
   const [row] = await tx<FactRow[]>`
     DELETE FROM facts WHERE id = ${factId} AND chat_id = ${subject.chatId} AND user_id = ${subject.userId}
-    RETURNING id, chat_id, user_id, kind, value, value_norm, confidence, status, source_msg_ids`;
+    RETURNING id, chat_id, user_id, kind, value, value_norm, confidence, status, source_msg_ids, zones`;
   if (!row) return [];
   await tx`
     INSERT INTO rejected_facts (chat_id, user_id, kind, value_norm) VALUES (${subject.chatId}, ${subject.userId}, ${row.kind}, ${row.value_norm})
@@ -348,6 +371,18 @@ async function removeOwnAlias(tx: Queryable, subject: Subject, aliasId: number, 
   return [{ kind: "alias_removed", row }];
 }
 
+/** Sets the subject's own time zone, or clears it with null; nothing when it is that already. */
+async function setOwnZone(tx: Queryable, subject: Subject, zone: string | null, place: string | null, msgId: number): Promise<Applied[]> {
+  const [before] = await tx<ZoneState[]>`
+    SELECT time_zone, time_zone_source, time_zone_set_at FROM members WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId}`;
+  if (!before || (before.time_zone === zone && (zone === null || before.time_zone_source === "chat"))) return [];
+  await tx`
+    UPDATE members SET time_zone = ${zone}, time_zone_source = ${zone === null ? null : "chat"}, time_zone_set_at = now()
+    WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId}`;
+  await log(tx, subject, "user", subject.userId, "set_time_zone", { zone: before.time_zone, source: before.time_zone_source }, { zone, source: zone === null ? null : "chat", chat_id: subject.chatId }, msgId);
+  return [{ kind: "zone", before, value: zone, place }];
+}
+
 async function addOwnMemo(tx: Queryable, subject: Subject, op: Extract<OwnOp, { action: "add_memo" }>, msgId: number): Promise<Applied[]> {
   const text = cleanText(op.text);
   const [row] = await tx<{ id: number }[]>`
@@ -376,23 +411,25 @@ export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgI
     const [request] = await tx`SELECT 1 FROM self_edits WHERE id = ${requestId} AND status = ${fromStatus} FOR UPDATE`;
     if (!request) return null;
     const [member] = await tx<{ opted_out: boolean }[]>`SELECT opted_out FROM members WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} FOR UPDATE`;
-    const adds = new Set(["add", "replace", "set_tagline", "add_alias", "add_memo"]);
+    const adds = new Set(["add", "replace", "set_tagline", "add_alias", "add_memo", "set_zone"]);
     const applied: Applied[] = [];
     const memoCount = async (projectId: number | null) =>
       (await tx<{ count: number }[]>`SELECT count(*)::int AS count FROM memos WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} AND project_id IS NOT DISTINCT FROM ${projectId}`)[0]?.count ?? 0;
     for (const op of ops) {
       if (member?.opted_out !== false && adds.has(op.action)) continue;
       if (op.action === "add_memo" && (await memoCount(op.projectId)) >= MAX_MEMOS) continue;
-      if (op.action === "add") applied.push(...(await addFact(tx, subject, op.field, op.value, msgId)));
+      if (op.action === "add") applied.push(...(await addFact(tx, subject, op.field, op.value, msgId, op.zones)));
       else if (op.action === "remove") applied.push(...(await removeFact(tx, subject, op.factId, msgId)));
       else if (op.action === "replace") {
         applied.push(...(await removeFact(tx, subject, op.factId, msgId)));
-        applied.push(...(await addFact(tx, subject, op.field, op.value, msgId)));
+        applied.push(...(await addFact(tx, subject, op.field, op.value, msgId, op.zones)));
       } else if (op.action === "set_tagline") applied.push(...(await setTaglineOf(tx, subject, cleanText(op.value), msgId)));
       else if (op.action === "clear_tagline") applied.push(...(await setTaglineOf(tx, subject, null, msgId)));
       else if (op.action === "add_alias") applied.push(...(await addOwnAlias(tx, subject, op.value, msgId)));
       else if (op.action === "remove_alias") applied.push(...(await removeOwnAlias(tx, subject, op.aliasId, msgId)));
       else if (op.action === "add_memo") applied.push(...(await addOwnMemo(tx, subject, op, msgId)));
+      else if (op.action === "set_zone") applied.push(...(await setOwnZone(tx, subject, op.zone, op.place, msgId)));
+      else if (op.action === "clear_zone") applied.push(...(await setOwnZone(tx, subject, null, null, msgId)));
       else applied.push(...(await removeOwnMemo(tx, subject, op, msgId)));
     }
     if (applied.length === 0) return applied;
@@ -411,7 +448,7 @@ export async function undoOwnOps(sql: Sql, subject: Subject, requestId: number, 
     if (!request?.applied) return null;
     const [member] = await tx<{ opted_out: boolean }[]>`SELECT opted_out FROM members WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId}`;
     // Nothing comes back onto the card of someone who has opted out since.
-    const restores = new Set(["fact_removed", "alias_removed", "tagline", "memo_removed"]);
+    const restores = new Set(["fact_removed", "alias_removed", "tagline", "memo_removed", "zone"]);
     const applied = request.applied;
     for (const change of [...applied].reverse()) {
       if (member?.opted_out !== false && restores.has(change.kind)) continue;
@@ -431,14 +468,20 @@ export async function undoOwnOps(sql: Sql, subject: Subject, requestId: number, 
       } else if (change.kind === "fact_removed") {
         const row = change.row;
         await tx`
-          INSERT INTO facts (id, chat_id, user_id, kind, value, value_norm, confidence, status, source_msg_ids)
-          VALUES (${row.id}, ${subject.chatId}, ${subject.userId}, ${row.kind}, ${row.value}, ${row.value_norm}, ${row.confidence}, ${row.status}, ${row.source_msg_ids})
+          INSERT INTO facts (id, chat_id, user_id, kind, value, value_norm, confidence, status, source_msg_ids, zones)
+          VALUES (${row.id}, ${subject.chatId}, ${subject.userId}, ${row.kind}, ${row.value}, ${row.value_norm}, ${row.confidence}, ${row.status}, ${row.source_msg_ids}, ${row.zones ?? null})
           ON CONFLICT DO NOTHING`;
         await tx`DELETE FROM rejected_facts WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} AND kind = ${row.kind} AND value_norm = ${row.value_norm}`;
       } else if (change.kind === "tagline") {
         await tx`
           UPDATE members SET tagline = ${change.before.tagline}, tagline_manual = ${change.before.tagline_manual}
           WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId}`;
+      } else if (change.kind === "zone") {
+        // Only the zone this change set goes back: one chosen since in the Mini App or taken from a device stays.
+        await tx`
+          UPDATE members SET time_zone = ${change.before.time_zone}, time_zone_source = ${change.before.time_zone_source}, time_zone_set_at = ${change.before.time_zone_set_at}
+          WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} AND time_zone IS NOT DISTINCT FROM ${change.value}
+            AND time_zone_source IS NOT DISTINCT FROM ${change.value === null ? null : "chat"}`;
       } else if (change.kind === "memo_added") {
         await tx`DELETE FROM memos WHERE id = ${change.memoId} AND chat_id = ${subject.chatId} AND user_id = ${subject.userId}`;
       } else if (change.kind === "memo_removed") {

@@ -2,7 +2,8 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { approvedChats, pauseChronicle, type Chat } from "../core/chats.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
-import { BudgetExceededError } from "../core/llm.js";
+import { assertBudget, BudgetExceededError, recordUsage } from "../core/llm.js";
+import { PLACE_ZONES_PURPOSE, placeCardPlaces, placeZones } from "../core/zones.js";
 import { clearExpiredTexts } from "../core/messages.js";
 import { consentObjectionsSince, consentObjectionText } from "../core/notes.js";
 import { messageLink } from "../core/text.js";
@@ -21,6 +22,8 @@ import {
 } from "./extract.js";
 import { areThemesDue, buildThemes } from "./themes-index.js";
 
+const PLACING_RETRY_MS = 60 * 60_000;
+
 export interface SchedulerOptions {
   sql: Sql;
   anthropic: Anthropic;
@@ -28,7 +31,7 @@ export interface SchedulerOptions {
     Config,
     "EXTRACTION_MODEL" | "MONTHLY_LLM_BUDGET_USD" | "CHAT_MONTHLY_BUDGET_USD" | "EXTRACTION_INTERVAL_HOURS" | "EXTRACTION_PASS_MESSAGES" | "EXTRACTION_MIN_GAP_MINUTES"
   > &
-    Partial<Pick<Config, "ADMIN_TG_IDS" | "DISPLAY_TIMEZONE">>;
+    Partial<Pick<Config, "ADMIN_TG_IDS" | "DISPLAY_TIMEZONE" | "PLACE_ZONES_MODEL">>;
   checkEveryMs?: number;
   /** A message to the bot owners; `resumeChatId` adds a button that resumes the chronicler paused in that chat. */
   notifyAdmins: (text: string, offer?: { resumeChatId: number }) => Promise<void>;
@@ -112,6 +115,8 @@ export function createChatProcessor(options: SchedulerOptions, signals?: StopSig
   const log = options.log ?? ((line: string) => console.log(line));
   const lastAlertAt = new Map<string, number>();
   const stopping = () => signals?.drain.aborted ?? false;
+  /** A chat whose places could not be placed waits this long before the next try. */
+  const placingFailedAt = new Map<number, number>();
 
   const alertOnce = async (key: string, text: string) => {
     if (Date.now() - (lastAlertAt.get(key) ?? 0) < ALERT_COOLDOWN_MS) return;
@@ -261,6 +266,33 @@ export function createChatProcessor(options: SchedulerOptions, signals?: StopSig
     } catch (error) {
       if (error instanceof BudgetExceededError) await reportBudget(error, title);
       else log(`[themes] ${title}: not rebuilt, the next try is in a day: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    // The places on cards that have no time zones yet: a city added in the Mini App or by the chronicler.
+    const model = config.PLACE_ZONES_MODEL;
+    try {
+      if (model && !stopping() && !paused && Date.now() - (placingFailedAt.get(chat.id) ?? 0) > PLACING_RETRY_MS) {
+        const placed = await placeCardPlaces(sql, chat.id, async (places) => {
+          await assertBudget(sql, config.MONTHLY_LLM_BUDGET_USD, { id: chat.id, limitUsd: chatUsd });
+          const zones = await placeZones(places, {
+            anthropic: options.anthropic,
+            model,
+            onUsage: (usage) => recordUsage(sql, PLACE_ZONES_PURPOSE, model, usage, chat.id),
+            signal: signals?.abort,
+            endUserId: options.endUserIdOf?.(chat.id),
+          });
+          return zones;
+        });
+        if (placed.placed || placed.nowhere) log(`[zones] ${title}: placed ${placed.placed} place(s) on cards in their time zones${placed.nowhere ? `, ${placed.nowhere} name no place` : ""}`);
+        if (placed.unplaced) {
+          placingFailedAt.set(chat.id, Date.now());
+          log(`[zones] ${title}: ${placed.unplaced} place(s) on cards could not be placed; the next try is in an hour`);
+        }
+      }
+    } catch (error) {
+      placingFailedAt.set(chat.id, Date.now());
+      if (error instanceof BudgetExceededError) await reportBudget(error, title);
+      else log(`[zones] ${title}: the places on cards were not placed, the next try is in an hour: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
 }
