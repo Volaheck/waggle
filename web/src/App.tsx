@@ -28,6 +28,7 @@ import {
   type ChatInfo,
   type ChronicleEntry,
   type Fact,
+  type Memo,
   type PersonSummary,
   type Project,
 } from "./api";
@@ -880,6 +881,7 @@ interface PersonResponse {
   /** What the chat calls them, set by them, an owner or the chronicler. */
   aliases?: string[];
   projects: Project[];
+  memos?: Memo[];
   messages_30d: number;
   is_me?: boolean;
   /** The viewer's own card, or a bot owner looking after someone else's. */
@@ -1009,6 +1011,22 @@ function PersonScreen({ id, go }: { id: string; go: Go }) {
           )}
         </Card>
       </Section>
+      {data.memos && data.memos.length > 0 && (
+        <Section label="notes" index={2}>
+          <Card className="dossier">
+            <NoteList
+              memos={data.memos}
+              canDelete={() => data.can_edit}
+              busy={busy}
+              onDelete={async (memo) => {
+                setBusy(memo.id);
+                if (await deleteNote(memo)) reload();
+                setBusy(null);
+              }}
+            />
+          </Card>
+        </Section>
+      )}
       {projects.length > 0 && (
         <Section label="projects" index={2}>
           <Card className="board">
@@ -1295,6 +1313,11 @@ interface ProjectResponse {
   first_seen_url: string | null;
   discussions: { msg_id: number; text: string; display_name: string | null; url: string }[];
   history: ChronicleEntry[];
+  memos?: Memo[];
+  /** The viewer is one of its authors. */
+  can_note?: boolean;
+  /** A bot owner, who may take a note down. */
+  can_moderate?: boolean;
 }
 
 function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
@@ -1307,6 +1330,7 @@ function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
   const [refused, setRefused] = useState(false);
   const [pop, setPop] = useState(false);
   const [allHistory, setAllHistory] = useState(false);
+  const [noteBusy, setNoteBusy] = useState<number | null>(null);
   useEffect(() => setResult(null), [data]);
   // The viewer is awaited too, so an author never meets a Vote button that can only fail.
   if (!data || (!viewer.data && !viewer.error)) return <LoadState error={error} retry={reload} skeleton="project" />;
@@ -1458,6 +1482,28 @@ function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
                 </div>
               </div>
             ))}
+          </Card>
+        </Section>
+      )}
+      {((data.memos ?? []).length > 0 || data.can_note) && (
+        <Section label="notes" index={2}>
+          <Card className="dossier">
+            {(data.memos ?? []).length === 0 ? (
+              <div className="hint">Nothing yet — news, plans, what the project needs.</div>
+            ) : (
+              <NoteList
+                memos={data.memos ?? []}
+                canDelete={(memo) => memo.user_id === viewer.data?.user.id || Boolean(data.can_moderate)}
+                busy={noteBusy}
+                byline={(memo) => memo.display_name ?? null}
+                onDelete={async (memo) => {
+                  setNoteBusy(memo.id);
+                  if (await deleteNote(memo)) reload();
+                  setNoteBusy(null);
+                }}
+              />
+            )}
+            {data.can_note && <NoteForm projectId={project.id} placeholder="A note on the project, in your own words" onAdded={reload} />}
           </Card>
         </Section>
       )}
@@ -1877,12 +1923,107 @@ function ChronicleScreen() {
   );
 }
 
+// ---------- notes ----------
+
+const NOTE_ERRORS: Record<string, string> = {
+  too_long: "too long — 300 characters at most",
+  personal_data: "no phone numbers, emails or other personal data here",
+  forbidden: "that’s a topic the bot never keeps",
+  names_someone: "a note is about you or your project — leave other people out",
+  too_many: "20 notes already — remove an old one first",
+  opted_out: "your card is off — turn it back on first",
+  forbidden_project: "only the project’s authors write notes on it",
+};
+
+const noteDate = (iso: string) => new Date(iso).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+
+/** Notes people wrote themselves, newest first, each dated, with a delete button where the viewer may use it. */
+function NoteList({ memos, canDelete, onDelete, busy, byline }: { memos: Memo[]; canDelete: (memo: Memo) => boolean; onDelete: (memo: Memo) => void; busy: number | null; byline?: (memo: Memo) => string | null }) {
+  return (
+    <>
+      {memos.map((memo) => (
+        <div key={memo.id} className="edit-row note-row">
+          <div className="grow">
+            <span lang={langOf(memo.text)}>{memo.text}</span>
+            <span className="note-meta">{[byline?.(memo), noteDate(memo.created_at)].filter(Boolean).join(" · ")}</span>
+          </div>
+          {canDelete(memo) && (
+            <div className="row-actions">
+              <button className="icon-btn reject" aria-label={`Delete the note “${memo.text}”`} disabled={busy === memo.id} onClick={() => onDelete(memo)}>
+                <Icon name="close" />
+              </button>
+            </div>
+          )}
+        </div>
+      ))}
+    </>
+  );
+}
+
+/** A note to add: the server checks what it says, and its refusal is shown in plain words. */
+function NoteForm({ projectId, placeholder, onAdded }: { projectId: number | null; placeholder: string; onAdded: () => void }) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+  const add = async () => {
+    const value = text.trim();
+    if (!value || busy) return;
+    setBusy(true);
+    setFailed(null);
+    try {
+      await api("/memos", { method: "POST", body: { text: value, project_id: projectId } });
+      haptic("success");
+      setText("");
+      onAdded();
+    } catch (error) {
+      haptic("error");
+      const code = error instanceof ApiError ? (error.code === "forbidden" ? "forbidden_project" : error.code) : "";
+      setFailed(NOTE_ERRORS[code] ?? "couldn’t add it — try again");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="note-form">
+      <AutoTextarea rows={2} maxLength={300} aria-label="New note" placeholder={placeholder} lang={langOf(text)} value={text} onChange={(event) => setText(event.target.value)} />
+      <div className="field-foot">
+        <span className={cx("field-count", text.length >= 280 && "near")}>{text.length}/300</span>
+      </div>
+      <button className="btn small" disabled={!text.trim() || busy} onClick={() => void add()}>
+        <Icon name="plus" />
+        Add a note
+      </button>
+      {failed && (
+        <div className="form-error" role="alert">
+          <Glyph>&gt;</Glyph>
+          {failed}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Deletes a note after a confirmation; true once it is gone. */
+async function deleteNote(memo: Memo): Promise<boolean> {
+  if (!(await tgConfirm(`Delete the note “${memo.text.slice(0, 80)}”?`))) return false;
+  try {
+    await api(`/memos/${memo.id}`, { method: "DELETE" });
+    haptic("success");
+    return true;
+  } catch {
+    haptic("error");
+    tgAlert("Couldn’t delete it — try again");
+    return false;
+  }
+}
+
 // ---------- me ----------
 
 interface MeResponse {
   user: { id: number; display_name: string; username: string | null; tagline: string | null; tagline_manual: boolean; opted_out: boolean; is_admin?: boolean };
   facts: Fact[];
   projects: Project[];
+  memos?: Memo[];
 }
 
 const MANUAL_KINDS = ["role", "stack", "expertise", "interest", "looking_for", "can_help", "link", "timezone"] as const;
@@ -1938,6 +2079,7 @@ function MeScreen({ go }: { go: Go }) {
   const [busy, setBusy] = useState<Busy>(null);
   const [addFailed, setAddFailed] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
+  const [noteBusy, setNoteBusy] = useState<number | null>(null);
   const closeToast = useCallback(() => setToast(null), []);
   // A saved tagline drops the draft only once the fresh card carries it, so the old text never flashes back.
   const savedTagline = data?.user.tagline ?? "";
@@ -2072,6 +2214,27 @@ function MeScreen({ go }: { go: Go }) {
                   </button>
                 </div>
               )}
+            </Card>
+          </Section>
+
+          <Section label="notes" index={4}>
+            <Card className="dossier">
+              {(data.memos ?? []).length === 0 ? (
+                <div className="hint">Plans, news, what you’re after — in your own words. You can also ask the bot in the chat: “add a note: …”.</div>
+              ) : (
+                <NoteList
+                  memos={data.memos ?? []}
+                  canDelete={() => true}
+                  busy={noteBusy}
+                  byline={(memo) => (memo.project_name ? `on ${memo.project_name}` : null)}
+                  onDelete={async (memo) => {
+                    setNoteBusy(memo.id);
+                    if (await deleteNote(memo)) reload();
+                    setNoteBusy(null);
+                  }}
+                />
+              )}
+              <NoteForm projectId={null} placeholder="A note about you, in your own words" onAdded={reload} />
             </Card>
           </Section>
 

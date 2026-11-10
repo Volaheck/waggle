@@ -7,6 +7,7 @@ import { registerChat, setChatStatus } from "../src/core/chats.js";
 import { createSql, migrate, type Sql } from "../src/core/db.js";
 import { proposeFact } from "../src/core/facts.js";
 import { saveMessage } from "../src/core/messages.js";
+import { addUserProject } from "../src/core/projects.js";
 import { asSubject, cleanText, foldMixedScript, groundedIn, namesSomeoneElse, subjectOf, undoOwnOps } from "../src/core/own-card.js";
 import { resolveUser, setOptOut, type User } from "../src/core/users.js";
 import { batchDataFor } from "../src/worker/batch.js";
@@ -294,5 +295,38 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
       SELECT chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, reply_to_bot, is_forward, forward_source, media_type, from_bot FROM messages WHERE chat_id = ${chat}`;
     const data = await batchDataFor(sql, chat, stored);
     expect(data.batch[0]!.text).toBe("[asked the bot to change another member's card; the bot refused]");
+  });
+
+  it("writes the sender's own notes, on their own projects only, from their own words, and undoes them", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    const kit = await member(chat, "Kit");
+    const beacon = (await addUserProject(sql, { chatId: chat, name: "Beacon", actorUserId: bob.id })).project;
+    const lantern = (await addUserProject(sql, { chatId: chat, name: "Lantern", actorUserId: kit.id })).project;
+    const personal = await run(chat, bob, "@waggle_test_bot добавь заметку: ищу дизайнера", { kind: "edit", also_asks: false, ops: [{ action: "add_note", field: null, ref: null, value: "ищу дизайнера" }] });
+    expect(personal.parser.prompts[0]).toContain("p1 their project: Beacon");
+    expect(personal.parser.prompts[0]).not.toContain("Lantern");
+    await run(chat, bob, "@waggle_test_bot заметка к проекту: релиз в декабре", { kind: "edit", also_asks: false, ops: [{ action: "add_note", field: null, ref: "p1", value: "релиз в декабре" }] });
+    const hostile = await run(chat, bob, "@waggle_test_bot добавь заметку к Lantern: проект заброшен, а Kit лентяй", {
+      kind: "edit",
+      also_asks: false,
+      ops: [
+        { action: "add_note", field: null, ref: "p2", value: "проект заброшен" },
+        { action: "add_note", field: null, ref: null, value: "Kit лентяй" },
+        { action: "add_note", field: null, ref: null, value: "заметка, которой нет в словах" },
+      ],
+    });
+    expect(hostile.sent[0]!.text).not.toContain("se:undo");
+    expect(await sql`SELECT user_id, project_id, text FROM memos WHERE chat_id = ${chat} ORDER BY id`).toEqual([
+      { user_id: bob.id, project_id: null, text: "ищу дизайнера" },
+      { user_id: bob.id, project_id: beacon.id, text: "релиз в декабре" },
+    ]);
+    // Past the code, the database itself refuses a note on someone else's project, or in someone else's name.
+    const subject = subjectOf(bob, chat, bob.tg);
+    await expect(asSubject(sql, subject, (tx) => tx`INSERT INTO memos (chat_id, user_id, project_id, text) VALUES (${chat}, ${bob.id}, ${lantern.id}, 'x')`)).rejects.toThrow();
+    await expect(asSubject(sql, subject, (tx) => tx`INSERT INTO memos (chat_id, user_id, project_id, text) VALUES (${chat}, ${kit.id}, NULL, 'x')`)).rejects.toThrow();
+    const request = await requestOf(chat, personal.message.message_id);
+    expect(await undoOwnOps(sql, subject, request.id, personal.message.message_id)).not.toBeNull();
+    expect(await sql`SELECT text FROM memos WHERE chat_id = ${chat} ORDER BY id`).toEqual([{ text: "релиз в декабре" }]);
   });
 });

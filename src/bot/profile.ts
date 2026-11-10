@@ -1,5 +1,6 @@
 import { InlineKeyboard } from "grammy";
 import { memberAliases } from "../core/aliases.js";
+import { ownMemos } from "../core/memos.js";
 import { chatsOfUser, getChat } from "../core/chats.js";
 import {
   FACT_KIND_LABELS,
@@ -182,7 +183,7 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
 
   async function knowledgeScreen(ctx: BotContext, scope: Scope, edit: boolean) {
     const { person, chatId, user } = scope;
-    const facts = await ownFacts(sql, chatId, user.id);
+    const [facts, memos] = await Promise.all([ownFacts(sql, chatId, user.id), ownMemos(sql, chatId, user.id)]);
     const [stats] = await sql<{ messages: number; first: Date | null }[]>`
       SELECT count(*)::int AS messages, min(sent_at) AS first FROM messages WHERE chat_id = ${chatId} AND user_id = ${user.id}`;
     const text = [
@@ -194,6 +195,9 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
       "",
       "<b>Facts</b> (✍️ — added by you, 🙈 — hidden, numbers — source messages):",
       factsWithSources(facts, chatId),
+      ...(memos.length
+        ? ["", "<b>Your notes</b>:", ...memos.map((memo) => `📝 ${escapeHtml(memo.text)}${memo.project_name ? ` <i>— on ${escapeHtml(memo.project_name)}</i>` : ""}`)]
+        : []),
       "",
       `Message texts are kept for ${retention} for the chronicle and /catchup, then deleted once the chronicler has gone through them. To delete everything about you in all chats — /forgetme.`,
     ].join("\n");

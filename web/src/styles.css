@@ -423,6 +423,12 @@ select.input { appearance: none; -webkit-appearance: none; padding-right: 38px; 
 .source svg { width: 15px; height: 15px; }
 .source:active { background: var(--surface-2); color: var(--text); }
 .edit-row { display: flex; align-items: center; gap: 4px; min-height: 44px; }
+.note-row { border-top: 1px solid var(--border); }
+.note-row:first-child { border-top: 0; }
+.note-row .grow { display: flex; flex-direction: column; gap: 3px; }
+.note-meta { color: var(--muted); font: 11.5px/1.4 var(--font-mono); }
+.note-form { display: grid; gap: 8px; padding: 12px 0 8px; }
+.note-row + .note-form { border-top: 1px solid var(--border); }
 .edit-row .grow { padding: 6px 0; font-size: 15px; line-height: 1.4; overflow-wrap: anywhere; }
 
 /* ---------- score in a honeycomb cell, filled with honey relative to the leader ---------- */

@@ -708,6 +708,7 @@ export async function mergeProjects(sql: Sql, chatId: number, intoSlug: string, 
         SELECT ${into.id}, user_id, created_at FROM votes WHERE project_id = ${project.id}
         ON CONFLICT DO NOTHING`;
       await tx`UPDATE project_signals SET project_id = ${into.id} WHERE project_id = ${project.id}`;
+      await tx`UPDATE memos SET project_id = ${into.id} WHERE project_id = ${project.id}`;
       await tx`UPDATE chronicle SET project_id = ${into.id} WHERE project_id = ${project.id}`;
       await moveProjectAliases(tx, project.id, into.id);
       const links = { ...project.links, ...into.links, other: [...new Set([...(into.links.other ?? []), ...(project.links.other ?? [])])] };

@@ -197,6 +197,7 @@ async function applyOptOut(tx: Queryable, userId: number, optedOut: boolean, sco
     await tx`DELETE FROM facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     await tx`DELETE FROM rejected_facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     await tx`DELETE FROM aliases WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
+    await tx`DELETE FROM memos WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     await forgetNotes(tx, userId, scope);
     // Notes on how the person uses others' projects are shown on those project cards, so they go as well.
     await tx`

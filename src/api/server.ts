@@ -9,6 +9,8 @@ import type { Sql } from "../core/db.js";
 import { FACT_KINDS, getFact, ownFacts, proposeFact, rejectFact, setFactHidden, visibleFacts } from "../core/facts.js";
 import { addUserProject, canEditProject, getProjectBySlug, hideProject, listProjects, mergeProjects, PROJECT_STATUSES, projectsOfUser, renameProject, setVote, updateProject } from "../core/projects.js";
 import { topChronicle, topLimitFor } from "../core/chronicle.js";
+import { addMemo, canNoteProject, deleteMemo, MAX_MEMO_CHARS, memosOf, ownMemos, projectMemos } from "../core/memos.js";
+import { cleanText, memoProblem, othersOf } from "../core/own-card.js";
 import { messageLink, safeHttpUrl, truncate } from "../core/text.js";
 import { approvedChats, chatsOfUser, setCurrentChat, type Chat } from "../core/chats.js";
 import { ensureMember, getPerson, peopleOfChat, resolveUser, setOptOut, setTagline, type Person, type User } from "../core/users.js";
@@ -202,11 +204,12 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     const user = c.get("user");
     const person = c.get("person");
     const chatId = c.get("chatId");
-    const [facts, projects] = await Promise.all([ownFacts(sql, chatId, user.id), projectsOfUser(sql, chatId, user.id)]);
+    const [facts, projects, memos] = await Promise.all([ownFacts(sql, chatId, user.id), projectsOfUser(sql, chatId, user.id), ownMemos(sql, chatId, user.id)]);
     return c.json({
       user: { ...personPayload(person), tagline: person.tagline, tagline_manual: person.tagline_manual, is_admin: isOwner(user) },
       facts: facts.map(withSources(c)),
       projects,
+      memos,
     });
   });
 
@@ -243,6 +246,28 @@ export function createApi(deps: ApiDeps): Hono<Env> {
   api.post("/facts/:id/hide", factAction("hide"));
   api.post("/facts/:id/restore", factAction("restore"));
 
+  // Notes are written by their author only, about themselves or about a project of theirs; an owner may take one down.
+  api.post("/memos", async (c) => {
+    const user = c.get("user");
+    const chatId = c.get("chatId");
+    const body = z.object({ text: z.string().max(MAX_MEMO_CHARS * 2), project_id: z.number().int().positive().nullable().optional() }).safeParse(await c.req.json());
+    if (!body.success) return c.json({ error: "bad_request" }, 400);
+    if (c.get("person").opted_out) return c.json({ error: "opted_out" }, 409);
+    const projectId = body.data.project_id ?? null;
+    if (projectId !== null && !(await canNoteProject(sql, chatId, projectId, user.id))) return c.json({ error: "forbidden" }, 403);
+    const text = cleanText(body.data.text);
+    const problem = memoProblem(text, await othersOf(sql, chatId, user.id));
+    if (problem) return c.json({ error: problem }, 422);
+    const memo = await addMemo(sql, { chatId, userId: user.id, projectId, text });
+    return memo ? c.json({ memo }) : c.json({ error: "too_many" }, 409);
+  });
+
+  api.delete("/memos/:id", async (c) => {
+    const user = c.get("user");
+    const ok = await deleteMemo(sql, { chatId: c.get("chatId"), memoId: Number(c.req.param("id")), actorUserId: user.id, asOwner: isOwner(user) });
+    return ok ? c.json({ ok }) : c.json({ error: "not_found" }, 404);
+  });
+
   api.get("/people", async (c) => {
     const chatId = c.get("chatId");
     const [people, extras] = await Promise.all([
@@ -273,13 +298,14 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     const chatId = c.get("chatId");
     const person = await getPerson(sql, chatId, Number(c.req.param("id")));
     if (!person) return c.json({ error: "not_found" }, 404);
-    const [facts, projects, stats, aliases] = await Promise.all([
+    const [facts, projects, stats, aliases, memos] = await Promise.all([
       person.opted_out ? Promise.resolve([]) : visibleFacts(sql, chatId, person.id),
       projectsOfUser(sql, chatId, person.id),
       sql<{ messages_30d: number }[]>`
         SELECT count(*)::int AS messages_30d FROM messages
         WHERE chat_id = ${chatId} AND user_id = ${person.id} AND sent_at > now() - interval '30 days'`,
       person.opted_out ? Promise.resolve([]) : memberAliases(sql, chatId, person.id),
+      person.opted_out ? Promise.resolve([]) : memosOf(sql, chatId, [person.id]),
     ]);
     const viewer = c.get("user");
     return c.json({
@@ -287,6 +313,7 @@ export function createApi(deps: ApiDeps): Hono<Env> {
       facts: facts.map(withSources(c)),
       aliases,
       projects,
+      memos,
       messages_30d: stats[0]?.messages_30d ?? 0,
       is_me: viewer.id === person.id,
       can_edit: viewer.id === person.id || isOwner(viewer),
@@ -323,9 +350,13 @@ export function createApi(deps: ApiDeps): Hono<Env> {
       WHERE project_id = ${project.id} AND chat_id = ${chatId}
       ORDER BY period_to DESC
       LIMIT 10`;
+    const [memos, canNote] = await Promise.all([projectMemos(sql, [project.id]), canNoteProject(sql, chatId, project.id, user.id)]);
     return c.json({
       project: withAuthorAvatars(project),
       can_edit: await canEditProject(sql, project.id, user.id, isOwner(user)),
+      memos,
+      can_note: canNote,
+      can_moderate: isOwner(user),
       first_seen_url: project.first_seen_msg_id ? linkFor(c, project.first_seen_msg_id) : null,
       discussions: discussions.flatMap((row) => {
         const url = linkFor(c, row.msg_id);

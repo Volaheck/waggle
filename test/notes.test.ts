@@ -811,6 +811,14 @@ describe.skipIf(!DATABASE_URL)("notes, themes and the hidden layer", () => {
       expect(wornWords(worded.slice(0, 4), asked(4))).toEqual(["обещания", "2.5"]);
       expect(wornWords(worded.slice(0, 4), asked(5))).toEqual(["2.5"]);
     });
+
+    it("shows the notes people wrote themselves in the focus, dated", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      await sql`INSERT INTO memos (chat_id, user_id, text) VALUES (${chat}, ${kit.id}, 'ищу дизайнера в команду')`;
+      const focus = block(await contextFor(asking(chat, kit, "что нового?")), "in_focus")!;
+      expect(focus).toMatch(/📝 notes they wrote themselves: “ищу дизайнера в команду” \(\d{1,2} \w{3,4}\)/);
+    });
   });
 
   describe("the bot", () => {

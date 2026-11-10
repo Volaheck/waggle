@@ -109,6 +109,37 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
     await sql?.end();
   });
 
+  describe("notes", () => {
+    it("are written by their author only, about themselves or on their own project, and taken down by the author or an owner", async () => {
+      const app = createApi({ sql, botToken: TOKEN, adminTgIds: [9103], isMember: async () => true, webDistDir: "web/dist" });
+      // Signing in renames an account after its Telegram name, so each signs in under its own.
+      const names: Record<number, string> = { 9101: "Anna", 9102: "Mallory", 9103: "Carol" };
+      const as = (tgId: number) => ({ ...auth(tgId, names[tgId]), "x-chat-id": key(A), "content-type": "application/json" });
+      const post = (tgId: number, body: unknown) => app.request("/api/memos", { method: "POST", headers: as(tgId), body: JSON.stringify(body) });
+      const notebook = (await addUserProject(sql, { chatId: A, name: "Notebook", actorUserId: ids.anna! })).project;
+
+      const own = await post(9101, { text: "looking for a designer" });
+      expect(own.status).toBe(200);
+      const { memo } = (await own.json()) as { memo: { id: number } };
+      expect((await post(9101, { text: "beta in December", project_id: notebook.id })).status).toBe(200);
+      expect((await post(9102, { text: "abandoned", project_id: notebook.id })).status).toBe(403);
+      expect((await post(9102, { text: "Anna never ships" })).status).toBe(422);
+      expect((await post(9102, { text: "call me at +7 999 123-45-67" })).status).toBe(422);
+
+      const card = (await (await app.request(`/api/people/${ids.anna}`, { headers: as(9102) })).json()) as { memos: { text: string }[] };
+      expect(card.memos.map((note) => note.text)).toEqual(["looking for a designer"]);
+      const page = (await (await app.request(`/api/projects/${notebook.slug}`, { headers: as(9102) })).json()) as { memos: { text: string }[]; can_note: boolean };
+      expect(page.memos.map((note) => note.text)).toEqual(["beta in December"]);
+      expect(page.can_note).toBe(false);
+
+      expect((await app.request(`/api/memos/${memo.id}`, { method: "DELETE", headers: as(9102) })).status).toBe(404);
+      expect((await app.request(`/api/memos/${memo.id}`, { method: "DELETE", headers: as(9103) })).status).toBe(200);
+      await setOptOut(sql, ids.anna!, true, A);
+      expect(await sql`SELECT 1 FROM memos WHERE user_id = ${ids.anna!} AND chat_id = ${A}`).toHaveLength(0);
+      await setOptOut(sql, ids.anna!, false, A);
+    });
+  });
+
   describe("adding projects by hand", () => {
     it("never takes over another member's project by its name, slug or link", async () => {
       const created = await addUserProject(sql, { chatId: A, name: "Atlas", tagline: "Anna's tracker", links: { repo: "https://github.com/anna/atlas" }, actorUserId: ids.anna! });

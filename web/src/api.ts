@@ -159,6 +159,19 @@ export interface Source {
   url: string;
 }
 
+/** A note its author wrote, about themselves or about a project of theirs. */
+export interface Memo {
+  id: number;
+  user_id: number;
+  project_id: number | null;
+  text: string;
+  created_at: string;
+  /** The project it is on, in its author's own list. */
+  project_name?: string | null;
+  /** Its author, on a project's page. */
+  display_name?: string;
+}
+
 export interface Fact {
   id: number;
   kind: string;

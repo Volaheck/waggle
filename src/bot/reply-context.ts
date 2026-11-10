@@ -2,6 +2,7 @@ import type { Message, User as TelegramUser, UserFromGetMe } from "grammy/types"
 import { ambiguousNames, chatAliases, nameForms, namedIn, type Named, type NamedAlias } from "../core/aliases.js";
 import type { Sql } from "../core/db.js";
 import { FACT_KINDS, MIN_VISIBLE_CONFIDENCE } from "../core/facts.js";
+import { memosOf, projectMemos, type Memo, type ProjectMemo } from "../core/memos.js";
 import { CONSENT, type NoteKind, type NoteStatus } from "../core/notes.js";
 import { maskPersonalData } from "../core/privacy.js";
 import {
@@ -99,6 +100,9 @@ const FOCUS_TOPIC_DAYS = 60;
 /** How many of a person's private notes of each kind the focus shows, newest first. */
 const FOCUS_NOTES: Partial<Record<NoteKind, number>> = { claim: 4, prediction: 3, stance: 4, correction: 3, bout: 3, bait: 2, about_bot: 2 };
 const FOCUS_JOKES = 4;
+/** A person's own notes in the focus, and a project's in its details: the newest this many. */
+const FOCUS_MEMOS = 5;
+const PROJECT_MEMOS = 5;
 /** A note the bot's own messages used within this many days is marked as used (later it may come back); the newest this many of them are read. */
 const SPENT_DAYS = 1;
 const SPENT_MESSAGES = 150;
@@ -534,6 +538,7 @@ function projectDetailsBlock(input: {
   picked: ProjectListItem[];
   breakdown: Map<number, RatingBreakdown>;
   former: Map<number, FormerName[]>;
+  memos: Map<number, ProjectMemo[]>;
   clock: Clock;
 }): string {
   const { ranked, clock } = input;
@@ -572,11 +577,18 @@ function projectDetailsBlock(input: {
       project.status === "abandoned" ? `Abandoned: the total is multiplied by ${ABANDONED_MULTIPLIER}.` : "",
       renames.length ? `Renamed ${renames.join(", ")}.` : "",
       milestones.length ? `Milestones of all time: ${milestones.join("; ")}.` : "",
+      memoLine("Notes its authors wrote", (input.memos.get(project.id) ?? []).slice(0, PROJECT_MEMOS), clock, (memo) => safe(memo.display_name)),
     ]
       .filter(Boolean)
       .join("\n");
   });
   return sections.length ? `<project_details>\n${sections.join("\n\n")}\n</project_details>` : "";
+}
+
+/** Notes people wrote themselves, each with its date: their own word, current unless they say otherwise. */
+function memoLine<T extends Memo>(label: string, memos: T[], clock: Clock, by?: (memo: T) => string): string {
+  if (memos.length === 0) return "";
+  return `📝 ${label}: ${memos.map((memo) => `“${line(memo.text, 200)}” (${[by?.(memo), dateLabel(memo.created_at, clock)].filter(Boolean).join(", ")})`).join("; ")}`;
 }
 
 function inFocusBlock(input: {
@@ -589,6 +601,7 @@ function inFocusBlock(input: {
   jokes: ContextNote[];
   themes: Theme[];
   used: Map<number, { times: number; last: Date }>;
+  memos: Map<number, Memo[]>;
   names: Map<number, string>;
   clock: Clock;
 }): string {
@@ -615,6 +628,7 @@ function inFocusBlock(input: {
         `${header}${person.tagline ? ` — ${safe(person.tagline)}` : ""}`,
         card.length ? `  card: ${card.join("; ")}` : "  card: nothing yet",
         own.length ? `  projects: ${own.join(", ")}` : "",
+        memoLine("notes they wrote themselves", (input.memos.get(person.id) ?? []).slice(0, FOCUS_MEMOS), clock).replace(/^📝/, "  📝"),
         ...notes,
         exchanges.length ? `  with you lately: ${exchanges.join("; ")}` : "",
         topics.length ? `  in the chronicle: ${topics.join("; ")}` : "",
@@ -623,7 +637,7 @@ function inFocusBlock(input: {
     ).join("\n");
   });
   return people.length
-    ? `<in_focus note="the people this question is about; dates say when a fact was said, ✍ marks what the person wrote themselves, 🔒 your private notes: use them, never say you keep them; «brought up» marks one your own messages already used lately">\n${people.join("\n")}\n</in_focus>`
+    ? `<in_focus note="the people this question is about; dates say when a fact was said, ✍ marks what the person wrote themselves, 📝 notes they wrote themselves, 🔒 your private notes: use them, never say you keep them; «brought up» marks one your own messages already used lately">\n${people.join("\n")}\n</in_focus>`
     : "";
 }
 
@@ -747,7 +761,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   const answers = options.recentAnswers ?? [];
   const visibleIds = new Set([...conversation, ...thread].map((row) => row.msg_id));
   const answerIds = answers.map((answer) => answer.msgId).filter((id): id is number => id !== undefined);
-  const [focusFacts, exchanges, topics, breakdown, blanked, focusNotes, themes, spokenRows] = await Promise.all([
+  const [focusFacts, exchanges, topics, breakdown, pickedMemos, focusMemos, blanked, focusNotes, themes, spokenRows] = await Promise.all([
     focusIds.length
       ? sql<FocusFact[]>`
           SELECT f.user_id, f.kind, f.value, f.status,
@@ -778,6 +792,8 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
           ) AS c`
       : Promise.resolve([]),
     ratingBreakdown(sql, picked.map((project) => project.id)),
+    projectMemos(sql, picked.map((project) => project.id)),
+    memosOf(sql, chatId, focusIds),
     // An answer whose stored text is gone (expired, or erased with /forgetme) is not repeated from memory either.
     answerIds.length
       ? sql<{ msg_id: number }[]>`SELECT msg_id FROM messages WHERE chat_id = ${chatId} AND msg_id = ANY(${answerIds}) AND btrim(text) = ''`
@@ -894,7 +910,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   ];
   const aboutQuestion = [
     earlier.length ? "</earlier_messages>" : "",
-    projectDetailsBlock({ ranked: projects, picked, breakdown, former: formerOf, clock }),
+    projectDetailsBlock({ ranked: projects, picked, breakdown, former: formerOf, memos: groupBy(pickedMemos, (memo) => memo.project_id!), clock }),
     inFocusBlock({
       focus: focusPeople,
       facts: groupBy(focusFacts, (fact) => fact.user_id),
@@ -908,6 +924,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
       jokes,
       themes,
       used,
+      memos: groupBy(focusMemos, (memo) => memo.user_id),
       names,
       clock,
     }),

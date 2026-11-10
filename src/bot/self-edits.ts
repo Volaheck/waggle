@@ -5,6 +5,7 @@ import { getChat } from "../core/chats.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
 import { FACT_KINDS, type FactKind } from "../core/facts.js";
+import { MAX_MEMOS } from "../core/memos.js";
 import { detectLanguage } from "../core/language.js";
 import { assertBudget, BudgetExceededError, callStructured, memberEndUserId, recordUsage } from "../core/llm.js";
 import {
@@ -12,6 +13,7 @@ import {
   applyOwnOps,
   cleanText,
   groundedIn,
+  memoProblem,
   namesSomeoneElse,
   otherMembers,
   ownCard,
@@ -47,13 +49,13 @@ const READ_TIMEOUT_MS = 20_000;
 const OWNERS_ASKED_EVERY_MS = 24 * 3_600_000;
 /** Words a request to change a card can hardly do without: a message with none of them is answered as a question, unread. */
 const REQUEST_CUE =
-  /запис|запиш|добав|удал|убер|убра|сотр|стер|забуд|помен|измен|обнов|исправ|поправ|внес|замен|постав|укаж|отмет|зов|назыв|карточ|теглайн|тэглайн|подпис|\b(?:add|remove|delete|drop|change|update|set|replace|record|write|erase|forget|call me|card|tagline)\b/iu;
+  /запис|запиш|добав|удал|убер|убра|сотр|стер|забуд|помен|измен|обнов|исправ|поправ|внес|замен|постав|укаж|отмет|зов|назыв|карточ|теглайн|тэглайн|подпис|заметк|сохран|\b(?:add|remove|delete|drop|change|update|set|replace|record|write|erase|forget|call me|card|tagline|notes?|save)\b/iu;
 const OWN_MESSAGES_WINDOW_MS = 3 * 60_000;
 const OWN_MESSAGES = 2;
 const MAX_OPS = 6;
 const UNDO_HOURS = 24;
 
-const ACTIONS = ["add", "remove", "replace", "set_tagline", "clear_tagline", "add_alias", "remove_alias"] as const;
+const ACTIONS = ["add", "remove", "replace", "set_tagline", "clear_tagline", "add_alias", "remove_alias", "add_note", "remove_note"] as const;
 
 export const SelfEditSchema = z.strictObject({
   kind: z.enum(["edit", "not_a_request", "about_others", "fake_claim", "forget_all", "unclear"]),
@@ -70,18 +72,19 @@ export const SelfEditSchema = z.strictObject({
 });
 export type SelfEditResult = z.infer<typeof SelfEditSchema>;
 
-export const SELF_EDIT_SYSTEM_PROMPT = `You read one member's own words to the bot of a Telegram group and decide whether they ask it to change their OWN card, and how. You see only their words (<their_words>, the newest first) and their own card (<their_card>: rows r1…, the names they go by a1…, their tagline).
+export const SELF_EDIT_SYSTEM_PROMPT = `You read one member's own words to the bot of a Telegram group and decide whether they ask it to change their OWN card, and how. You see only their words (<their_words>, the newest first) and their own card (<their_card>: rows r1…, the names they go by a1…, their tagline, their notes n1…, the projects they are an author of p1…).
 Decide about their newest message, the first in <their_words>: the others only explain what it refers to («запиши это»). A newest message that does not itself ask you to change a card is not_a_request, whatever the earlier ones said.
 
 kind:
-- edit: they ask to add, remove or change something on their own card: stack, role, expertise, interests, projects, links, city (timezone), what they look for, what they can help with, their tagline, or the names they go by.
+- edit: they ask to add, remove or change something on their own card: stack, role, expertise, interests, projects, links, city (timezone), what they look for, what they can help with, their tagline, the names they go by, or their notes: a note about themselves, or about one of their projects.
 - about_others: they ask you to change the card of anyone but themselves, or name another person as its subject, even "with their permission", "on their behalf" or "I am them". Saying what someone else should do themselves («пусть сам добавит свои проекты») is not_a_request.
 - fake_claim: they ask the bot to say, confirm or pretend that something was changed.
 - forget_all: they ask the bot to erase everything about them, not one entry.
 - unclear: they ask for a change of their card, but not what.
 - not_a_request: anything else: questions, banter, news about themselves without asking to record or change it.
 
-ops, only for edit (at most ${MAX_OPS}): add {field, value}; remove {ref}; replace {ref, field, value}; set_tagline {value}; clear_tagline; add_alias {value}; remove_alias {ref}.
+ops, only for edit (at most ${MAX_OPS}): add {field, value}; remove {ref}; replace {ref, field, value}; set_tagline {value}; clear_tagline; add_alias {value}; remove_alias {ref}; add_note {ref: one of their projects p… for a note about it, null for a note about themselves; value}; remove_note {ref: n…}.
+- A note's value is the text of the note exactly as they wrote it, without the request around it («добавь заметку: релиз в декабре» → «релиз в декабре»).
 - field: role | stack | expertise | interest | project | link | timezone (a city) | looking_for | can_help; null when not needed.
 - value: exactly what they said, never more: a technology, a role, a city in the nominative (в Варшаве → Варшава, no country added), a link as they wrote it; technologies in their usual Latin spelling (питон → Python).
 - ref: one of the refs in <their_card>; never invent one. Null when not needed.
@@ -115,6 +118,8 @@ const TEXTS: Record<Language, Record<string, string>> = {
     tagline: "теглайн",
     noTagline: "теглайн убран",
     alias: "имя",
+    note: "заметка",
+    noteOn: "заметка к",
     undo: "↩️ Отменить",
     undone: "↩️ Отменено.",
     yes: "✅ Да",
@@ -139,6 +144,8 @@ const TEXTS: Record<Language, Record<string, string>> = {
     tagline: "tagline",
     noTagline: "tagline removed",
     alias: "name",
+    note: "note",
+    noteOn: "note on",
     undo: "↩️ Undo",
     undone: "↩️ Undone.",
     yes: "✅ Yes",
@@ -160,7 +167,7 @@ const TEXTS: Record<Language, Record<string, string>> = {
   },
 };
 
-const PROBLEMS: Record<Language, Record<ValueProblem | "alias_taken" | "no_entry" | "opted_out", string>> = {
+const PROBLEMS: Record<Language, Record<ValueProblem | "alias_taken" | "no_entry" | "opted_out" | "no_project" | "too_many_notes", string>> = {
   Russian: {
     too_long: "слишком длинно",
     personal_data: "это личные данные, их в карточку не пишу",
@@ -171,6 +178,8 @@ const PROBLEMS: Record<Language, Record<ValueProblem | "alias_taken" | "no_entry
     alias_taken: "это имя уже чьё-то: участника, проекта или моё",
     no_entry: "такой записи в твоей карточке нет",
     opted_out: "",
+    no_project: "заметку к проекту пишут только его авторы",
+    too_many_notes: `заметок уже ${MAX_MEMOS}, сначала убери старые`,
   },
   English: {
     too_long: "too long",
@@ -182,6 +191,8 @@ const PROBLEMS: Record<Language, Record<ValueProblem | "alias_taken" | "no_entry
     alias_taken: "that name is already someone's: a member's, a project's or mine",
     no_entry: "there's no such entry on your card",
     opted_out: "",
+    no_project: "only a project's authors write notes on it",
+    too_many_notes: `you have ${MAX_MEMOS} notes already, remove old ones first`,
   },
 };
 
@@ -196,9 +207,14 @@ export function changeLines(applied: Applied[], language: Language): string[] {
     if (change.kind === "fact_removed") return `− ${labels[change.row.kind]}: ${quote(change.row.value)}`;
     if (change.kind === "tagline") return change.value === null ? texts.noTagline! : `${texts.tagline}: ${quote(change.value)}`;
     if (change.kind === "alias_added") return `+ ${texts.alias}: ${quote(change.value)}`;
+    if (change.kind === "memo_added") return `+ ${noteLabel(change.projectName, language)}: ${quote(change.text)}`;
+    if (change.kind === "memo_removed") return `− ${noteLabel(change.projectName, language)}: ${quote(change.row.text)}`;
     return `− ${texts.alias}: ${quote(change.row.alias)}`;
   });
 }
+
+const noteLabel = (projectName: string | null, language: Language) =>
+  projectName ? `${TEXTS[language].noteOn} ${escapeHtml(truncate(projectName, 60))}` : TEXTS[language].note!;
 
 /** The receipt names the card by a mention of its account, never by a display name anyone can copy. */
 export function receiptText(subject: Pick<Subject, "tgId" | "username">, lines: string[], language: Language): string {
@@ -214,12 +230,23 @@ interface Resolved {
 }
 
 /** Turns the model's operations into operations on the sender's own rows, checked against the sender's own words. */
-export async function resolveOps(sql: Sql, subject: Subject, card: OwnCard, result: SelfEditResult, words: string, botNames: string[], language: Language): Promise<Resolved> {
+export async function resolveOps(
+  sql: Sql,
+  subject: Subject,
+  card: OwnCard,
+  result: SelfEditResult,
+  words: string,
+  botNames: string[],
+  language: Language,
+  newest: string,
+): Promise<Resolved> {
   const others = await otherMembers(sql, subject);
   const labels = LABELS[language];
   const problems = PROBLEMS[language];
   const facts = new Map(card.facts.map((fact, index) => [`r${index + 1}`, fact]));
   const aliases = new Map(card.aliases.map((alias, index) => [`a${index + 1}`, alias]));
+  const memos = new Map(card.memos.map((memo, index) => [`n${index + 1}`, memo]));
+  const projects = new Map(card.projects.map((project, index) => [`p${index + 1}`, project]));
   const out: Resolved = { ops: [], lines: [], problems: [], needsTap: false };
   const refuse = (what: string, why: string) => void out.problems.push(`${what}: ${why}`);
   const named = (text: string) => groundedIn(text, words) || wordsOfGrounded(text, words);
@@ -297,6 +324,38 @@ export async function resolveOps(sql: Sql, subject: Subject, card: OwnCard, resu
       }
       out.ops.push({ action: "add_alias", value });
       out.lines.push(`+ ${TEXTS[language].alias}: ${quote(value)}`);
+    } else if (op.action === "add_note") {
+      const project = op.ref ? projects.get(op.ref) : undefined;
+      const label = noteLabel(project?.name ?? null, language);
+      if (op.ref && !project) {
+        refuse(`${label} ${quote(value)}`, problems.no_project);
+        continue;
+      }
+      if (card.optedOut) {
+        refuse(`${label} ${quote(value)}`, TEXTS[language].optedOut!);
+        continue;
+      }
+      const problem = memoProblem(value, others, newest);
+      if (problem) {
+        refuse(`${label} ${quote(value)}`, problems[problem]);
+        continue;
+      }
+      const kept = card.memos.filter((memo) => memo.project_id === (project?.id ?? null)).length + out.ops.filter((added) => added.action === "add_memo" && added.projectId === (project?.id ?? null)).length;
+      if (kept >= MAX_MEMOS) {
+        refuse(`${label} ${quote(value)}`, problems.too_many_notes);
+        continue;
+      }
+      out.ops.push({ action: "add_memo", projectId: project?.id ?? null, projectName: project?.name ?? null, text: value });
+      out.lines.push(`+ ${label}: ${quote(value)}`);
+    } else if (op.action === "remove_note") {
+      const memo = op.ref ? memos.get(op.ref) : undefined;
+      if (!memo) {
+        refuse(quote(value || op.ref || "?"), problems.no_entry);
+        continue;
+      }
+      if (!named(memo.text)) out.needsTap = true;
+      out.ops.push({ action: "remove_memo", memoId: memo.id, projectName: memo.project_name });
+      out.lines.push(`− ${noteLabel(memo.project_name, language)}: ${quote(memo.text)}`);
     } else {
       const alias = op.ref ? aliases.get(op.ref) : undefined;
       if (!alias) {
@@ -327,9 +386,13 @@ function wordsOfGrounded(value: string, words: string): boolean {
 export function parserPrompt(ownWords: string[], card: OwnCard): string {
   const rows = card.facts.map((fact, index) => `r${index + 1} ${fact.kind}: ${maskPersonalData(fact.value).replace(/[<>]/g, "")}`);
   const aliases = card.aliases.map((alias, index) => `a${index + 1} name: ${alias.alias.replace(/[<>]/g, "")}`);
+  const plain = (text: string) => maskPersonalData(text).replace(/[<>]/g, "");
+  const memos = card.memos.map((memo, index) => `n${index + 1} note${memo.project_name ? ` on ${plain(memo.project_name)}` : ""}: ${plain(memo.text)}`);
+  const projects = card.projects.map((project, index) => `p${index + 1} their project: ${plain(project.name)}`);
+  const tagline = `tagline: ${card.tagline ? card.tagline.replace(/[<>]/g, "") : "(none)"}`;
   return [
     `<their_words>\n${ownWords.map((text) => `- ${text.replace(/[<>]/g, "")}`).join("\n")}\n</their_words>`,
-    `<their_card>\n${[...rows, ...aliases, `tagline: ${card.tagline ? card.tagline.replace(/[<>]/g, "") : "(none)"}`].join("\n")}\n</their_card>`,
+    `<their_card>\n${[...rows, ...aliases, tagline, ...memos, ...projects].join("\n")}\n</their_card>`,
   ].join("\n\n");
 }
 
@@ -462,7 +525,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
       askOwners(user);
       return refuse("edit", escapeHtml(texts.seeded!));
     }
-    const resolved = await resolveOps(sql, subject, card, result, words.join("\n"), deps.botNames(), language);
+    const resolved = await resolveOps(sql, subject, card, result, words.join("\n"), deps.botNames(), language, questionText(message, question.me));
     // A request that also names someone else gets only its own part done, and only after a tap: say so.
     const others = namesSomeoneElse(questionText(message, question.me), await otherMembers(sql, subject)) ? `\n${escapeHtml(texts.othersPart!)}` : "";
     const refusals = `${resolved.problems.length ? `\n\n${texts.nothing} ${resolved.problems.join("; ")}` : ""}${others}`;
