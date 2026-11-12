@@ -38,6 +38,7 @@ import { BUSINESS_UPDATES, businessRemindersOn, registerBusiness } from "./busin
 import { registerPortrait } from "./portrait.js";
 import { portraitsOn } from "../worker/portrait.js";
 import { createAssistant, isAddressedToBot, repliesSpendUsd, type Assistant, type AssistantDeps } from "./assistant.js";
+import { registerReminders } from "./reminders.js";
 import { createSelfEdits, registerSelfEdits, type SelfEdits } from "./self-edits.js";
 import { createInterjector, type Interjector } from "./interjector.js";
 import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
@@ -105,6 +106,7 @@ const HELP_TEXT = [
   "<b>Chat</b>",
   "/catchup — what you missed (sent to DM; /catchup 12 — last 12 hours)",
   "/chronicle — chronicle: what people talked about",
+  "Mention me with «remind me in 2 months to …» (any language) — I'll remind you here and in DM",
   "",
   "<b>Privacy</b>",
   "/whatyouknow — everything I know about you · /forgetme — delete it",
@@ -410,6 +412,7 @@ export function createBot(deps: BotDeps): {
   // A person's private portrait: their own private chat with the bot only.
   registerPortrait(bot, { sql, config, on: portraitsOn(deps.anthropic, config) });
   registerSelfEdits(bot, { sql, botNames: () => [bot.botInfo.first_name, bot.botInfo.username] });
+  registerReminders(bot, { sql, config });
 
   bot.callbackQuery(/^seedok:(\d+)$/, async (ctx) => {
     const owner = await kit.identity(ctx.from);

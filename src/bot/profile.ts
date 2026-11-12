@@ -1,5 +1,6 @@
 import { InlineKeyboard } from "grammy";
 import { memberAliases } from "../core/aliases.js";
+import { waitingReminders } from "../core/member-reminders.js";
 import { ownMemos } from "../core/memos.js";
 import { chatsOfUser, getChat } from "../core/chats.js";
 import {
@@ -13,7 +14,7 @@ import {
   type FactKind,
 } from "../core/facts.js";
 import { addUserProject, canEditProject, projectsOfUser, updateProject, type ProjectFields } from "../core/projects.js";
-import { escapeHtml, extractUrls, isRepoHost, safeHttpUrl } from "../core/text.js";
+import { escapeHtml, extractUrls, isRepoHost, safeHttpUrl, truncate } from "../core/text.js";
 import { forgetUser, getPerson, setOptOut, setTagline } from "../core/users.js";
 import { localTimeOf, memberClock, zoneLabel, type MemberClock } from "../core/zones.js";
 import { countOf, factsWithSources, personCard, userHeader } from "./format.js";
@@ -26,6 +27,7 @@ import {
   type PendingInput,
   type Scope,
 } from "./kit.js";
+import { dueLabel } from "./reminders.js";
 
 const MANUAL_KINDS: FactKind[] = [
   "role",
@@ -53,6 +55,9 @@ const KIND_PROMPTS: Record<FactKind, string> = {
   timezone: "Where are you / what's your time zone? For example: “Berlin”, “UTC+3”",
   project: "Describe the project in a few words",
 };
+
+/** How much of each reminder «What do you know about me» shows: twenty of them still fit one message. */
+const REMINDER_SHOWN_CHARS = 120;
 
 /** Buttons are made for one chat and carry it («me:c100123:privacy»), so a tap acts there whatever chat is current. */
 const meButton = (chatId: number, action: string) => `me:${encodeChat(chatId)}:${action}`;
@@ -199,7 +204,12 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
 
   async function knowledgeScreen(ctx: BotContext, scope: Scope, edit: boolean) {
     const { person, chatId, user } = scope;
-    const [facts, memos, clock] = await Promise.all([ownFacts(sql, chatId, user.id), ownMemos(sql, chatId, user.id), memberClock(sql, chatId, user.id, kit.config.DISPLAY_TIMEZONE)]);
+    const [facts, memos, reminders, clock] = await Promise.all([
+      ownFacts(sql, chatId, user.id),
+      ownMemos(sql, chatId, user.id),
+      waitingReminders(sql, chatId, user.id),
+      memberClock(sql, chatId, user.id, kit.config.DISPLAY_TIMEZONE),
+    ]);
     const [stats] = await sql<{ messages: number; first: Date | null }[]>`
       SELECT count(*)::int AS messages, min(sent_at) AS first FROM messages WHERE chat_id = ${chatId} AND user_id = ${user.id}`;
     const text = [
@@ -214,6 +224,9 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
       factsWithSources(facts, chatId),
       ...(memos.length
         ? ["", "<b>Your notes</b>:", ...memos.map((memo) => `📝 ${escapeHtml(memo.text)}${memo.project_name ? ` <i>— on ${escapeHtml(memo.project_name)}</i>` : ""}`)]
+        : []),
+      ...(reminders.length
+        ? ["", "<b>Your reminders</b> (✖️ under a receipt cancels one):", ...reminders.map((reminder) => `⏰ ${escapeHtml(dueLabel(reminder.due_at, clock.zone, "English"))}: ${escapeHtml(truncate(reminder.text, REMINDER_SHOWN_CHARS))}`)]
         : []),
       "",
       `Message texts are kept for ${retention} for the chronicle and /catchup, then deleted once the chronicler has gone through them. To delete everything about you in all chats — /forgetme.`,

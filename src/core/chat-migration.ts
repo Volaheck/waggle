@@ -156,6 +156,11 @@ async function moveChatData(tx: Queryable, from: number, to: number): Promise<Ch
   await tx`UPDATE interjections SET chat_id = ${to}, msg_id = ${shiftedId(tx, "msg_id")} WHERE chat_id = ${from}`;
   await tx`UPDATE self_edits SET chat_id = ${to}, msg_id = ${shiftedId(tx, "msg_id")}, receipt_msg_id = ${shiftedId(tx, "receipt_msg_id")} WHERE chat_id = ${from}`;
   await tx`UPDATE memos SET chat_id = ${to}, source_msg_id = ${shiftedId(tx, "source_msg_id")} WHERE chat_id = ${from}`;
+  await tx`
+    UPDATE reminders SET chat_id = ${to}, source_msg_id = ${shiftedId(tx, "source_msg_id")}, thread_id = ${shiftedId(tx, "thread_id")},
+           receipt_msg_id = ${shiftedId(tx, "receipt_msg_id")}, chat_msg_id = ${shiftedId(tx, "chat_msg_id")}
+    WHERE chat_id = ${from}`;
+  await tx`DELETE FROM reminders r USING members m WHERE r.chat_id = ${to} AND m.chat_id = ${to} AND m.user_id = r.user_id AND m.opted_out`;
   await tx`UPDATE ideas SET chat_id = ${to}, msg_id = ${shiftedId(tx, "msg_id")}, evidence_msg_ids = ${shiftedIds(tx, "evidence_msg_ids")} WHERE chat_id = ${from}`;
   await tx`UPDATE llm_usage SET chat_id = ${to} WHERE chat_id = ${from}`;
   await tx`UPDATE users SET current_chat_id = ${to} WHERE current_chat_id = ${from}`;

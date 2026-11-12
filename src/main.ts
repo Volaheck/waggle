@@ -5,6 +5,7 @@ import { createApi } from "./api/server.js";
 import { ALLOWED_UPDATES, createBot, notifyAdmins, registerCommands } from "./bot/bot.js";
 import { businessRemindersOn, startBusinessRetention } from "./bot/business.js";
 import { startBusinessReminders } from "./worker/business-reminders.js";
+import { startMemberReminders } from "./worker/member-reminders.js";
 import { portraitsOn, startPortraits } from "./worker/portrait.js";
 import { startWeeklyIdeas } from "./worker/ideas.js";
 import { startNameSync } from "./bot/names.js";
@@ -120,6 +121,8 @@ const stopBusinessReminders =
   anthropic && businessRemindersOn(anthropic, config) ? startBusinessReminders({ sql, anthropic, api: bot.api, config }) : async () => {};
 const stopPortraits = anthropic && portraitsOn(anthropic, config) ? startPortraits({ sql, anthropic, api: bot.api, config }) : async () => {};
 const stopWeeklyIdeas = anthropic ? startWeeklyIdeas({ sql, anthropic, api: bot.api, config, botUsername: bot.botInfo.username }) : async () => {};
+// Delivering what members asked to be reminded of needs no model: reminders set earlier still come without a key.
+const stopMemberReminders = startMemberReminders({ sql, api: bot.api, config, botUsername: bot.botInfo.username });
 const stopNameSync = startNameSync(bot.api, sql, config.ADMIN_TG_IDS);
 if (config.ADMIN_TG_IDS.length === 0) {
   console.warn("[bot] ADMIN_TG_IDS is empty — nobody can approve new chats. Get your Telegram ID from a bot like @userinfobot and add it to ADMIN_TG_IDS.");
@@ -130,7 +133,7 @@ const shutdown = async (signal: string) => {
   stopNameSync();
   stopRetention();
   stopBusinessRetention();
-  await settledWithin(REPLIES_WAIT_MS, [stopBusinessReminders(), stopPortraits(), stopWeeklyIdeas()]);
+  await settledWithin(REPLIES_WAIT_MS, [stopBusinessReminders(), stopPortraits(), stopWeeklyIdeas(), stopMemberReminders()]);
   // The bot does not start speaking up uninvited any more; a check under way finishes with the answers below.
   interjector?.stop();
   // The bot keeps serving while the chronicler call under way finishes; no new call starts. A call that takes longer

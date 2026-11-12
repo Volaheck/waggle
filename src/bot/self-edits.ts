@@ -6,7 +6,6 @@ import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
 import { FACT_KINDS, type FactKind } from "../core/facts.js";
 import { MAX_MEMO_CHARS, MAX_MEMOS } from "../core/memos.js";
-import { detectLanguage } from "../core/language.js";
 import { assertBudget, BudgetExceededError, callStructured, memberEndUserId, recordUsage } from "../core/llm.js";
 import {
   aliasTaken,
@@ -33,6 +32,7 @@ import { getUser, type User } from "../core/users.js";
 import { localTimeOf, zoneLabel, zoneName } from "../core/zones.js";
 import { chatBudgetUsd } from "../worker/scheduler.js";
 import { realReply, type BotContext } from "./kit.js";
+import { chatLanguage, handleReminderRequest, REMIND_CUE, REMINDER_KINDS, reminderFailedText, type ReminderSettled, type RepliedTo, type Written } from "./reminders.js";
 import { questionText, type Answered, type Question } from "./reply-context.js";
 
 /**
@@ -41,6 +41,9 @@ import { questionText, type Answered, type Question } from "./reply-context.js";
  * those words, applies it to the sender's card alone (src/core/own-card.ts) and posts a receipt it writes itself,
  * with an Undo button only the sender can use. Anything else goes on to the answer as before. Only a note may be
  * worded by the bot, from the sender's words or the message they point at; everything else is their own words.
+ * A message with a reminder word is read for a reminder first (src/bot/reminders.ts), in the same queue and on the
+ * same record; one that turns out to ask for none goes on here as if it had never been read for one, and one that also
+ * asks for a change to the sender's card goes on here once its reminder is done, the answer told about both.
  */
 
 export const SELF_EDIT_PURPOSE = "self_edit";
@@ -62,6 +65,10 @@ const RECALL_CUE =
 const NOTES_CUE = /заметк|бэклог|\b(?:notes?|backlog)\b/iu;
 /** A reply to the bot's answer to a request it could not tell what to do with answers that answer this long. */
 const CLARIFY_MINUTES = 60;
+/** The kinds of a request the answer asked about, for what it was missing: a card request's, a reminder request's. */
+const UNCLEAR_KINDS = ["unclear", REMINDER_KINDS.unclear] as const;
+/** Requests whose words still count among a sender's own words: nothing was done about them. */
+const UNHANDLED_KINDS = ["not_a_request", ...UNCLEAR_KINDS];
 /** Room the notes of one receipt share, so that it stays one Telegram message. */
 const RECEIPT_NOTE_CHARS = 2400;
 const TELEGRAM_TEXT_LIMIT = 4096;
@@ -641,11 +648,8 @@ function wordsOfGrounded(value: string, words: string): boolean {
 
 const ZONE_SOURCES = { chat: "they set it in the chat", app: "they set it in the Mini App", device: "from their device" } as const;
 
-/** The message a request replies to: what «это» points at. */
-export interface PointedAt {
-  author: "bot" | "member";
-  text: string;
-}
+/** The message a request replies to, the bot's or another member's: what «это» points at. */
+export type PointedAt = Pick<RepliedTo, "author" | "text">;
 
 const POINTED_AT_FROM = { bot: "you, the bot", member: "another member" } as const;
 
@@ -689,13 +693,19 @@ const projectByRef = (card: OwnCard, ref: string) => (/^p\d+$/.test(ref) ? card.
 const fromAnswerHint = (project: string | null) =>
   `${NOTHING_CHANGED} yet: they asked to save what you answer now as notes${project ? ` on their project «${project}»` : ""}. Give that content itself, plainly, one item per line, the way it should be kept; right after your answer the bot words the notes from it and posts its own receipt, so don't say it is saved, or that it can't be, and don't tell them how to ask`;
 
-/** The message the request replies to, the bot's or another member's: what «это» points at. Their own is among their words already. */
-function pointedAtOf(question: Question, subject: Subject): PointedAt | undefined {
+/**
+ * The message the request replies to, the bot's or another member's: what «это» points at, as the readings see it, as
+ * it was written, and when. Their own is among their words already.
+ */
+function pointedAtOf(question: Question, subject: Subject): RepliedTo | undefined {
   const replied = realReply(question.message);
   if (!replied || (replied.from?.id === subject.tgId && !replied.forward_origin)) return undefined;
-  const text = cleanText(maskPersonalData(replied.text ?? replied.caption ?? ""));
+  const original = replied.text ?? replied.caption ?? "";
+  const text = cleanText(maskPersonalData(original));
   if (!text) return undefined;
-  return { author: replied.from?.id === question.me.id ? "bot" : "member", text: truncate(text, POINTED_AT_CHARS) };
+  // A forwarded message's «завтра» counts from when it was first written.
+  const writtenAt = new Date((replied.forward_origin?.date ?? replied.date) * 1000);
+  return { author: replied.from?.id === question.me.id ? "bot" : "member", text: truncate(text, POINTED_AT_CHARS), original, at: writtenAt };
 }
 
 /** A button for each project of theirs, and one to drop the notes: only the request's author can tap them. */
@@ -719,32 +729,33 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
   const queues = new Map<string, Promise<void>>();
   const inFlight = new Set<Promise<void>>();
 
-  const languageOf = async (chatId: number): Promise<Language> => {
-    const rows = await sql<{ text: string }[]>`
-      SELECT text FROM messages WHERE chat_id = ${chatId} AND NOT is_forward AND NOT from_bot AND btrim(text) <> '' ORDER BY msg_id DESC LIMIT 200`;
-    return detectLanguage(rows.map((row) => row.text)) === "Russian" ? "Russian" : "English";
-  };
+  const languageOf = (chatId: number): Promise<Language> => chatLanguage(sql, chatId);
 
   /**
    * The sender's own words: this message, their own messages just before it in the same topic, and their own message it
-   * replies to. An earlier request is never among them: what it asked was done, declined or undone already.
+   * replies to, each as the readings see it, as it was written, and when. An earlier request is never among them: what
+   * it asked was done, declined or undone already.
    */
-  const ownWordsOf = async (question: Question, subject: Subject): Promise<string[]> => {
+  const ownWordsOf = async (question: Question, subject: Subject): Promise<Written[]> => {
     const { message, me } = question;
     const thread = message.is_topic_message ? (message.message_thread_id ?? null) : null;
-    const recent = await sql<{ text: string }[]>`
-      SELECT m.text FROM messages m
+    const recent = await sql<{ text: string; sent_at: Date }[]>`
+      SELECT m.text, m.sent_at FROM messages m
       WHERE m.chat_id = ${subject.chatId} AND m.user_id = ${subject.userId} AND m.msg_id < ${message.message_id} AND NOT m.is_forward AND btrim(m.text) <> ''
         AND m.sent_at > ${new Date(message.date * 1000 - OWN_MESSAGES_WINDOW_MS)} AND m.thread_id IS NOT DISTINCT FROM ${thread}
-        AND NOT EXISTS (SELECT 1 FROM self_edits s WHERE s.chat_id = m.chat_id AND s.msg_id = m.msg_id AND s.kind NOT IN ('not_a_request', 'unclear'))
+        AND NOT EXISTS (SELECT 1 FROM self_edits s WHERE s.chat_id = m.chat_id AND s.msg_id = m.msg_id AND s.kind <> ALL(${UNHANDLED_KINDS}::text[]))
       ORDER BY m.msg_id DESC LIMIT ${OWN_MESSAGES}`;
     const replied = message.reply_to_message;
     const [repliedRequest] = replied
-      ? await sql`SELECT 1 FROM self_edits WHERE chat_id = ${subject.chatId} AND msg_id = ${replied.message_id} AND kind NOT IN ('not_a_request', 'unclear')`
+      ? await sql`SELECT 1 FROM self_edits WHERE chat_id = ${subject.chatId} AND msg_id = ${replied.message_id} AND kind <> ALL(${UNHANDLED_KINDS}::text[])`
       : [];
     const ownReply =
-      replied && !repliedRequest && replied.from?.id === subject.tgId && !replied.forward_origin && !replied.via_bot ? [replied.text ?? replied.caption ?? ""] : [];
-    return [questionText(message, me), ...recent.map((row) => row.text), ...ownReply].map((text) => cleanText(maskPersonalData(text))).filter(Boolean);
+      replied && !repliedRequest && replied.from?.id === subject.tgId && !replied.forward_origin && !replied.via_bot
+        ? [{ original: replied.text ?? replied.caption ?? "", at: new Date(replied.date * 1000) }]
+        : [];
+    return [{ original: questionText(message, me), at: new Date(message.date * 1000) }, ...recent.map((row) => ({ original: row.text, at: row.sent_at })), ...ownReply]
+      .map((written) => ({ ...written, text: cleanText(maskPersonalData(written.original)) }))
+      .filter((written) => written.text);
   };
 
   const reply = async (api: Api, question: Question, text: string, keyboard?: InlineKeyboard) => {
@@ -787,20 +798,22 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
   /** The bot's question about their city that this message replies to, asked of the sender within ASK_CITY_DAYS. */
   /**
    * The sender's own request the bot could not tell what to do with, when the message replies to the bot's answer to it
-   * within CLARIFY_MINUTES: the answer asked what was missing, and this message answers it.
+   * within CLARIFY_MINUTES: the answer asked what was missing, and this message answers it. Its kind tells whether it
+   * asked to change their card or for a reminder.
    */
-  const clarifiedOf = async (question: Question, userId: number): Promise<string | undefined> => {
+  const clarifiedOf = async (question: Question, userId: number): Promise<(Written & { kind: (typeof UNCLEAR_KINDS)[number] }) | undefined> => {
     const replied = realReply(question.message);
     if (!replied || replied.from?.id !== question.me.id) return undefined;
-    const [row] = await sql<{ text: string }[]>`
-      SELECT q.text FROM messages a
+    const [row] = await sql<{ text: string; sent_at: Date; kind: (typeof UNCLEAR_KINDS)[number] }[]>`
+      SELECT q.text, q.sent_at, s.kind FROM messages a
       JOIN self_edits s ON s.chat_id = a.chat_id AND s.msg_id = a.reply_to_msg_id
       JOIN messages q ON q.chat_id = s.chat_id AND q.msg_id = s.msg_id
       WHERE a.chat_id = ${question.chatId} AND a.msg_id = ${replied.message_id} AND a.from_bot
-        AND s.user_id = ${userId} AND s.kind = 'unclear' AND s.created_at > now() - ${`${CLARIFY_MINUTES} minutes`}::interval
+        AND s.user_id = ${userId} AND s.kind = ANY(${[...UNCLEAR_KINDS]}::text[]) AND s.created_at > now() - ${`${CLARIFY_MINUTES} minutes`}::interval
       LIMIT 1`;
-    const text = row ? cleanText(maskPersonalData(withoutMention(row.text, question.me.username))) : "";
-    return text || undefined;
+    const original = row ? cleanText(withoutMention(row.text, question.me.username)) : "";
+    const text = cleanText(maskPersonalData(original));
+    return text ? { text, original, at: row!.sent_at, kind: row!.kind } : undefined;
   };
 
   const cityAskedOf = async (question: Question, userId: number): Promise<{ id: number; place: string } | undefined> => {
@@ -835,17 +848,21 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     const open = chat?.status === "approved" && !chat.chronicle_paused_at;
     const cued = REQUEST_CUE.test(asked) || REDO_CUE.test(asked);
     // A reply to the bot's question about their city answers it, with request words or without; so does a reply to the
-    // answer that asked what an unclear request of theirs was for.
+    // answer that asked what an unclear request of theirs was for, a card request's or a reminder request's.
     const cityAsked = open ? await cityAskedOf(question, user.id) : undefined;
-    const clarified = open && !cityAsked ? await clarifiedOf(question, user.id) : undefined;
-    if (!open || (!cued && !cityAsked && !clarified)) {
+    const unclearAsked = open && !cityAsked ? await clarifiedOf(question, user.id) : undefined;
+    const clarified = unclearAsked?.kind === "unclear" ? unclearAsked : undefined;
+    const reminderAsked = unclearAsked?.kind === REMINDER_KINDS.unclear ? unclearAsked : undefined;
+    const reminding = open && (REMIND_CUE.test(asked) || reminderAsked !== undefined);
+    if (!open || (!cued && !cityAsked && !clarified && !reminding)) {
       await done("not_a_request", "answered");
       return deps.answer(api, question);
     }
     const subject = subjectOf(user, chatId, from);
     // Words that only ask for something back are a request while there is an undone change of theirs to bring back.
     const undone = await undoneRequestOf(question, subject);
-    if (!REQUEST_CUE.test(asked) && !undone && !cityAsked && !clarified) {
+    const cardRequest = REQUEST_CUE.test(asked) || undone !== undefined || cityAsked !== undefined || clarified !== undefined;
+    if (!cardRequest && !reminding) {
       await done("not_a_request", "answered");
       return deps.answer(api, question);
     }
@@ -863,9 +880,50 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
       await done("not_a_request", "answered");
       return deps.answer(api, question, `${NOTHING_CHANGED}: a request in it was not read, the bot's budget is spent`);
     }
-    const [ownWords, card] = await Promise.all([ownWordsOf(question, subject), ownCard(sql, subject)]);
-    const words = clarified && !ownWords.some((text) => cleanText(withoutMention(text, question.me.username)) === clarified) ? [...ownWords, clarified] : ownWords;
+    const ownWords = await ownWordsOf(question, subject);
+    /** Their words with the earlier request this message answers, when it is not among them already. */
+    const withRequest = (request: Written | undefined) =>
+      request && !ownWords.some((written) => cleanText(withoutMention(written.text, question.me.username)) === request.text) ? [...ownWords, request] : ownWords;
     const replyTo = pointedAtOf(question, subject);
+    /** What the bot did, or could not do, about a reminder the message asks for too: the answer to the rest hears it. */
+    let alongside: string | undefined;
+    /** How the reminder settled the record, put back when the message turns out to ask for no change to their card. */
+    let reminderSettled: ReminderSettled | undefined;
+    if (reminding) {
+      const language = await languageOf(chatId);
+      const reminded = await handleReminderRequest(
+        { sql, anthropic: deps.anthropic, config, answer: deps.answer, log },
+        {
+          api,
+          question,
+          user,
+          subject,
+          requestId: id,
+          words: withRequest(reminderAsked),
+          replyTo,
+          askedWhat: reminderAsked,
+          language,
+          optedOut: TEXTS[language].optedOut!,
+          cardRequest,
+          reply: (html, keyboard) => reply(api, question, html, keyboard),
+        },
+      );
+      if (reminded.status === "handled") return;
+      if (reminded.status === "card_too") {
+        alongside = reminded.line;
+        reminderSettled = reminded.settled;
+        // The change to their card is read on the same record, as if from the start.
+        await sql`UPDATE self_edits SET kind = 'parsing' WHERE id = ${id} AND status = 'parsing'`;
+      } else if (!cardRequest) {
+        await done("not_a_request", "answered");
+        return deps.answer(api, question, reminded.status === "unread" ? reminded.line : undefined);
+      } else if (reminded.status === "unread") alongside = reminded.line;
+    }
+    /** The answer to the message, told about a reminder it asks for as well. */
+    const answer = (cardChange?: string, onAnswered?: (answered: Answered) => void) =>
+      deps.answer(api, question, [alongside, cardChange].filter(Boolean).join("; ") || undefined, onAnswered);
+    const card = await ownCard(sql, subject);
+    const words = withRequest(clarified).map((written) => written.text);
     const undoneText = undone?.text && REDO_CUE.test(asked) ? cleanText(maskPersonalData(undone.text)) : undefined;
     // A reading that fails or takes too long changes nothing: the message is answered as a question, and the log says why.
     const readRequest = (pointed: PointedAt | undefined) =>
@@ -874,7 +932,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
         maxTokens: 4000,
         effort: "low",
         system: SELF_EDIT_SYSTEM_PROMPT,
-        prompt: parserPrompt(words, card, { undone: undoneText, askedCity: cityAsked?.place, askedWhat: clarified, replyTo: pointed, bot: deps.botNames() }),
+        prompt: parserPrompt(words, card, { undone: undoneText, askedCity: cityAsked?.place, askedWhat: clarified?.text, replyTo: pointed, bot: deps.botNames() }),
         schema: SelfEditSchema,
         onUsage: (usage) => recordUsage(sql, SELF_EDIT_PURPOSE, config.REPLY_MODEL, usage, chatId),
         signal: AbortSignal.timeout(READ_TIMEOUT_MS),
@@ -903,8 +961,10 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     if (!result) {
       if (!outcome.ok) log(`[self-edit] chat ${chatId}: could not read msg ${message.message_id} (${outcome.message}); answering it as a question`);
       else if (read && read.kind !== "not_a_request") log(`[self-edit] chat ${chatId}: msg ${message.message_id} read as ${read.kind} without its own words asking for it; answering it as a question`);
-      await done("not_a_request", "answered");
-      return deps.answer(api, question, outcome.ok ? undefined : `${NOTHING_CHANGED}: a request in it could not be read just now; it can be asked again`);
+      // A message that asked for a reminder and nothing on their card stays on record as the reminder request it was.
+      if (reminderSettled) await done(reminderSettled.kind, reminderSettled.status, reminderSettled.receipt === null ? {} : { receipt: reminderSettled.receipt });
+      else await done("not_a_request", "answered");
+      return answer(outcome.ok ? undefined : `${NOTHING_CHANGED}: a request in it could not be read just now; it can be asked again`);
     }
     const language = await languageOf(chatId);
     const texts = TEXTS[language];
@@ -912,7 +972,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     const refuse = async (kind: string, html: string, alsoAsks = result.also_asks) => {
       const sent = await reply(api, question, html);
       await done(kind, "refused", { receipt: sent.message_id });
-      if (alsoAsks) deps.answer(api, question, `${NOTHING_CHANGED}; the bot's reply said: ${plainText(html)}`);
+      if (alsoAsks) answer(`${NOTHING_CHANGED}; the bot's reply said: ${plainText(html)}`);
     };
     if (result.kind === "redo") {
       // The very change they undid comes back as planned, checked again against the card as it is now.
@@ -938,12 +998,12 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
       const keptReceipt = sent && revived ? sent.message_id : !revived ? (undone.receipt_msg_id ?? undefined) : undefined;
       await done("redo", "answered", keptReceipt === undefined ? {} : { receipt: keptReceipt });
       await sql`UPDATE self_edits SET redo_of = ${undone.id} WHERE id = ${id}`;
-      return void (result.also_asks && deps.answer(api, question, lines.join("; ")));
+      return void (result.also_asks && answer(lines.join("; ")));
     }
     if (result.kind === "unclear") {
       // No set phrase to repeat: the answer asks, in a line, for just what is missing.
       await done("unclear", "answered");
-      return deps.answer(api, question, UNCLEAR);
+      return answer(UNCLEAR);
     }
     if (result.kind !== "edit") {
       const refusals: Record<string, string | undefined> = { about_others: texts.aboutOthers, fake_claim: texts.fakeClaim, forget_all: texts.forgetAll };
@@ -982,7 +1042,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
         await askedCity();
         const asking = resolved.pick ? "the bot asked them which of their projects the notes go on, with a button for each" : "the bot asked them to confirm the change with a tap";
         const pending = `${NOTHING_CHANGED} yet: ${asking}${refusals ? `; its reply also said: ${plainText(refusals)}` : ""}${cityLine ? `; ${ASKED_CITY}` : ""}`;
-        return void (alsoAsks && deps.answer(api, question, pending));
+        return void (alsoAsks && answer(pending));
       }
       await sql`UPDATE self_edits SET kind = 'edit', plan = ${sql.json(resolved.ops as never)} WHERE id = ${id}`;
       const applied = await applyOwnOps(sql, subject, resolved.ops, message.message_id, id, "parsing");
@@ -999,7 +1059,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
         await sql`UPDATE self_edits SET receipt_msg_id = ${sent.message_id} WHERE id = ${id}`.catch((error: unknown) => log(`[self-edit] chat ${chatId}: ${describe(error)}`));
         await askedCity().catch((error: unknown) => log(`[self-edit] chat ${chatId}: ${describe(error)}`));
       }
-      if (alsoAsks) deps.answer(api, question, `${changeLines(applied, language).join("; ")}${refusals ? `; the bot's reply also said: ${plainText(refusals)}` : ""}${cityLine ? `; ${ASKED_CITY}` : ""}`);
+      if (alsoAsks) answer(`${changeLines(applied, language).join("; ")}${refusals ? `; the bot's reply also said: ${plainText(refusals)}` : ""}${cityLine ? `; ${ASKED_CITY}` : ""}`);
     };
 
     if (!result.ops.some(waitsForAnswer)) return carryOut(result, replyTo?.text, false);
@@ -1008,7 +1068,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
       const rest = result.ops.filter((op) => !waitsForAnswer(op));
       if (rest.length) return carryOut({ ...result, ops: rest }, replyTo?.text, false);
       await done("unclear", "answered");
-      return deps.answer(api, question, UNCLEAR);
+      return answer(UNCLEAR);
     }
     // What they ask to save is what the bot is about to answer: the answer goes first, and the notes are worded from it.
     await sql`UPDATE self_edits SET kind = 'edit' WHERE id = ${id}`;
@@ -1016,7 +1076,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     const named = target && target !== PICK_REF ? projectByRef(card, target) : undefined;
     const answered = await new Promise<Answered>((resolve) => {
       const timer = setTimeout(() => resolve(null), ANSWER_WAIT_MS);
-      deps.answer(api, question, fromAnswerHint(named?.name ?? null), (posted) => {
+      answer(fromAnswerHint(named?.name ?? null), (posted) => {
         clearTimeout(timer);
         resolve(posted);
       });
@@ -1061,7 +1121,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     if (kind === undefined) return;
     if (kind === "parsing") return deps.answer(api, question, NOTHING_CHANGED);
     const language = await languageOf(question.chatId).catch(() => "English" as const);
-    await reply(api, question, escapeHtml(TEXTS[language].failed!)).catch(() => {});
+    await reply(api, question, escapeHtml(kind === REMINDER_KINDS.handled ? reminderFailedText(language) : TEXTS[language].failed!)).catch(() => {});
   };
 
   return {
@@ -1119,10 +1179,7 @@ export function registerSelfEdits(bot: Bot<BotContext>, deps: { sql: Sql; botNam
     }
     const user = await getUser(sql, request.user_id);
     if (!user) return undefined;
-    const rows = await sql<{ text: string }[]>`
-      SELECT text FROM messages WHERE chat_id = ${request.chat_id} AND NOT is_forward AND NOT from_bot AND btrim(text) <> '' ORDER BY msg_id DESC LIMIT 200`;
-    const language: Language = detectLanguage(rows.map((row) => row.text)) === "Russian" ? "Russian" : "English";
-    return { request, subject: subjectOf(user, request.chat_id, ctx.from), language };
+    return { request, subject: subjectOf(user, request.chat_id, ctx.from), language: await chatLanguage(sql, request.chat_id) };
   };
 
   bot.callbackQuery(/^se:(ok|no|undo|redo|to):(\d+)(?::(\d+))?$/, async (ctx) => {

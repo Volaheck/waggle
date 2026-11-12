@@ -138,3 +138,47 @@ export function maskPersonalData(text: string): string {
   }
   return result + maskPlainText(text.slice(from));
 }
+
+/** The placeholders masking puts into a text; a new expression each time, as a global one keeps its place between uses. */
+const placeholders = () => /\[(?:phone|email|card|account|number|secret|person|birthdate)\]/g;
+
+/** What each placeholder in a text's masked form stands for, in order; none when the two cannot be lined up. */
+function maskedValues(original: string): { masked: string; values: { placeholder: string; value: string }[] } {
+  const masked = maskPersonalData(original);
+  const found = [...masked.matchAll(placeholders())];
+  const kept = masked.split(placeholders());
+  const values: { placeholder: string; value: string }[] = [];
+  if (!original.startsWith(kept[0]!)) return { masked, values: [] };
+  let at = kept[0]!.length;
+  for (const [index, placeholder] of found.entries()) {
+    const next = kept[index + 1]!;
+    // Two placeholders side by side leave no telling where one value ends.
+    const end = next === "" ? (index === found.length - 1 ? original.length : -1) : original.indexOf(next, at + 1);
+    if (end <= at) return { masked, values: [] };
+    values.push({ placeholder: placeholder[0], value: original.slice(at, end) });
+    at = end + next.length;
+  }
+  return { masked, values };
+}
+
+/**
+ * A text written from masked words (a reminder the reading worded) with its placeholders back as they were written:
+ * found within one of the originals' masked forms, it takes the values at that place; otherwise a placeholder takes the
+ * only value of its kind the originals hold. One that cannot be told stays a placeholder. What is stored and shown to
+ * the chat's own members stays as written; only what goes to Anthropic is masked.
+ */
+export function unmaskFrom(text: string, originals: string[]): string {
+  if (!placeholders().test(text)) return text;
+  const lined = originals.map(maskedValues);
+  for (const { masked, values } of lined) {
+    const at = masked.toLowerCase().indexOf(text.toLowerCase());
+    if (at < 0 || values.length === 0) continue;
+    let index = [...masked.slice(0, at).matchAll(placeholders())].length;
+    return text.replace(placeholders(), (placeholder) => (values[index]?.placeholder === placeholder ? values[index++]!.value : placeholder));
+  }
+  const onlyValue = (placeholder: string) => {
+    const found = new Set(lined.flatMap(({ values }) => values.filter((value) => value.placeholder === placeholder).map((value) => value.value)));
+    return found.size === 1 ? [...found][0]! : placeholder;
+  };
+  return text.replace(placeholders(), onlyValue);
+}

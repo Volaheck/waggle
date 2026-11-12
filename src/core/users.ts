@@ -205,6 +205,8 @@ async function applyOptOut(tx: Queryable, userId: number, optedOut: boolean, sco
     await tx`DELETE FROM rejected_facts WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     await tx`DELETE FROM aliases WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     await tx`DELETE FROM memos WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
+    // Reminders they asked for are their own words too: someone who opted out gets none.
+    await tx`DELETE FROM reminders WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     await forgetNotes(tx, userId, scope);
     // Notes on how the person uses others' projects are shown on those project cards, so they go as well.
     await tx`
@@ -234,11 +236,20 @@ async function dropCardRequests(tx: Queryable, userId: number, chatId: number | 
 /**
  * /forgetme and "stop collecting" in one chat (or, without a chat id, everywhere). With `messages` the text of
  * the person's messages is blanked too, and so is the text of the bot's answers to them (an interjection's copy in
- * its log included).
+ * its log included) and of the reminders it delivered to them in the chat.
  */
 export async function forgetUser(sql: Sql, userId: number, options: { chatId?: number; messages: boolean }): Promise<void> {
   const scope = options.chatId ?? null;
   await sql.begin(async (tx) => {
+    // A delivered reminder need not reply to its request (one carried into a supergroup has nothing to reply to), so it
+    // is found through its reminder, before the reminders go with the rest.
+    if (options.messages) {
+      await tx`
+        UPDATE messages delivered SET text = '', extracted_at = now()
+        FROM reminders r
+        WHERE delivered.chat_id = r.chat_id AND delivered.msg_id = r.chat_msg_id AND delivered.from_bot
+          AND r.user_id = ${userId} AND (${scope}::bigint IS NULL OR r.chat_id = ${scope}::bigint)`;
+    }
     await applyOptOut(tx, userId, true, scope);
     await dropCardRequests(tx, userId, scope);
     // Everywhere means the private portrait too (src/core/portrait.ts).

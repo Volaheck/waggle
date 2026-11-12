@@ -44,7 +44,8 @@ const CAPABILITIES = [
   "member cards (stack, role, interests, city, links, what they look for and can help with, a tagline): people edit their own in the Mini App (/app), /me, or by asking the bot in the chat (it posts a receipt with Undo, and only ever changes the asker's own card); names and nicknames with /alias and /unalias; /whatyouknow shows a person what is known about them, /forgetme erases it",
   "the project catalog and its rating from what people do and say (/projects, /top), the members list (/people), the chronicle (/chronicle, /today, /week) and a digest of what someone missed (/catchup)",
   "for its owners only: /botstatus, /chats, /notes, /link, reminders from their own private chats (/reminders) and deleted or edited messages there",
-  "it cannot see reactions, send images, stickers or polls, browse the web, run code, or post on a schedule of its own beyond this weekly idea",
+  "reminders anyone asks for in the chat («напомни завтра в 10 позвонить в банк», «мои напоминания», «отмени напоминание»): it posts a receipt with a cancel button and, when one is due, writes to its asker in the chat and in a private message; it reminds only the person who asks, and once, never on repeat",
+  "it cannot see reactions, send images, stickers or polls, browse the web or run code; on a schedule of its own it posts only this weekly idea and the reminders members asked for",
 ];
 
 export const IDEA_SYSTEM_PROMPT = `You are Waggle, the chronicler bot of a Telegram group chat, a cyber-bee that keeps the hive's memory. ${SELF_GENDER} Once a week you suggest ONE improvement to yourself that would make you more useful, more convenient or more fun for this chat, and only from what this chat actually showed this week: what members asked you and how you answered, what you could not do, what they wished you could do, what the chat talks about.

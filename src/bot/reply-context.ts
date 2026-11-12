@@ -389,7 +389,7 @@ export function aboutYouBlock(input: {
     "<about_you>",
     `You are ${safe(me.first_name)} (@${me.username}), the chat's chronicler bot; this answer is written by ${input.model}.`,
     owners.length ? `Your ${owners.length > 1 ? "owners, who built you and pay" : "owner, who built you and pays"} for you: ${owners.join("; ")}.` : "",
-    "You read the chat and keep the members' cards, the project catalog with its rating and the chronicle, and you answer when someone mentions you or replies to you. A member changes their own card, tagline, time zone, names and notes (about themselves or on a project of theirs) by asking you plainly in the chat: you do it and post a receipt with ↩️ Undo, and ↪️ Redo after an Undo; the Mini App (/app) does the same. Nobody changes anyone else's data, a project's catalog entry, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets. /forgetme erases what you know about a person.",
+    "You read the chat and keep the members' cards, the project catalog with its rating and the chronicle, and you answer when someone mentions you or replies to you. A member changes their own card, tagline, time zone, names and notes (about themselves or on a project of theirs) by asking you plainly in the chat: you do it and post a receipt with ↩️ Undo, and ↪️ Redo after an Undo; the Mini App (/app) does the same. A member asks you to remind them of something later the same way: you post a receipt with ✖️ Cancel and, when it is due, write to them in the chat and in a private message; only ever the person who asks, and once, never on repeat. Nobody changes anyone else's data, a project's catalog entry, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets. /forgetme erases what you know about a person.",
     entry
       ? `In the catalog you are the project ${safe(entry.project.name)}: #${entry.rank} of ${entry.total}, ${entry.project.score} rating points, ${entry.project.votes} vote(s).`
       : "",
@@ -884,11 +884,12 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
           ORDER BY coalesce(said_at, created_at) DESC, id DESC`
       : Promise.resolve([]),
     focusIds.length ? recurringThemes(sql, chatId) : Promise.resolve([]),
-    // The bot's own words of the last days, its receipts for card requests aside, newest first.
+    // The bot's own words of the last days, its receipts for card and reminder requests and the reminders it delivered aside, newest first.
     sql<{ text: string; sent_at: Date }[]>`
       SELECT m.text, m.sent_at FROM messages m
       WHERE m.chat_id = ${chatId} AND m.from_bot AND btrim(m.text) <> '' AND m.sent_at > now() - ${`${SPENT_DAYS} days`}::interval
         AND NOT EXISTS (SELECT 1 FROM self_edits s WHERE s.chat_id = m.chat_id AND s.receipt_msg_id = m.msg_id)
+        AND NOT EXISTS (SELECT 1 FROM reminders r WHERE r.chat_id = m.chat_id AND m.msg_id IN (r.chat_msg_id, r.receipt_msg_id))
       ORDER BY m.msg_id DESC LIMIT ${SPENT_MESSAGES}`,
   ]);
   // What the bot's own words of the last days already used: the notes they brought up, and the words they wore out.
@@ -1019,7 +1020,9 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     threadLines.length ? `<thread note="the messages the question replies to, root first">\n${threadLines.join("\n")}\n</thread>` : "",
     // A message of the bot's from before it kept its own messages: Telegram's copy stands in.
     repliedToBot && unstoredParent ? `<your_message_they_reply_to>\n${line(unstoredParent, 1500)}\n</your_message_they_reply_to>` : "",
-    question.cardChange ? `<card_change note="what the bot did about this message's request to change the sender's card; its reply already said it">${line(question.cardChange, 600)}</card_change>` : "",
+    question.cardChange
+      ? `<card_change note="what the bot did about this message's request to change the sender's card or to remind them of something; its reply already said it">${line(question.cardChange, 600)}</card_change>`
+      : "",
     worn.length ? `<worn_out note="what your latest answers kept coming back to">${worn.map(safe).join(", ")}</worn_out>` : "",
     `<if_insulted motif="${options.insultMotif}" />`,
     // Right before the question, where a smaller model still has it in mind: the tone of the answer follows this message.

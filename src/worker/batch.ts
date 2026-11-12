@@ -69,20 +69,23 @@ export async function skippedMessageIds(sql: Sql, chatId: number): Promise<numbe
 }
 
 /** Everything the chronicler is shown along with a batch of messages: the context before it, the people, the catalog, the notes. */
-/** What the chronicler reads instead of a request to the bot about someone's card: never a source for anyone's data. */
+/** What the chronicler reads instead of a request to the bot about someone's card or a reminder: never a source for anyone's data. */
 const CARD_REQUEST_TEXTS: Record<string, string> = {
   edit: "[asked the bot to change their own card; the bot handled it]",
   about_others: "[asked the bot to change another member's card; the bot refused]",
   fake_claim: "[asked the bot to say it changed someone's data; the bot refused]",
   unclear: "[asked the bot to change their card without saying what]",
   redo: "[asked the bot to bring back a change of their own card they had undone]",
+  reminder: "[asked the bot for a reminder; the bot handled it]",
+  reminder_unclear: "[asked the bot for a reminder without saying when or what of]",
   parsing: "[a request to the bot about a card]",
 };
 
 /**
- * Requests to change a card are handled by the bot itself (src/bot/self-edits.ts): the chronicler sees only that one
- * was made, so it can neither apply one again, nor bring back what its author undid, nor take a request about another
- * member as a fact or a correction about them.
+ * Requests to change a card and requests for reminders are handled by the bot itself (src/bot/self-edits.ts,
+ * src/bot/reminders.ts): the chronicler sees only that one was made, so it can neither apply one again, nor bring back
+ * what its author undid, nor take a request about another member as a fact or a correction about them, nor note what
+ * someone asked to be reminded of as a promise or a plan of theirs.
  */
 async function withoutCardRequests(sql: Sql, chatId: number, messages: StoredMessage[]): Promise<StoredMessage[]> {
   if (messages.length === 0) return messages;
