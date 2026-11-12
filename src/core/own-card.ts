@@ -347,9 +347,18 @@ const STATUS_WORDS: Record<ProjectStatus, RegExp> = {
   abandoned: /(?<!\p{L})(?:заброш|забросил|бросил|брошен|закрыл|закрыт|мертв|похоронил|забил на)|\b(?:abandon\w*|dropped|dead|killed|gave up|shut down)\b/iu,
 };
 
-/** Whether the sender's own words name this status of a project. */
+/**
+ * Whether the sender's own words name this status of a project, and not as one it isn't: a status word under a
+ * negation in its own clause («он не заброшен», «больше не на паузе», "not live yet") says no status, while «нет, он
+ * заброшен» says that one.
+ */
 export function statusSaid(status: ProjectStatus, senderText: string): boolean {
-  return STATUS_WORDS[status].test(cleanText(senderText).toLowerCase().replace(/ё/g, "е"));
+  const text = cleanText(senderText).toLowerCase().replace(/ё/g, "е").replace(/’/g, "'");
+  return [...text.matchAll(new RegExp(STATUS_WORDS[status].source, "giu"))].some((match) => {
+    const clause = text.slice(0, match.index).split(/[,.;:!?()«»"—–]/u).pop() ?? "";
+    const before = (clause.match(/[\p{L}\p{N}']+/gu) ?? []).slice(-2);
+    return !before.some((word) => NEGATIONS.has(word) || /n't$/u.test(word));
+  });
 }
 
 /** Every status of a project the words name. */

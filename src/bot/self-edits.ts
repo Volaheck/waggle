@@ -132,7 +132,7 @@ const REDO_CUE =
 const OWNERS_ASKED_EVERY_MS = 24 * 3_600_000;
 /** Words a request to change a card or a project can hardly do without. */
 const CARD_CUE =
-  /запис|запиш|добав|удал|убер|убра|сотр|стер|забуд|помен|измен|обнов|исправ|поправ|внес|занес|замен|постав|установ|смен|задай|задать|выстав|переключ|пояс|укаж|отмет|зов|назыв|переимен|карточ|теглайн|тэглайн|подпис|заметк|сохран|закин|кинь|скин|запомн|бэклог|\b(?:add|remove|delete|drop|change|update|set|replace|rename|record|write|erase|forget|call me|card|tagline|notes?|save|backlog|time ?zone)\b/iu;
+  /запис|запиш|добав|удал|убер|убра|сотр|стер|забуд|помен|измен|обнов|исправ|поправ|внес|занес|замен|постав|установ|смен|задай|задать|выстав|переключ|пояс|укаж|отмет|(?<!\p{L})(?:зови|зовите|зовут|назови|назовите)(?!\p{L})|назыв|переимен|карточ|теглайн|тэглайн|подпис|заметк|сохран|закин|кинь|скин|запомн|бэклог|\b(?:add|remove|delete|drop|change|update|set|replace|rename|record|write|erase|forget|call me|card|tagline|notes?|save|backlog|time ?zone)\b/iu;
 /**
  * The words that name each part of a project's entry. Without a request word, a message asks for a change only by
  * naming a project of the sender's, the part it sets and a value for it (VALUE_GIVEN): «у Nova теперь сайт …»,
@@ -789,7 +789,10 @@ export async function resolveOps(
     }
     const around = await projectsNamedIn([words, pointedAt ?? ""]);
     if (around.others) return around.own.length ? "which_project" : "not_author";
-    if (around.own.length) return picked && around.own.includes(picked) ? picked : around.own.length === 1 ? around.own[0]! : "which_project";
+    if (around.own.length === 1) return around.own[0]!;
+    // Of several, the reading's pick only when their own words name it, never when only the message they reply to does
+    // (the bot's own «Atlas или Nova?» answered «да»).
+    if (around.own.length) return picked && (await projectsNamedIn([words])).own.includes(picked) ? picked : "which_project";
     const namedLikeYou = card.projects.find((project) => botNames.some((name) => nameKey(name) === nameKey(project.name)));
     if (namedLikeYou && ABOUT_YOU.test(newest)) return namedLikeYou;
     return card.projects.length === 1 ? card.projects[0]! : "which_project";
@@ -1688,24 +1691,30 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     const read = outcome.ok ? asEdit(outcome.data) : null;
     // The request has to stand in the newest message, in its own words: a reading that cannot quote it is a question.
     // A message let in by a redo word alone can only be a redo, and one let in as an answer about their city only an edit
-    // of their time zone.
-    const answeringCity = cityAsked !== undefined && !requestWords;
-    const answering = answeringCity || (clarified !== undefined && !requestWords);
+    // of their time zone, and a wish its own words ask for. Only words that ask for a change of the card or a project make a reply to the bot's question a
+    // new request instead of its answer: a wish beside the answer («Nova, и не шути про мой вес») leaves it the answer.
+    const cardWords = CARD_CUE.test(asked) || aboutOwnProject;
+    const answeringCity = cityAsked !== undefined && !cardWords;
+    const answering = answeringCity || (clarified !== undefined && !cardWords);
     const fits = (kind: SelfEditResult["kind"]) => kind !== "not_a_request" && (requestWords || kind === "redo" || (answering && kind === "edit"));
     const quoted = read && fits(read.kind) && requestStandsIn(read.asks, asked, read.kind, answering, aboutOwnProject) ? read : null;
-    // Only what the newest message's words ask for stands: a wish only with a wish's words, and a change of the card not
-    // when only a wish's words let the message in.
-    const askedFor = quoted && !answering && quoted.kind === "edit" ? opsAskedIn(asked, quoted.ops, aboutOwnProject) : quoted?.ops;
+    // Only what the words ask for stands: a wish only with a wish's words, and a change of the card not when only a
+    // wish's words let the message in. An answer to the bot's question is weighed with the request it answers, and an
+    // unclear reading, which the answer may turn into a note, like any other.
+    const askedFor =
+      quoted && !answeringCity && (quoted.kind === "edit" || quoted.kind === "unclear")
+        ? opsAskedIn(answering && clarified ? `${clarified.text}\n${asked}` : asked, quoted.ops, aboutOwnProject)
+        : quoted?.ops;
     const standing = quoted && askedFor && (askedFor.length > 0 || quoted.ops.length === 0) ? { ...quoted, ops: askedFor } : null;
     // A request that stands only by naming a part of a project's entry sets only the parts it names, and nothing on
-    // their card; with none of them left, it was no request.
-    const byPartsAlone = standing?.kind === "edit" && !answering && !REQUEST_CUE.test(standing.asks ?? "");
-    const partsAsked = byPartsAlone ? standing.ops.filter((op) => isProjectAction(op.action) && partNamed(op.action, asked)) : [];
+    // their card; with none of them left, it was no request. A wish beside it stands on its own words (opsAskedIn).
+    const byPartsAlone = standing?.kind === "edit" && !answering && !CARD_CUE.test(standing.asks ?? "");
+    const partsAsked = byPartsAlone ? standing.ops.filter((op) => isWishOp(op) || (isProjectAction(op.action) && partNamed(op.action, asked))) : [];
     const reading =
       !standing || (byPartsAlone && partsAsked.length === 0)
         ? null
         : answeringCity
-          ? { ...standing, ops: standing.ops.filter((op) => op.action === "set_zone" || (op.action === "add" && op.field === "timezone")) }
+          ? { ...standing, ops: standing.ops.filter((op) => op.action === "set_zone" || (op.action === "add" && op.field === "timezone") || (isWishOp(op) && WISH_CUE.test(asked))) }
           : byPartsAlone
             ? { ...standing, ops: partsAsked }
             : standing;
@@ -1766,15 +1775,16 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
       await done("unclear", "answered");
       return answer(WISH_CUE.test(asked) && !CARD_CUE.test(asked) ? UNCLEAR_WISH : UNCLEAR);
     }
-    // What no wish can do, and a wish about someone else, have fixed words of their own.
-    if (result.kind === "loosen" || (result.kind === "about_others" && WISH_CUE.test(asked))) {
+    // A request about someone else's project, by name, is told who changes a project.
+    const othersProject =
+      result.kind === "about_others" &&
+      namedIn([asked, foldMixedScript(asked)], await projectNamesOf(sql, chatId)).some((projectId) => !card.projects.some((project) => project.id === projectId));
+    // What no wish can do, and a wish about someone else, have fixed words of their own; a change asked of someone else's
+    // project keeps its own, wish words beside it or not.
+    if (result.kind === "loosen" || (result.kind === "about_others" && WISH_CUE.test(asked) && !(othersProject && (CARD_CUE.test(asked) || namesAPart(asked))))) {
       return refuse(result.kind, escapeHtml(WISH_TEXTS[language][result.kind === "loosen" ? "loosen" : "othersWish"]));
     }
     if (result.kind !== "edit") {
-      // A request about someone else's project, by name, is told who changes a project.
-      const othersProject =
-        result.kind === "about_others" &&
-        namedIn([asked, foldMixedScript(asked)], await projectNamesOf(sql, chatId)).some((projectId) => !card.projects.some((project) => project.id === projectId));
       const refusals: Record<string, string | undefined> = { about_others: othersProject ? texts.othersProject : texts.aboutOthers, fake_claim: texts.fakeClaim, forget_all: texts.forgetAll };
       return refuse(result.kind, escapeHtml(refusals[result.kind]!));
     }

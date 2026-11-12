@@ -76,6 +76,14 @@ describe("reading a request", () => {
     expect(statusSaid("in_progress", "я его снова пилю")).toBe(true);
     expect(statusSaid("paused", "Relic теперь на паузе")).toBe(true);
     expect(statusSaid("idea", "это пока только идея")).toBe(true);
+    // A status word under a negation in its own clause says no status; one after «нет,» says it.
+    expect(statusSaid("abandoned", "и нет, он не заброшен")).toBe(false);
+    expect(statusSaid("abandoned", "нет, он заброшен")).toBe(true);
+    expect(statusSaid("paused", "Atlas больше не на паузе")).toBe(false);
+    expect(statusSaid("abandoned", "он не заброшен, а запущен")).toBe(false);
+    expect(statusSaid("launched", "он не заброшен, а запущен")).toBe(true);
+    expect(statusSaid("launched", "it's not live yet")).toBe(false);
+    expect(statusSaid("launched", "Atlas isn't launched")).toBe(false);
   });
 
   it("tells the answer that a project's authors change it in the chat, and never to send anyone to write a note", () => {
@@ -840,6 +848,28 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
       expect(await zoneOf(chat, bob.id)).toEqual({ time_zone: "America/Toronto", time_zone_source: "chat" });
       // An answer about the city changes the zone and nothing else.
       expect(await sql`SELECT 1 FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id} AND kind = 'stack'`).toHaveLength(0);
+      // A wish beside the answer leaves it the answer: the zone is set, and the wish its own words ask for is kept.
+      const ann = await member(chat, "Ann");
+      const asking = await run(chat, ann, "@waggle_test_bot поставь мне пояс Канада", { kind: "edit", also_asks: false, ops: [{ action: "set_zone", field: null, ref: null, value: "Канада" }] });
+      const [annQuestion] = await sql<{ receipt_msg_id: number }[]>`SELECT receipt_msg_id FROM self_edits WHERE chat_id = ${chat} AND msg_id = ${asking.message.message_id}`;
+      const withWish = await run(
+        chat,
+        ann,
+        "Торонто, и не шути про мой акцент",
+        {
+          kind: "edit",
+          asks: "Торонто, и не шути про мой акцент",
+          also_asks: false,
+          ops: [
+            { action: "set_zone", field: null, ref: null, value: "Торонто" },
+            { action: "add_wish", field: null, ref: null, value: "не шути про мой акцент", scope: "self" },
+          ],
+        },
+        undefined,
+        replyTo(chat, annQuestion!.receipt_msg_id),
+      );
+      expect(await zoneOf(chat, ann.id)).toEqual({ time_zone: "America/Toronto", time_zone_source: "chat" });
+      expect(withWish.sent[0]!.text).toContain("🤐 Запомнил: «не шути про мой акцент».");
     });
 
     it("never asks on its own which city someone is in: where they are comes from what they say", async () => {
@@ -1131,6 +1161,7 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
         [bob, "@waggle_test_bot Atlas уже на паузе?", {}],
         [bob, "@waggle_test_bot статус Atlas: заброшен?", {}],
         [bob, "@waggle_test_bot глянь репост про Atlas: огонь", {}],
+        [bob, "@waggle_test_bot ура, Atlas вышел, первые пользователи уже есть!", {}],
         [bob, "@waggle_test_bot Atlas заброшен?", planted],
       ];
       for (const [asker, text, extra] of unread) {
@@ -1160,6 +1191,110 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
         FROM messages WHERE chat_id = ${chat} AND msg_id = ANY(${ids}) ORDER BY msg_id`;
       const data = await batchDataFor(sql, chat, stored);
       expect(data.batch.map((message) => message.text)).toEqual(["[asked the bot to change a project of theirs; the bot handled it]", news.message.text]);
+    });
+
+    it("keeps a project's guards when a wish comes along: the parts named, the answer to its question, its fixed refusal", async () => {
+      const wish = (value: string) => ({ action: "add_wish" as const, field: null, ref: null, value, scope: "self" as const });
+      const toAnswer = async (chatId: number, request: Message, text: string) => {
+        const msgId = ++nextBotMsgId;
+        await saveBotMessage(sql, { chatId, msgId, sentAt: new Date(), text, replyToMsgId: request.message_id });
+        return { reply_to_message: { message_id: msgId, date: 0, chat: { id: chatId, type: "supergroup", title: "Hive" }, from: me, text } } as unknown as Partial<Message>;
+      };
+
+      // News that gives a part a value, with a wish beside it: that part is set and the wish kept, whatever the reading
+      // quotes, never a status or a technology the message names no part for.
+      const first = await russianChat();
+      const bob = await member(first, "Bob");
+      const atlas = await found(first, "Atlas", [bob.id]);
+      const moved = await run(first, bob, "@waggle_test_bot Atlas переехал с PHP на Go и вышел, сайт: https://atlas.example. Только не шути про него", {
+        kind: "wish",
+        also_asks: false,
+        ops: [op("remove_project_stack", "PHP"), op("add_project_stack", "Go"), op("set_project_status", "launched"), op("set_project_site", "https://atlas.example"), wish("не шути про него")],
+      });
+      expect(moved.sent[0]!.text).toBe("✏️ Проект Atlas: сайт: https://atlas.example\n🤐 Запомнил: «не шути про него».");
+      expect(await entryOf(atlas.id)).toMatchObject({ status: "in_progress", stack: ["PHP"], links: { site: "https://atlas.example" } });
+      expect((await requestOf(first, moved.message.message_id)).kind).toBe("edit");
+      const second = await russianChat();
+      const ann = await member(second, "Ann");
+      const nova = await found(second, "Nova", [ann.id]);
+      const quotedWish = await run(second, ann, "@waggle_test_bot Nova вышла, сайт: https://nova.example, и не шути про неё", {
+        kind: "edit",
+        also_asks: false,
+        asks: "и не шути про неё",
+        ops: [op("set_project_status", "launched"), op("set_project_site", "https://nova.example"), wish("не шути про неё")],
+      });
+      expect(quotedWish.sent[0]!.text).toBe("✏️ Проект Nova: сайт: https://nova.example\n🤐 Запомнил: «не шути про неё».");
+      expect((await entryOf(nova.id)).status).toBe("in_progress");
+
+      // A wish beside the answer to «which project?» leaves it the answer: the change it completes is made.
+      const third = await russianChat();
+      const dan = await member(third, "Dan");
+      await found(third, "Atlas", [dan.id]);
+      const relic = await found(third, "Relic", [dan.id]);
+      const vague = await run(third, dan, "@waggle_test_bot добавь в стек Kotlin", { kind: "edit", also_asks: false, ops: [op("add_project_stack", "Kotlin", "p1")] });
+      expect((await requestOf(third, vague.message.message_id)).kind).toBe("unclear");
+      const answered = await run(
+        third,
+        dan,
+        "Relic, и не шути про мой вес",
+        { kind: "edit", also_asks: false, asks: "Relic, и не шути про мой вес", ops: [op("add_project_stack", "Kotlin", "p2"), wish("не шути про мой вес")] },
+        undefined,
+        await toAnswer(third, vague.message, "Atlas или Relic?"),
+      );
+      expect(answered.sent[0]!.text).toBe("✏️ Проект Relic: стек: + Kotlin\n🤐 Запомнил: «не шути про мой вес».");
+      expect((await entryOf(relic.id)).stack).toEqual(["PHP", "Kotlin"]);
+      // A reply that names no project («да») to the bot's own «Atlas или Relic?» is no pick of one, whatever the reading.
+      const seventh = await russianChat();
+      const hal = await member(seventh, "Hal");
+      const halAtlas = await found(seventh, "Atlas", [hal.id]);
+      const halRelic = await found(seventh, "Relic", [hal.id]);
+      const unsure = await run(seventh, hal, "@waggle_test_bot добавь в стек Go", { kind: "edit", also_asks: false, ops: [op("add_project_stack", "Go", "p1")] });
+      const yes = await run(seventh, hal, "да", { kind: "edit", also_asks: false, asks: "да", ops: [op("add_project_stack", "Go", "p1")] }, undefined, await toAnswer(seventh, unsure.message, "Atlas или Relic?"));
+      expect(yes.sent).toEqual([]);
+      expect(yes.cardChanges[0]).toContain("could not tell which of their projects it is for (Atlas, Relic)");
+      expect([(await entryOf(halAtlas.id)).stack, (await entryOf(halRelic.id)).stack]).toEqual([["PHP"], ["PHP"]]);
+
+      // A reply to the bot's question about a wish is weighed with that wish: it changes no project, whatever the reading.
+      const fourth = await russianChat();
+      const eve = await member(fourth, "Eve");
+      const mist = await found(fourth, "Atlas", [eve.id]);
+      const unclear = await run(fourth, eve, "@waggle_test_bot не шути так", { kind: "unclear", also_asks: false, ops: [] });
+      expect((await requestOf(fourth, unclear.message.message_id)).kind).toBe("unclear");
+      const which = await run(
+        fourth,
+        eve,
+        "про Atlas, я его забросил",
+        { kind: "wish", also_asks: false, asks: "про Atlas, я его забросил", ops: [wish("не шути про Atlas"), op("set_project_status", "abandoned")] },
+        undefined,
+        await toAnswer(fourth, unclear.message, "Про что именно не шутить?"),
+      );
+      expect(which.sent.map((sent) => sent.text).join("\n")).not.toContain("Проект Atlas");
+      expect(await entryOf(mist.id)).toMatchObject({ status: "in_progress", manual_fields: [] });
+
+      // A change asked of someone else's project is refused in its own fixed words, a wish beside it or not; a wish
+      // about another member keeps the wish's.
+      const fifth = await russianChat();
+      const owner = await member(fifth, "Fay");
+      const kit = await member(fifth, "Kit");
+      const theirs = await found(fifth, "Atlas", [owner.id]);
+      const changeOfTheirs = await run(fifth, kit, "@waggle_test_bot поменяй статус Atlas на запущен и не шути про него", { kind: "about_others", also_asks: false, ops: [] });
+      expect(changeOfTheirs.sent[0]!.text).toBe("🔒 Проект меняют только его авторы: кто они, видно в Mini App (/app). Чужой не трону, кто бы ни просил и что бы ни разрешал.");
+      const aboutHer = await run(fifth, kit, "@waggle_test_bot не шути про Fay и её Atlas", { kind: "about_others", also_asks: false, ops: [] });
+      expect(aboutHer.sent[0]!.text).toBe("🔒 Просить можно только за себя: про кого-то другого может попросить только сам этот человек.");
+      expect((await entryOf(theirs.id)).status).toBe("in_progress");
+
+      // «он не заброшен» says no status: the site is set, the status asked again, and the project stays as it is.
+      const sixth = await russianChat();
+      const gil = await member(sixth, "Gil");
+      const kept = await found(sixth, "Atlas", [gil.id]);
+      const denied = await run(sixth, gil, "@waggle_test_bot поменяй сайт Atlas на https://atlas.dev, и нет, он не заброшен", {
+        kind: "edit",
+        also_asks: false,
+        ops: [op("set_project_site", "https://atlas.dev"), op("set_project_status", "abandoned")],
+      });
+      expect(denied.sent[0]!.text).toContain("✏️ Проект Atlas: сайт: https://atlas.dev");
+      expect(denied.sent[0]!.text).toContain("не понял, какой статус");
+      expect(await entryOf(kept.id)).toMatchObject({ status: "in_progress", links: { site: "https://atlas.dev" } });
     });
 
     it("takes a technology off on its own, asks before taking off one they did not name, and leaves renaming to the Mini App", async () => {
