@@ -404,7 +404,7 @@ describe("answers squeezed out by pressure", () => {
     expect(squeezedOut("Мяу мяу. МЯУ! мяу, мяу")).toBe(true);
     expect(squeezedOut("мяу мяу мяу мяу")).toBe(false);
     expect(squeezedOut("Пчёлы не мяукают, а реанимацию по чату не делают.")).toBe(false);
-    expect(squeezedOut("Жил-был кот. ".repeat(120))).toBe(true);
-    expect(squeezedOut("а".repeat(1500))).toBe(false);
+    expect(squeezedOut("Жил-был кот. ".repeat(160))).toBe(true);
+    expect(squeezedOut("а".repeat(2000))).toBe(false);
   });
 });
