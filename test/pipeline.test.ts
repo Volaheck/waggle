@@ -518,11 +518,15 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     expect(await pendingCount(chat.id)).toBe(40);
     expect(await usageRows(chat.id)).toBe(1);
 
-    // A call still running when the stop can wait no longer is cancelled; the input it was sent is paid for.
+    // A call still running when the stop can wait no longer is cancelled; the input it was sent is paid for. The stop
+    // comes once the call is under way, however long the pass takes to get there.
     const cancel = new AbortController();
+    let callStarted!: () => void;
+    const underWay = new Promise<void>((resolve) => (callStarted = resolve));
     const hanging = {
       messages: {
         stream(_params: unknown, options?: { signal?: AbortSignal }) {
+          callStarted();
           return {
             currentMessage: { usage: { input_tokens: 50_000, output_tokens: 3, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
             finalMessage: () => new Promise((_resolve, reject) => options?.signal?.addEventListener("abort", () => reject(new Error("Request was aborted.")))),
@@ -531,7 +535,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
       },
     } as unknown as Anthropic;
     const pass = runExtractionPass({ ...deps(chat.id, hanging), signal: cancel.signal });
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await underWay;
     cancel.abort();
     await expect(pass).rejects.toThrow("aborted");
     expect(await failedRun()).toEqual({ status: "failed", error: INTERRUPTED_PASS_ERROR });
