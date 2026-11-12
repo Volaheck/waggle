@@ -9,6 +9,7 @@ import {
   ABANDONED_MULTIPLIER,
   formerNames,
   listProjects,
+  projectForms,
   ratingBreakdown,
   STATUS_LABELS,
   type FormerName,
@@ -404,7 +405,7 @@ export function aboutYouBlock(input: {
     "<about_you>",
     `You are ${safe(me.first_name)} (@${me.username}), the chat's chronicler bot; this answer is written by ${input.model}.`,
     owners.length ? `Your ${owners.length > 1 ? "owners, who built you and pay" : "owner, who built you and pays"} for you: ${owners.join("; ")}.` : "",
-    "You read the chat and keep the members' cards, the project catalog with its rating and the chronicle, and you answer when someone mentions you or replies to you. A member changes their own card, tagline, time zone, names and notes (about themselves or on a project of theirs) by asking you plainly in the chat: you do it and post a receipt with ↩️ Undo, and ↪️ Redo after an Undo; the Mini App (/app) does the same. A member asks you to remind them of something later the same way: you post a receipt with ✖️ Cancel and, when it is due, write to them in the chat and in a private message; only ever the person who asks, and once, never on repeat. They also ask you to do, at a later time, anything you do when asked (an answer, a summary of the chat, a change to their card or notes, a reminder, a /command): you post a receipt with ✖️ Cancel and at that time do it as if they had just asked, once. Nobody changes anyone else's data, a project's catalog entry, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets. /forgetme erases what you know about a person.",
+    "You read the chat and keep the members' cards, the project catalog with its rating and the chronicle, and you answer when someone mentions you or replies to you. A member changes their own card, tagline, time zone, names and notes (about themselves or on a project of theirs), and a project's authors its tagline, status, stack and links, by asking you plainly in the chat: you do it and post a receipt with ↩️ Undo, and ↪️ Redo after an Undo; the Mini App (/app) does the same and also renames or removes a project; nobody changes a project's authors through you. Nobody needs a note to change a card or a project. A member asks you to remind them of something later the same way: you post a receipt with ✖️ Cancel and, when it is due, write to them in the chat and in a private message; only ever the person who asks, and once, never on repeat. They also ask you to do, at a later time, anything you do when asked (an answer, a summary of the chat, a change to their card, notes or projects, a reminder, a /command): you post a receipt with ✖️ Cancel and at that time do it as if they had just asked, once. Nobody changes anyone else's data, someone else's project, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets. /forgetme erases what you know about a person.",
     entry
       ? `In the catalog you are the project ${safe(entry.project.name)}: #${entry.rank} of ${entry.total}, ${entry.project.score} rating points, ${entry.project.votes} vote(s).`
       : "",
@@ -635,7 +636,9 @@ function projectDetailsBlock(input: {
 
 /**
  * When each project's status last changed: the first of the latest run of logged changes with that status (imports and
- * the chronicler log what a project became, people what it was too), else when the project was made.
+ * the chronicler log what a project became, people what it was too), else when the project was made. A change an
+ * author asked for in the chat and took back with Undo never happened, nor did its Undo (the same request's message,
+ * src/core/own-card.ts): a Redo is a change of its own.
  */
 async function statusDates(sql: Sql, projectIds: number[]): Promise<Map<number, Date>> {
   if (projectIds.length === 0) return new Map();
@@ -645,7 +648,16 @@ async function statusDates(sql: Sql, projectIds: number[]): Promise<Map<number, 
     LEFT JOIN LATERAL (
       SELECT at FROM (
         SELECT c.at, c.after->>'status' AS status, lag(c.after->>'status') OVER (ORDER BY c.at, c.id) AS previous
-        FROM change_log c WHERE c.entity = 'project' AND c.entity_id = p.id AND c.after ? 'status'
+        FROM change_log c
+        WHERE c.entity = 'project' AND c.entity_id = p.id AND c.after ? 'status' AND c.op <> 'undo'
+          AND NOT EXISTS (
+            SELECT 1 FROM change_log u
+            WHERE u.entity = 'project' AND u.entity_id = c.entity_id AND u.op = 'undo' AND u.id > c.id AND c.source = 'user'
+              AND u.source_msg_ids = c.source_msg_ids AND u.actor_user_id IS NOT DISTINCT FROM c.actor_user_id
+              AND NOT EXISTS (
+                SELECT 1 FROM change_log redone
+                WHERE redone.entity = 'project' AND redone.entity_id = c.entity_id AND redone.op = 'update'
+                  AND redone.source_msg_ids = c.source_msg_ids AND redone.id > c.id AND redone.id < u.id))
       ) AS logged
       WHERE previous IS DISTINCT FROM status AND status = p.status
       ORDER BY at DESC LIMIT 1
@@ -865,15 +877,9 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
 
   // Projects the question or its thread names, by any name they had; for a question about the rating that names none,
   // the asker's own.
-  const projectNames: Named[] = projects.map((project) => {
-    const names = [
-      project.name,
-      project.slug.replace(/-/g, " "),
-      ...(projectAliases.get(project.id) ?? []).map((alias) => alias.alias),
-      ...(formerOf.get(project.id) ?? []).map((entry) => entry.name),
-    ];
-    return { id: project.id, forms: [...new Set([...names, ...names.flatMap(transliterateName)])] };
-  });
+  const projectNames: Named[] = projects.map((project) =>
+    projectForms(project, [...(projectAliases.get(project.id) ?? []).map((alias) => alias.alias), ...(formerOf.get(project.id) ?? []).map((entry) => entry.name)]),
+  );
   let pickedIds = namedIn([asked, ...threadTexts], projectNames);
   if (pickedIds.length === 0 && asker && asksAboutRating(asked)) {
     pickedIds = projects.filter((project) => project.authors.some((author) => author.id === asker.id)).map((project) => project.id);
@@ -1071,7 +1077,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     // A message of the bot's from before it kept its own messages: Telegram's copy stands in.
     repliedToBot && unstoredParent ? `<your_message_they_reply_to>\n${line(unstoredParent, 1500)}\n</your_message_they_reply_to>` : "",
     question.cardChange
-      ? `<card_change note="what the bot did about this message's request to change the sender's card, to remind them of something or to do something for them later; its reply already said it">${line(question.cardChange, 600)}</card_change>`
+      ? `<card_change note="what the bot did about this message's request to change the sender's card or a project of theirs, to remind them of something or to do something for them later; its reply already said it">${line(question.cardChange, 600)}</card_change>`
       : "",
     question.scheduled ? askedEarlierBlock(question.scheduled.askedAt, (asker && clocks.get(asker.id)?.zone) || options.timezone) : "",
     worn.length ? `<worn_out note="what your own answers kept coming back to lately: leave it out">${worn.map(safe).join(", ")}</worn_out>` : "",

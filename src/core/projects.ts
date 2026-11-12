@@ -1,10 +1,16 @@
+import type { Named } from "./aliases.js";
 import type { Queryable, Sql } from "./db.js";
 import { isNearDuplicate } from "./facts.js";
-import { normalizeUrl, safeHttpUrl, slugify } from "./text.js";
+import { normalizeUrl, safeHttpUrl, slugify, transliterateName } from "./text.js";
 
 /** Stored as is and used verbatim by the chronicler, whose schemas accept exactly these codes. */
 export const PROJECT_STATUSES = ["idea", "in_progress", "launched", "paused", "abandoned"] as const;
 export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
+
+/** A person's edit keeps within these, wherever it is made. */
+export const MAX_PROJECT_TAGLINE_CHARS = 200;
+export const MAX_STACK_ITEM_CHARS = 40;
+export const MAX_STACK_ITEMS = 20;
 
 export const STATUS_LABELS: Record<ProjectStatus, string> = {
   idea: "idea",
@@ -207,6 +213,27 @@ async function renamedFrom(sql: Queryable, chatId: number, oldSlug: string): Pro
   return project;
 }
 
+/** Every name a project goes by in a message: its name, its slug and the names given to it, in either alphabet. */
+export function projectForms(project: Pick<Project, "id" | "name" | "slug">, givenNames: string[]): Named {
+  const names = [project.name, project.slug.replace(/-/g, " "), ...givenNames];
+  return { id: project.id, forms: [...new Set([...names, ...names.flatMap(transliterateName)])] };
+}
+
+/** The chat's shown projects as names a message may hold: each with its aliases and its former names. */
+export async function projectNamesOf(sql: Sql, chatId: number): Promise<Named[]> {
+  const [projects, aliases, former] = await Promise.all([
+    sql<Pick<Project, "id" | "name" | "slug">[]>`SELECT id, name, slug FROM projects WHERE chat_id = ${chatId} AND NOT hidden ORDER BY id`,
+    sql<{ project_id: number; alias: string }[]>`SELECT project_id, alias FROM aliases WHERE chat_id = ${chatId} AND project_id IS NOT NULL`,
+    formerNames(sql, chatId),
+  ]);
+  return projects.map((project) =>
+    projectForms(project, [
+      ...aliases.filter((alias) => alias.project_id === project.id).map((alias) => alias.alias),
+      ...former.filter((entry) => entry.project_id === project.id).map((entry) => entry.name),
+    ]),
+  );
+}
+
 export async function findProject(sql: Sql, chatId: number, query: string): Promise<Project | undefined> {
   const needle = query.trim();
   const [project] = await sql<Project[]>`
@@ -251,8 +278,8 @@ export interface UpsertResult {
 type Candidate = Project & { author_ids: number[] };
 
 const EDITABLE_FIELDS = ["tagline", "status", "stack", "links"] as const;
-type EditableField = (typeof EDITABLE_FIELDS)[number];
-type EditableValues = Pick<Project, EditableField>;
+export type EditableField = (typeof EDITABLE_FIELDS)[number];
+export type EditableValues = Pick<Project, EditableField>;
 
 /** Matching and creating projects of one chat happen one at a time, so two adds of one name cannot both insert. */
 async function lockChatProjects(tx: Queryable, chatId: number): Promise<void> {
@@ -500,14 +527,37 @@ function withLinks(current: ProjectLinks, patch: { repo?: string | null; site?: 
   return result;
 }
 
-/** Applies a person's edit to one project row, locks what changed against the chronicler and logs only what really changed. */
-async function applyEdit(
-  tx: Queryable,
-  current: Project,
-  fields: ProjectFields,
-  who: { source: "user" | "admin"; actorUserId: number },
-  options: { activityAt?: Date; restore?: boolean } = {},
-): Promise<{ project: Project; changed: boolean }> {
+/** Who makes an edit, and the messages it comes from (a request in the chat). */
+interface EditedBy {
+  source: "user" | "admin";
+  actorUserId: number;
+  sourceMsgIds?: number[];
+}
+
+/** What a person's edit changed: each field it changed, as it was and as it is now. */
+export interface ProjectEdit {
+  fields: EditableField[];
+  before: Partial<EditableValues>;
+  after: Partial<EditableValues>;
+}
+
+/** What an edit reads of a project: all the self-edit role may see of one (migrations/015_project_edits.sql). */
+type EditedRow = EditableValues & Pick<Project, "id" | "manual_fields">;
+
+/** How an edit is made: when it counts as activity, whether it brings a deleted project back, whether it is an Undo. */
+interface EditOptions {
+  activityAt?: Date;
+  restore?: boolean;
+  /** An Undo of a request in the chat: logged as one, so the project's history can tell the change it took back. */
+  undo?: boolean;
+}
+
+/**
+ * Writes a person's edit of one project row, locks what changed against the chronicler and logs only what really
+ * changed. It sets the editable columns, manual_fields and updated_at, and hidden or last_activity_at only when asked
+ * to: no more than the self-edit role may write.
+ */
+async function writeEdit(tx: Queryable, current: EditedRow, fields: ProjectFields, who: EditedBy, options: EditOptions = {}): Promise<ProjectEdit> {
   const next: EditableValues = {
     tagline: fields.tagline === undefined ? current.tagline : fields.tagline?.trim() || null,
     status: fields.status ?? current.status,
@@ -515,24 +565,59 @@ async function applyEdit(
     links: fields.links === undefined ? current.links : withLinks(current.links, fields.links),
   };
   const changedFields = EDITABLE_FIELDS.filter((field) => !sameValue(field, current, next));
-  if (changedFields.length === 0 && !options.restore) return { project: current, changed: false };
-  const [project] = await tx<Project[]>`
+  const edit: ProjectEdit = { fields: changedFields, before: pickFields(current, changedFields), after: pickFields(next, changedFields) };
+  if (changedFields.length === 0 && !options.restore) return edit;
+  await tx`
     UPDATE projects SET
       tagline = ${next.tagline},
       status = ${next.status},
       stack = ${next.stack},
       links = ${tx.json(next.links)},
       manual_fields = ${[...new Set([...current.manual_fields, ...changedFields])]},
-      hidden = ${options.restore ? false : current.hidden},
-      last_activity_at = greatest(last_activity_at, ${options.activityAt ?? null}),
+      ${options.restore ? tx`hidden = false,` : tx``}
+      ${options.activityAt ? tx`last_activity_at = greatest(last_activity_at, ${options.activityAt}),` : tx``}
       updated_at = now()
-    WHERE id = ${current.id}
-    RETURNING *`;
+    WHERE id = ${current.id}`;
   await tx`
-    INSERT INTO change_log (entity, entity_id, op, before, after, source, actor_user_id)
-    VALUES ('project', ${current.id}, ${options.restore ? "restore" : "update"}, ${tx.json(pickFields(current, changedFields))},
-            ${tx.json(pickFields(next, changedFields))}, ${who.source}, ${who.actorUserId})`;
+    INSERT INTO change_log (entity, entity_id, op, before, after, source, actor_user_id, source_msg_ids)
+    VALUES ('project', ${current.id}, ${options.restore ? "restore" : options.undo ? "undo" : "update"}, ${tx.json(edit.before)},
+            ${tx.json(edit.after)}, ${who.source}, ${who.actorUserId}, ${who.sourceMsgIds ?? []}::bigint[])`;
+  return edit;
+}
+
+/** Applies a person's edit to one project row and returns the row as it is now. */
+async function applyEdit(
+  tx: Queryable,
+  current: Project,
+  fields: ProjectFields,
+  who: EditedBy,
+  options: Pick<EditOptions, "activityAt" | "restore"> = {},
+): Promise<{ project: Project; changed: boolean }> {
+  const edit = await writeEdit(tx, current, fields, who, options);
+  if (edit.fields.length === 0 && !options.restore) return { project: current, changed: false };
+  const [project] = await tx<Project[]>`SELECT * FROM projects WHERE id = ${current.id}`;
   return { project: project!, changed: true };
+}
+
+/**
+ * A person's edit of one shown project, addressed by its id, in the caller's transaction: it can only ever touch that
+ * row, in that chat. The Mini App's edit (updateProject) and an author's request in the chat (src/core/own-card.ts,
+ * under the self-edit role, which row-level security lets touch only a project the subject is an author of) are this
+ * one edit, and so is the Undo of such a request. `fields` may be worked out from the row as it is once locked (a
+ * technology added to its stack). Undefined when there is no such project to edit.
+ */
+export async function editProject(
+  tx: Queryable,
+  target: { chatId: number; projectId: number },
+  fields: ProjectFields | ((current: EditableValues) => ProjectFields),
+  who: EditedBy,
+  options: Pick<EditOptions, "activityAt" | "undo"> = {},
+): Promise<ProjectEdit | undefined> {
+  const [current] = await tx<EditedRow[]>`
+    SELECT id, tagline, status, stack, links, manual_fields FROM projects
+    WHERE id = ${target.projectId} AND chat_id = ${target.chatId} AND NOT hidden FOR UPDATE`;
+  if (!current) return undefined;
+  return writeEdit(tx, current, typeof fields === "function" ? fields(current) : fields, who, options);
 }
 
 /** An edit addressed by project id: it can only ever touch that row, in that chat. Deleted projects are not edited. */
@@ -541,10 +626,10 @@ export async function updateProject(
   edit: ProjectFields & { chatId: number; projectId: number; source: "user" | "admin"; actorUserId: number; activityAt?: Date },
 ): Promise<{ project: Project; changed: boolean } | undefined> {
   return sql.begin(async (tx) => {
-    const [current] = await tx<Project[]>`
-      SELECT * FROM projects WHERE id = ${edit.projectId} AND chat_id = ${edit.chatId} AND NOT hidden FOR UPDATE`;
-    if (!current) return undefined;
-    return applyEdit(tx, current, edit, edit, { activityAt: edit.activityAt });
+    const done = await editProject(tx, edit, edit, edit, { activityAt: edit.activityAt });
+    if (!done) return undefined;
+    const [project] = await tx<Project[]>`SELECT * FROM projects WHERE id = ${edit.projectId}`;
+    return { project: project!, changed: done.fields.length > 0 };
   });
 }
 
@@ -692,7 +777,10 @@ export async function moveProjectAliases(tx: Queryable, fromId: number, intoId: 
   await tx`DELETE FROM aliases WHERE project_id = ${fromId}`;
 }
 
-/** Folds duplicate catalog entries into one: authors, votes, signals, aliases and links move over, the rest is hidden. */
+/**
+ * Folds duplicate catalog entries into one: authors, votes, signals and aliases move over, and the stack and links too
+ * unless a person set those of the entry they go into (manual_fields), which stay as they set them; the rest is hidden.
+ */
 export async function mergeProjects(sql: Sql, chatId: number, intoSlug: string, fromSlugs: string[]): Promise<number> {
   return sql.begin(async (tx) => {
     const [into] = await tx<Project[]>`SELECT * FROM projects WHERE chat_id = ${chatId} AND slug = ${intoSlug} AND NOT hidden FOR UPDATE`;
@@ -711,11 +799,14 @@ export async function mergeProjects(sql: Sql, chatId: number, intoSlug: string, 
       await tx`UPDATE memos SET project_id = ${into.id} WHERE project_id = ${project.id}`;
       await tx`UPDATE chronicle SET project_id = ${into.id} WHERE project_id = ${project.id}`;
       await moveProjectAliases(tx, project.id, into.id);
-      const links = { ...project.links, ...into.links, other: [...new Set([...(into.links.other ?? []), ...(project.links.other ?? [])])] };
+      const links = into.manual_fields.includes("links")
+        ? into.links
+        : { ...project.links, ...into.links, other: [...new Set([...(into.links.other ?? []), ...(project.links.other ?? [])])] };
+      const stack = into.manual_fields.includes("stack") ? tx`stack` : tx`(SELECT coalesce(array_agg(DISTINCT x), '{}') FROM unnest(stack || ${project.stack}::text[]) AS x)`;
       await tx`
         UPDATE projects SET
           links = ${tx.json(links)},
-          stack = (SELECT coalesce(array_agg(DISTINCT x), '{}') FROM unnest(stack || ${project.stack}::text[]) AS x),
+          stack = ${stack},
           source_msg_ids = (SELECT coalesce(array_agg(DISTINCT x), '{}') FROM unnest(source_msg_ids || ${project.source_msg_ids}::bigint[]) AS x),
           first_seen_msg_id = least(first_seen_msg_id, ${project.first_seen_msg_id}),
           last_activity_at = greatest(last_activity_at, ${project.last_activity_at}),

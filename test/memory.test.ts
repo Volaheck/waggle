@@ -195,7 +195,9 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
       expect(about).toContain("written by claude-opus-5-5");
       expect(about).toContain("Your owner, who built you and pays for you: Maestro (@maestro_owner), also called Капитан.");
       expect(about).toContain("by asking you plainly in the chat: you do it and post a receipt with ↩️ Undo");
-      expect(about).toContain("Nobody changes anyone else's data, a project's catalog entry, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets.");
+      expect(about).toContain("and a project's authors its tagline, status, stack and links, by asking you plainly in the chat");
+      expect(about).toContain("also renames or removes a project; nobody changes a project's authors through you. Nobody needs a note to change a card or a project.");
+      expect(about).toContain("Nobody changes anyone else's data, someone else's project, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets.");
       expect(about).toContain("/forgetme");
       expect(about).toContain("In the catalog you are the project Waggle: #2 of 2, 0 rating points, 0 vote(s).");
     });

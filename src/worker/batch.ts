@@ -74,10 +74,11 @@ export async function skippedMessageIds(sql: Sql, chatId: number): Promise<numbe
  * never a source for anyone's data.
  */
 const CARD_REQUEST_TEXTS: Record<string, string> = {
-  edit: "[asked the bot to change their own card; the bot handled it]",
-  about_others: "[asked the bot to change another member's card; the bot refused]",
+  edit: "[asked the bot to change their own card or a project of theirs; the bot handled it]",
+  project_edit: "[asked the bot to change a project of theirs; the bot handled it]",
+  about_others: "[asked the bot to change someone else's card or project; the bot refused]",
   fake_claim: "[asked the bot to say it changed someone's data; the bot refused]",
-  unclear: "[asked the bot to change their card without saying what]",
+  unclear: "[asked the bot to change their card or a project of theirs without saying what]",
   redo: "[asked the bot to bring back a change of their own card they had undone]",
   reminder: "[asked the bot for a reminder; the bot handled it]",
   reminder_unclear: "[asked the bot for a reminder without saying when or what of]",
@@ -87,16 +88,20 @@ const CARD_REQUEST_TEXTS: Record<string, string> = {
 };
 
 /**
- * Requests to change a card, requests for reminders and for something to do later are handled by the bot itself
- * (src/bot/self-edits.ts, src/bot/reminders.ts, src/bot/later.ts): the chronicler sees only that one was made, so it
- * can neither apply one again, nor bring back what its author undid, nor take a request about another member as a fact
- * or a correction about them, nor note what someone asked to be reminded of, or to have done later, as a promise or a
- * plan of theirs.
+ * Requests to change a card or a project, requests for reminders and for something to do later are handled by the bot
+ * itself (src/bot/self-edits.ts, src/bot/reminders.ts, src/bot/later.ts): the chronicler sees only that one was made, so
+ * it can neither apply one again, nor bring back what its author undid, nor take a request about another member as a
+ * fact or a correction about them, nor note what someone asked to be reminded of, or to have done later, as a promise or
+ * a plan of theirs. An author's change to projects of theirs alone, made in full and not undone (kind `project_edit`),
+ * is read as written: the news in it, a launch or a release, still counts for the rating, and what it set is locked
+ * against the chronicler anyway (manual_fields).
  */
 async function withoutCardRequests(sql: Sql, chatId: number, messages: StoredMessage[]): Promise<StoredMessage[]> {
   if (messages.length === 0) return messages;
   const requests = await sql<{ msg_id: number; kind: string }[]>`
-    SELECT msg_id, kind FROM self_edits WHERE chat_id = ${chatId} AND msg_id = ANY(${messages.map((message) => message.msg_id)}::bigint[]) AND kind <> 'not_a_request'`;
+    SELECT msg_id, kind FROM self_edits
+    WHERE chat_id = ${chatId} AND msg_id = ANY(${messages.map((message) => message.msg_id)}::bigint[]) AND kind <> 'not_a_request'
+      AND NOT (kind = 'project_edit' AND status = 'applied')`;
   const kinds = new Map(requests.map((request) => [request.msg_id, request.kind]));
   return messages.map((message) => (kinds.has(message.msg_id) ? { ...message, text: CARD_REQUEST_TEXTS[kinds.get(message.msg_id)!] ?? CARD_REQUEST_TEXTS.parsing! } : message));
 }

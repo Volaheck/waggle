@@ -4,16 +4,19 @@ import type { Queryable, Sql } from "./db.js";
 import { FACT_KINDS, type FactKind } from "./facts.js";
 import { MAX_MEMO_CHARS, MAX_MEMOS } from "./memos.js";
 import { maskPersonalData } from "./privacy.js";
+import { editProject, MAX_PROJECT_TAGLINE_CHARS, MAX_STACK_ITEM_CHARS, PROJECT_STATUSES, type EditableValues, type ProjectEdit, type ProjectFields, type ProjectStatus } from "./projects.js";
 import { canonicalStackValue, splitStackValue } from "./stack.js";
 import { hasForbiddenTopic, nameKey, normalizeValue, safeHttpUrl, transliterateName } from "./text.js";
 import { SERVICE_TG_IDS, type User } from "./users.js";
 import type { ChosenSource } from "./zones.js";
 
 /**
- * A member changes their own card by asking the bot. Whose card it is comes from Telegram's authenticated sender and
- * nothing else: Subject has one constructor, the operations name no person, and every write runs in asSubject, under
- * a database role that row-level security confines to that one member and chat (migrations/008_self_edits.sql).
- * Whatever a model or a message says, no other member's row can change on this path.
+ * A member changes their own card by asking the bot, and a project's author that project's entry. Whose card it is
+ * comes from Telegram's authenticated sender and nothing else: Subject has one constructor, the operations name no
+ * person, and every write runs in asSubject, under a database role that row-level security confines to that one member
+ * and chat (migrations/008_self_edits.sql), and on projects to those the member is an author of
+ * (migrations/015_project_edits.sql). Whatever a model or a message says, no other member's row and no one else's
+ * project can change on this path.
  */
 
 declare const subjectBrand: unique symbol;
@@ -56,7 +59,40 @@ export type OwnOp =
   | { action: "add_memo"; projectId: number | null; projectName: string | null; text: string; pick?: true }
   | { action: "remove_memo"; memoId: number; projectName: string | null }
   | { action: "set_zone"; zone: string; place: string }
-  | { action: "clear_zone" };
+  | { action: "clear_zone" }
+  | { action: "edit_project"; projectId: number; projectName: string; change: ProjectChange };
+
+/** A project's entry as a request in the chat changes it: each of its two links on its own. */
+export interface ProjectSlots {
+  tagline: string | null;
+  status: ProjectStatus;
+  stack: string[];
+  repo: string | null;
+  site: string | null;
+}
+
+/** What a request asks of one project: a slot left out stays as it is, and a link set to null comes off. */
+export interface ProjectChange {
+  tagline?: string;
+  status?: ProjectStatus;
+  stackAdd?: string[];
+  stackRemove?: string[];
+  repo?: string | null;
+  site?: string | null;
+  /**
+   * Set by an Undo for its Redo: a slot named here changes only while it still holds this value, the one the Undo put
+   * back, so what a co-author set since stays.
+   */
+  from?: Partial<Pick<ProjectSlots, "tagline" | "status" | "repo" | "site">>;
+}
+
+/** A project the subject is an author of, as their card lists it. */
+export interface OwnProject extends ProjectSlots {
+  id: number;
+  name: string;
+  /** Its other authors: a value written on it may name them. */
+  coauthor_ids: number[];
+}
 
 export interface OwnFact {
   id: number;
@@ -78,8 +114,8 @@ export interface OwnCard {
   optedOut: boolean;
   /** Their notes, about themselves and about their projects. */
   memos: OwnMemo[];
-  /** The projects they are an author of: the only ones they may write a note on. */
-  projects: { id: number; name: string }[];
+  /** The projects they are an author of: the only ones they may write a note on or change. */
+  projects: OwnProject[];
   /** The time zone they chose or their device gave, if any. */
   zone: { zone: string; source: ChosenSource } | null;
 }
@@ -98,8 +134,11 @@ export async function ownCard(sql: Sql, subject: Subject): Promise<OwnCard> {
       SELECT n.id, n.project_id, p.name AS project_name, n.text FROM memos n LEFT JOIN projects p ON p.id = n.project_id
       WHERE n.chat_id = ${subject.chatId} AND n.user_id = ${subject.userId} AND (n.project_id IS NULL OR NOT p.hidden)
       ORDER BY n.project_id NULLS FIRST, n.created_at, n.id`,
-    sql<{ id: number; name: string }[]>`
-      SELECT p.id, p.name FROM projects p JOIN project_members pm ON pm.project_id = p.id
+    sql<OwnProject[]>`
+      SELECT p.id, p.name, p.tagline, p.status, p.stack, p.links->>'repo' AS repo, p.links->>'site' AS site,
+             coalesce((SELECT array_agg(other.user_id ORDER BY other.user_id) FROM project_members other
+                       WHERE other.project_id = p.id AND other.user_id <> ${subject.userId}), '{}') AS coauthor_ids
+      FROM projects p JOIN project_members pm ON pm.project_id = p.id
       WHERE p.chat_id = ${subject.chatId} AND pm.user_id = ${subject.userId} AND NOT p.hidden ORDER BY p.name, p.id`,
   ]);
   const zone = member?.time_zone && member.time_zone_source ? { zone: member.time_zone, source: member.time_zone_source } : null;
@@ -259,16 +298,19 @@ export function valueNamesSomeone(value: string, others: Named[]): boolean {
 
 export type ValueProblem = "too_long" | "personal_data" | "forbidden" | "names_someone" | "not_their_words" | "bad_link";
 
+/** Where a value goes: a field of the card, its tagline, a name they go by, or a project's tagline or one of its technologies. */
+export type CheckedField = OwnField | "tagline" | "alias" | "project_tagline" | "project_stack";
+
 const MAX_VALUE_CHARS = 120;
 const MAX_VALUE_WORDS = 12;
-const MAX_TAGLINE_CHARS = 90;
-const MAX_ALIAS_CHARS = 40;
+const MAX_CHARS: Partial<Record<CheckedField, number>> = { tagline: 90, alias: 40, project_tagline: MAX_PROJECT_TAGLINE_CHARS, project_stack: MAX_STACK_ITEM_CHARS };
+/** A project's tagline is a sentence about what it does, longer than a value on a card. */
+const MAX_WORDS: Partial<Record<CheckedField, number>> = { project_tagline: 30 };
 
 /** What is wrong with a value a member asked for, if anything: the same limits as a manual edit and then some. */
-export function valueProblem(value: string, senderText: string, others: Named[], field: OwnField | "tagline" | "alias"): ValueProblem | null {
+export function valueProblem(value: string, senderText: string, others: Named[], field: CheckedField): ValueProblem | null {
   const clean = cleanText(value);
-  const limit = field === "tagline" ? MAX_TAGLINE_CHARS : field === "alias" ? MAX_ALIAS_CHARS : MAX_VALUE_CHARS;
-  if (!clean || clean.length > limit || wordsOf(clean).length > MAX_VALUE_WORDS) return "too_long";
+  if (!clean || clean.length > (MAX_CHARS[field] ?? MAX_VALUE_CHARS) || wordsOf(clean).length > (MAX_WORDS[field] ?? MAX_VALUE_WORDS)) return "too_long";
   if (maskPersonalData(clean) !== clean) return "personal_data";
   if (hasForbiddenTopic(clean)) return "forbidden";
   if (valueNamesSomeone(clean, others)) return "names_someone";
@@ -279,6 +321,30 @@ export function valueProblem(value: string, senderText: string, others: Named[],
   }
   if (!groundedIn(clean, senderText)) return "not_their_words";
   return null;
+}
+
+/**
+ * The words that say a project's status, in either language. A status set from the chat must be one the sender's own
+ * words name, whichever of the codes a model picked.
+ */
+const STATUS_WORDS: Record<ProjectStatus, RegExp> = {
+  idea: /(?<!\p{L})(?:иде(?:я|и|ю|ей|е)(?!\p{L})|задумк|концепт)|\b(?:idea|concept)\b/iu,
+  in_progress:
+    /(?<!\p{L})(?:в работе|в разработке|в процессе|пил(?:ю|им|ит|ят|ишь)(?!\p{L})|допилива|делаю|делаем|разрабатыва|продолжа|возобнов|работаю над|работаем над)|\b(?:in[ _]progress|working on|wip|in development|building|resumed?)\b/iu,
+  launched:
+    /(?<!\p{L})(?:запущ|запуст|вышел|вышла|вышло|вышли|релиз|зарелиз|выпущ|выпусти|выкат|в проде|на проде|в продакшен|в продакшн|задеплои)|\b(?:launch\w*|release[ds]?|shipped|live|published)\b/iu,
+  paused: /(?<!\p{L})(?:пауз|заморо|отложи|отложе|приостанов)|\b(?:paused?|on hold)\b/iu,
+  abandoned: /(?<!\p{L})(?:заброш|забросил|бросил|брошен|закрыл|закрыт|мертв|похоронил|забил на)|\b(?:abandon\w*|dropped|dead|killed|gave up|shut down)\b/iu,
+};
+
+/** Whether the sender's own words name this status of a project. */
+export function statusSaid(status: ProjectStatus, senderText: string): boolean {
+  return STATUS_WORDS[status].test(cleanText(senderText).toLowerCase().replace(/ё/g, "е"));
+}
+
+/** Every status of a project the words name. */
+export function statusesSaid(senderText: string): ProjectStatus[] {
+  return PROJECT_STATUSES.filter((status) => statusSaid(status, senderText));
 }
 
 export type MemoProblem = "too_long" | "personal_data" | "forbidden" | "names_someone" | "not_their_words";
@@ -319,7 +385,9 @@ export type Applied =
   | { kind: "alias_removed"; row: AliasRow }
   | { kind: "memo_added"; memoId: number; projectId: number | null; projectName: string | null; text: string }
   | { kind: "memo_removed"; row: MemoRow; projectName: string | null }
-  | { kind: "zone"; before: ZoneState; value: string | null; place: string | null };
+  | { kind: "zone"; before: ZoneState; value: string | null; place: string | null }
+  /** The slots of a project the request changed, each as it was and as the request left it. */
+  | { kind: "project"; projectId: number; projectName: string; before: Partial<ProjectSlots>; after: Partial<ProjectSlots> };
 
 interface ZoneState {
   time_zone: string | null;
@@ -470,6 +538,177 @@ async function removeOwnMemo(tx: Queryable, subject: Subject, op: Extract<OwnOp,
   return [{ kind: "memo_removed", row, projectName: op.projectName }];
 }
 
+/** A stack with these technologies taken off and these put on, each once, however they are written. */
+export function stackWith(stack: string[], add: string[], remove: string[]): string[] {
+  const gone = new Set(remove.map(normalizeValue));
+  const result = stack.filter((item) => !gone.has(normalizeValue(item)));
+  for (const item of add) {
+    if (!result.some((kept) => normalizeValue(kept) === normalizeValue(item))) result.push(item);
+  }
+  return result;
+}
+
+/** The technologies of `stack` that `other` lacks. */
+const missingFrom = (stack: string[], other: string[]) => stack.filter((item) => !other.some((kept) => normalizeValue(kept) === normalizeValue(item)));
+
+/** What a stack gained and lost from one version to the next. */
+export function stackChanges(before: string[], after: string[]): { added: string[]; removed: string[] } {
+  return { added: missingFrom(after, before), removed: missingFrom(before, after) };
+}
+
+/** The slots a request's change would change on a project as it is now, each as it is and as it would be. */
+export function plannedSlots(current: ProjectSlots, change: ProjectChange): { before: Partial<ProjectSlots>; after: Partial<ProjectSlots> } {
+  const before: Partial<ProjectSlots> = {};
+  const after: Partial<ProjectSlots> = {};
+  if (change.tagline !== undefined && change.tagline !== current.tagline) {
+    before.tagline = current.tagline;
+    after.tagline = change.tagline;
+  }
+  if (change.status !== undefined && change.status !== current.status) {
+    before.status = current.status;
+    after.status = change.status;
+  }
+  const stack = stackWith(current.stack, change.stackAdd ?? [], change.stackRemove ?? []);
+  if (stack.join("\n") !== current.stack.join("\n")) {
+    before.stack = current.stack;
+    after.stack = stack;
+  }
+  for (const slot of ["repo", "site"] as const) {
+    const value = change[slot];
+    if (value === undefined || value === current[slot]) continue;
+    before[slot] = current[slot];
+    after[slot] = value;
+  }
+  return { before, after };
+}
+
+/**
+ * A request's change as the fields of a project edit, made on the project as it is once locked; a slot its `from`
+ * names changes only while it holds that value.
+ */
+function projectFields(current: EditableValues, change: ProjectChange): ProjectFields {
+  const holds = (slot: keyof NonNullable<ProjectChange["from"]>, value: string | null) => change.from?.[slot] === undefined || change.from[slot] === value;
+  const stacked = Boolean(change.stackAdd?.length || change.stackRemove?.length);
+  const repo = change.repo !== undefined && holds("repo", current.links.repo ?? null) ? change.repo : undefined;
+  const site = change.site !== undefined && holds("site", current.links.site ?? null) ? change.site : undefined;
+  return {
+    tagline: change.tagline !== undefined && holds("tagline", current.tagline) ? change.tagline : undefined,
+    status: change.status !== undefined && holds("status", current.status) ? change.status : undefined,
+    stack: stacked ? stackWith(current.stack, change.stackAdd ?? [], change.stackRemove ?? []) : undefined,
+    links: repo !== undefined || site !== undefined ? { repo, site } : undefined,
+  };
+}
+
+/** The slots an edit changed, each as it was and as it is now; a link counts on its own. */
+function changedSlots(edit: ProjectEdit): { before: Partial<ProjectSlots>; after: Partial<ProjectSlots> } {
+  const before: Partial<ProjectSlots> = {};
+  const after: Partial<ProjectSlots> = {};
+  if (edit.fields.includes("tagline")) {
+    before.tagline = edit.before.tagline ?? null;
+    after.tagline = edit.after.tagline ?? null;
+  }
+  if (edit.fields.includes("status") && edit.before.status && edit.after.status) {
+    before.status = edit.before.status;
+    after.status = edit.after.status;
+  }
+  if (edit.fields.includes("stack")) {
+    before.stack = edit.before.stack ?? [];
+    after.stack = edit.after.stack ?? [];
+  }
+  for (const slot of ["repo", "site"] as const) {
+    const was = edit.before.links?.[slot] ?? null;
+    const now = edit.after.links?.[slot] ?? null;
+    if (!edit.fields.includes("links") || was === now) continue;
+    before[slot] = was;
+    after[slot] = now;
+  }
+  return { before, after };
+}
+
+/** A project's entry changed by one of its authors: the Mini App's own edit, which row-level security keeps to their projects. */
+async function editOwnProject(tx: Queryable, subject: Subject, op: Extract<OwnOp, { action: "edit_project" }>, msgId: number): Promise<Applied[]> {
+  const edit = await editProject(tx, { chatId: subject.chatId, projectId: op.projectId }, (current) => projectFields(current, op.change), {
+    source: "user",
+    actorUserId: subject.userId,
+    sourceMsgIds: [msgId],
+  });
+  if (!edit) return [];
+  const { before, after } = changedSlots(edit);
+  return Object.keys(after).length ? [{ kind: "project", projectId: op.projectId, projectName: op.projectName, before, after }] : [];
+}
+
+type ProjectApplied = Extract<Applied, { kind: "project" }>;
+
+/**
+ * What an Undo of a request's change sets on a project as it is now: a slot goes back only while it still holds what
+ * the request left there, so a later edit in the chat or the Mini App stays; each technology it added comes off and
+ * each it took off comes back on its own.
+ */
+function undoFields(current: EditableValues, change: ProjectApplied): ProjectFields {
+  const { before, after } = change;
+  const fields: ProjectFields = {};
+  if (after.tagline !== undefined && current.tagline === after.tagline) fields.tagline = before.tagline ?? null;
+  if (after.status !== undefined && before.status !== undefined && current.status === after.status) fields.status = before.status;
+  if (after.stack && before.stack) fields.stack = stackWith(current.stack, missingFrom(before.stack, after.stack), missingFrom(after.stack, before.stack));
+  const links: NonNullable<ProjectFields["links"]> = {};
+  for (const slot of ["repo", "site"] as const) {
+    if (after[slot] !== undefined && (current.links[slot] ?? null) === after[slot]) links[slot] = before[slot] ?? null;
+  }
+  if (Object.keys(links).length) fields.links = links;
+  return fields;
+}
+
+/**
+ * The change a Redo brings back after an Undo: what the Undo took back (`undone`, each slot as the Undo left it and as
+ * it found it), each slot only while it still holds what the Undo put there.
+ */
+function redoOf(undone: ProjectApplied): ProjectChange {
+  const { before, after } = undone;
+  const change: ProjectChange = {};
+  const from: NonNullable<ProjectChange["from"]> = {};
+  if (typeof after.tagline === "string") {
+    change.tagline = after.tagline;
+    from.tagline = before.tagline ?? null;
+  }
+  if (after.status && before.status) {
+    change.status = after.status;
+    from.status = before.status;
+  }
+  if (after.stack && before.stack) {
+    const { added, removed } = stackChanges(before.stack, after.stack);
+    change.stackAdd = added;
+    change.stackRemove = removed;
+  }
+  for (const slot of ["repo", "site"] as const) {
+    if (after[slot] === undefined) continue;
+    change[slot] = after[slot];
+    from[slot] = before[slot] ?? null;
+  }
+  return { ...change, from };
+}
+
+/**
+ * Puts back what a request changed on a project, the project's own edit logged as an Undo of it, so its history tells
+ * the change that was taken back. What the request locked against the chronicler stays locked. Gives what it took back,
+ * as the request's change (each slot as the Undo left it and as it found it), with the change a Redo brings back;
+ * nothing when it could put nothing back, everything having changed since.
+ */
+async function undoProjectEdit(tx: Queryable, subject: Subject, change: ProjectApplied, msgId: number): Promise<{ undone: ProjectApplied; redo: ProjectChange } | null> {
+  const edit = await editProject(
+    tx,
+    { chatId: subject.chatId, projectId: change.projectId },
+    (current) => undoFields(current, change),
+    { source: "user", actorUserId: subject.userId, sourceMsgIds: [msgId] },
+    { undo: true },
+  );
+  if (!edit) return null;
+  // The Undo's edit goes from what the request left to what was there before it: the change taken back is that, reversed.
+  const reverted = changedSlots(edit);
+  if (Object.keys(reverted.after).length === 0) return null;
+  const undone: ProjectApplied = { kind: "project", projectId: change.projectId, projectName: change.projectName, before: reverted.after, after: reverted.before };
+  return { undone, redo: redoOf(undone) };
+}
+
 /**
  * Applies the operations to the subject's own card, all or nothing, and records them on the request in the same
  * transaction, so a receipt that fails to go out never leaves a change nobody can undo. Someone who opted out gets
@@ -500,6 +739,7 @@ export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgI
       else if (op.action === "add_memo") applied.push(...(await addOwnMemo(tx, subject, op, msgId)));
       else if (op.action === "set_zone") applied.push(...(await setOwnZone(tx, subject, op.zone, op.place, msgId)));
       else if (op.action === "clear_zone") applied.push(...(await setOwnZone(tx, subject, null, null, msgId)));
+      else if (op.action === "edit_project") applied.push(...(await editOwnProject(tx, subject, op, msgId)));
       else applied.push(...(await removeOwnMemo(tx, subject, op, msgId)));
     }
     if (applied.length === 0) return applied;
@@ -510,19 +750,35 @@ export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgI
   });
 }
 
-/** Undoes what applyOwnOps recorded on the request, newest first, on the subject's own card only; null when there is nothing to undo. */
+/**
+ * Undoes what applyOwnOps recorded on the request, newest first, on the subject's own card and projects only, and gives
+ * what it took back: on a project, only the slots nobody changed since. The request's plan becomes what a Redo brings
+ * back, on a project only while nothing changed it since the Undo. Null when there is nothing to undo; empty, with the
+ * request left as it was, when everything it changed was changed since.
+ */
 export async function undoOwnOps(sql: Sql, subject: Subject, requestId: number, msgId: number): Promise<Applied[] | null> {
   return asSubject(sql, subject, async (tx) => {
-    const [request] = await tx<{ applied: Applied[] | null }[]>`
-      UPDATE self_edits SET status = 'undone', decided_at = now()
+    const [request] = await tx<{ applied: Applied[] | null; plan: OwnOp[] | null }[]>`
+      SELECT applied, plan FROM self_edits
       WHERE id = ${requestId} AND status = 'applied' AND applied IS NOT NULL AND created_at > now() - interval '24 hours'
-      RETURNING applied`;
+      FOR UPDATE`;
     if (!request?.applied) return null;
     const [member] = await tx<{ opted_out: boolean }[]>`SELECT opted_out FROM members WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId}`;
     // Nothing comes back onto the card of someone who has opted out since.
     const restores = new Set(["fact_removed", "alias_removed", "tagline", "memo_removed", "zone"]);
-    const applied = request.applied;
-    for (const change of [...applied].reverse()) {
+    const undone: Applied[] = [];
+    /** What a Redo brings back to each project, the Undo having taken it back. */
+    const redo = new Map<number, ProjectChange>();
+    for (const change of [...request.applied].reverse()) {
+      if (change.kind === "project") {
+        const taken = await undoProjectEdit(tx, subject, change, msgId);
+        if (taken) {
+          undone.unshift(taken.undone);
+          redo.set(change.projectId, taken.redo);
+        }
+        continue;
+      }
+      undone.unshift(change);
       if (member?.opted_out !== false && restores.has(change.kind)) continue;
       if (change.kind === "fact_added") {
         if (change.before) {
@@ -583,8 +839,15 @@ export async function undoOwnOps(sql: Sql, subject: Subject, requestId: number, 
         await tx`DELETE FROM rejected_facts WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} AND kind = ${ALIAS_STOP} AND value_norm = ${row.alias_norm}`;
       }
     }
+    if (undone.length === 0) return undone;
+    const plan = (request.plan ?? []).flatMap((op): OwnOp[] => {
+      if (op.action !== "edit_project") return [op];
+      const change = redo.get(op.projectId);
+      return change ? [{ ...op, change }] : [];
+    });
+    await tx`UPDATE self_edits SET status = 'undone', decided_at = now(), plan = ${tx.json(plan as never)} WHERE id = ${requestId}`;
     await log(tx, subject, "self_edit", msgId, "undo", null, null, msgId);
-    return applied;
+    return undone;
   });
 }
 
