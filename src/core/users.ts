@@ -207,6 +207,8 @@ async function applyOptOut(tx: Queryable, userId: number, optedOut: boolean, sco
     await tx`DELETE FROM memos WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     // Reminders they asked for are their own words too: someone who opted out gets none.
     await tx`DELETE FROM reminders WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
+    // So are their wishes, those they asked for the whole chat included.
+    await tx`DELETE FROM wishes WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     await forgetNotes(tx, userId, scope);
     // Notes on how the person uses others' projects are shown on those project cards, so they go as well.
     await tx`
@@ -226,11 +228,24 @@ export async function setOptOut(sql: Sql, userId: number, optedOut: boolean, cha
   });
 }
 
-/** Opting out leaves nothing to confirm or undo, and no card values in the requests' records. */
+/**
+ * Opting out leaves nothing to confirm or undo, and no card values in the requests' records: nor their wish for the whole
+ * chat in the record of an admin who took it back, which an Undo would otherwise bring back.
+ */
 async function dropCardRequests(tx: Queryable, userId: number, chatId: number | null): Promise<void> {
   await tx`
     UPDATE self_edits SET status = CASE WHEN status IN ('proposed', 'applied') THEN 'refused' ELSE status END, plan = NULL, applied = NULL, asked_city = NULL
     WHERE user_id = ${userId} AND (${chatId}::bigint IS NULL OR chat_id = ${chatId}::bigint)`;
+  const theirWish = { kind: "wish_removed", row: { user_id: userId } };
+  await tx`
+    UPDATE self_edits s SET applied = kept.applied, status = CASE WHEN kept.applied IS NULL AND s.status = 'applied' THEN 'refused' ELSE s.status END
+    FROM (
+      SELECT e.id, nullif(coalesce(jsonb_agg(change) FILTER (WHERE NOT change @> ${tx.json(theirWish)}), '[]'::jsonb), '[]'::jsonb) AS applied
+      FROM self_edits e CROSS JOIN LATERAL jsonb_array_elements(e.applied) AS change
+      WHERE e.applied @> ${tx.json([theirWish])} AND (${chatId}::bigint IS NULL OR e.chat_id = ${chatId}::bigint)
+      GROUP BY e.id
+    ) AS kept
+    WHERE s.id = kept.id`;
 }
 
 /**

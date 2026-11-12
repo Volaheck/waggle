@@ -70,8 +70,8 @@ export async function skippedMessageIds(sql: Sql, chatId: number): Promise<numbe
 
 /** Everything the chronicler is shown along with a batch of messages: the context before it, the people, the catalog, the notes. */
 /**
- * What the chronicler reads instead of a request to the bot about someone's card, a reminder or something to do later:
- * never a source for anyone's data.
+ * What the chronicler reads instead of a request to the bot about someone's card, a wish about how it writes (read as a
+ * card request), a reminder or something to do later: never a source for anyone's data.
  */
 const CARD_REQUEST_TEXTS: Record<string, string> = {
   edit: "[asked the bot to change their own card or a project of theirs; the bot handled it]",
@@ -84,6 +84,7 @@ const CARD_REQUEST_TEXTS: Record<string, string> = {
   reminder_unclear: "[asked the bot for a reminder without saying when or what of]",
   later: "[asked the bot to do something for them later; the bot handled it]",
   later_unclear: "[asked the bot to do something for them later without saying when or what]",
+  loosen: "[asked the bot to bend its rules for them; the bot refused]",
   parsing: "[a request to the bot about a card]",
 };
 

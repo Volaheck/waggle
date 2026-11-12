@@ -3,6 +3,7 @@ import type { Chat, ChatStatus } from "./chats.js";
 import type { Queryable, Sql } from "./db.js";
 import { moveNotes } from "./notes.js";
 import { freeSlug } from "./projects.js";
+import { moveWishes } from "./wishes.js";
 
 /**
  * A basic group that becomes a supergroup gets a new chat id, and Telegram numbers the supergroup's messages
@@ -164,6 +165,7 @@ async function moveChatData(tx: Queryable, from: number, to: number): Promise<Ch
            reply_to_msg_id = ${shiftedId(tx, "reply_to_msg_id")}, receipt_msg_id = ${shiftedId(tx, "receipt_msg_id")}, chat_msg_id = ${shiftedId(tx, "chat_msg_id")}
     WHERE chat_id = ${from}`;
   await tx`DELETE FROM reminders r USING members m WHERE r.chat_id = ${to} AND m.chat_id = ${to} AND m.user_id = r.user_id AND m.opted_out`;
+  await moveWishes(tx, from, to, (column) => shiftedId(tx, column));
   await tx`UPDATE ideas SET chat_id = ${to}, msg_id = ${shiftedId(tx, "msg_id")}, evidence_msg_ids = ${shiftedIds(tx, "evidence_msg_ids")} WHERE chat_id = ${from}`;
   await tx`UPDATE llm_usage SET chat_id = ${to} WHERE chat_id = ${from}`;
   await tx`UPDATE users SET current_chat_id = ${to} WHERE current_chat_id = ${from}`;

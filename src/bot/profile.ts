@@ -16,6 +16,7 @@ import {
 import { addUserProject, canEditProject, projectsOfUser, updateProject, type ProjectFields } from "../core/projects.js";
 import { escapeHtml, extractUrls, isRepoHost, safeHttpUrl, truncate } from "../core/text.js";
 import { forgetUser, getPerson, setOptOut, setTagline } from "../core/users.js";
+import { ownWishes } from "../core/wishes.js";
 import { localTimeOf, memberClock, zoneLabel, type MemberClock } from "../core/zones.js";
 import { countOf, factsWithSources, personCard, userHeader } from "./format.js";
 import {
@@ -204,11 +205,12 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
 
   async function knowledgeScreen(ctx: BotContext, scope: Scope, edit: boolean) {
     const { person, chatId, user } = scope;
-    const [facts, memos, reminders, clock] = await Promise.all([
+    const [facts, memos, reminders, clock, wishes] = await Promise.all([
       ownFacts(sql, chatId, user.id),
       ownMemos(sql, chatId, user.id),
       waitingReminders(sql, chatId, user.id),
       memberClock(sql, chatId, user.id, kit.config.DISPLAY_TIMEZONE),
+      ownWishes(sql, chatId, user.id),
     ]);
     const [stats] = await sql<{ messages: number; first: Date | null }[]>`
       SELECT count(*)::int AS messages, min(sent_at) AS first FROM messages WHERE chat_id = ${chatId} AND user_id = ${user.id}`;
@@ -230,6 +232,13 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
             "",
             "<b>Your reminders and things to do later</b> (✖️ under a receipt cancels one):",
             ...reminders.map((reminder) => `${reminder.kind === "action" ? "⏳" : "⏰"} ${escapeHtml(dueLabel(reminder.due_at, clock.zone, "English"))}: ${escapeHtml(truncate(reminder.text, REMINDER_SHOWN_CHARS))}`),
+          ]
+        : []),
+      ...(wishes.length
+        ? [
+            "",
+            "<b>Your wishes</b>, what you asked me not to write, or not in some way (↩️ under my receipt, or asking in the chat, takes one back):",
+            ...wishes.map((wish) => `🤐 ${escapeHtml(truncate(wish.text, REMINDER_SHOWN_CHARS))}${wish.scope === "chat" ? " <i>— for the whole chat</i>" : ""}`),
           ]
         : []),
       "",

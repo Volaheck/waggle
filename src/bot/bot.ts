@@ -27,6 +27,7 @@ import { saveMessage, updateEditedMessage } from "../core/messages.js";
 import { catchupFor } from "../core/chronicle.js";
 import { escapeHtml, nameKey, truncate } from "../core/text.js";
 import { accountByUsername, fullName, getUser, markLeft, SERVICE_TG_IDS, type User } from "../core/users.js";
+import { chatWishes, keepsOut } from "../core/wishes.js";
 import { memberClock, PLACE_ZONES_PURPOSE, PLACE_ZONES_TIMEOUT_MS, placeZones } from "../core/zones.js";
 import { nextConsolidationRetryAt } from "../worker/consolidate.js";
 import { lastSuccessfulRunAt, passDueAt, pendingStats } from "../worker/extract.js";
@@ -110,6 +111,7 @@ const HELP_TEXT = [
   "/chronicle — chronicle: what people talked about",
   "Mention me with «remind me in 2 months to …» (any language) — I'll remind you here and in DM",
   "Mention me with «in 2 hours set my tagline to …», «tomorrow at 9 sum up the night» or «on Monday at 9 /top» — I'll do it then, as if you had just asked",
+  "Mention me with «don't joke about my weight» or «write to me shorter» (a chat admin: «don't write about politics here») — I'll keep to it in my answers; ↩️ under my receipt or «you can joke about it again» takes it back",
   "",
   "<b>Privacy</b>",
   "/whatyouknow — everything I know about you · /forgetme — delete it",
@@ -243,6 +245,8 @@ export function createBot(deps: BotDeps): {
   // Answers are off without a key or with a zero cap; a mention then gets the help text instead.
   const answers =
     deps.anthropic && config.REPLIES_MONTHLY_BUDGET_USD > 0 ? createAssistant({ sql, anthropic: deps.anthropic, config, limits: deps.answerLimits }) : undefined;
+  /** Whether an account may ask for, or take back, a wish for the whole chat: one of its Telegram admins, or a bot owner. */
+  const mayAskForChat = async (chatId: number, tgId: number) => config.ADMIN_TG_IDS.includes(tgId) || (await membership.isChatAdmin(chatId, tgId));
   // Every message addressed to the bot is first checked for a request about the sender's own card (see self-edits.ts).
   const selfEdits: SelfEdits | undefined =
     deps.anthropic && answers
@@ -261,6 +265,7 @@ export function createBot(deps: BotDeps): {
             }),
           botNames: () => [bot.botInfo.first_name, bot.botInfo.username],
           onSeeded: (user) => askOwnersAboutSeed(user, `asks to change the imported card they took over by its ${user.linked_by === "name" ? "name" : "@username"}`),
+          mayAskForChat,
         })
       : undefined;
   // A message still being read for a card request is an answer under way too.
@@ -485,7 +490,7 @@ export function createBot(deps: BotDeps): {
   registerBusiness(bot, { sql, config, remindersOn: businessRemindersOn(deps.anthropic, config), portraitsOn: portraitsOn(deps.anthropic, config) });
   // A person's private portrait: their own private chat with the bot only.
   registerPortrait(bot, { sql, config, on: portraitsOn(deps.anthropic, config) });
-  registerSelfEdits(bot, { sql, botNames: () => [bot.botInfo.first_name, bot.botInfo.username] });
+  registerSelfEdits(bot, { sql, botNames: () => [bot.botInfo.first_name, bot.botInfo.username], mayAskForChat });
   registerReminders(bot, { sql, config });
 
   bot.callbackQuery(/^seedok:(\d+)$/, async (ctx) => {
@@ -927,6 +932,8 @@ export function createBot(deps: BotDeps): {
         WHERE chat_id = ${chat.id} AND created_at >= (date_trunc('day', now() AT TIME ZONE ${zone}) AT TIME ZONE ${zone})`;
       const [idea] = await sql<{ title: string; status: string; created_at: Date }[]>`
         SELECT title, status, created_at FROM ideas WHERE chat_id = ${chat.id} ORDER BY created_at DESC LIMIT 1`;
+      // A wish of the chat's to stay out of its conversations turns interjections off there, whatever /chats says.
+      const keptOut = (await chatWishes(sql, chat.id)).find((wish) => keepsOut(wish.text));
       const lastLine = last
         ? `${last.at ? formatDate(last.at, config.DISPLAY_TIMEZONE) : "running now"} · ${last.status} · ${countOf(last.messages_count, "message")}${last.error ? `\n⚠️ ${escapeHtml(last.error)}` : ""}`
         : "none yet";
@@ -946,6 +953,7 @@ export function createBot(deps: BotDeps): {
           interjector || interjections?.checks
             ? `Interjections today: ${countOf(interjections?.checks ?? 0, "check")}, ${interjections?.spoken ?? 0} spoken${chat.interjections ? "" : "; off here (/chats)"}`
             : "",
+          keptOut ? `🤐 Stays out of every conversation here: ${escapeHtml(keptOut.display_name)} asked it for the whole chat («${escapeHtml(truncate(keptOut.text, 80))}»); a chat admin can take that back in the chat` : "",
           !chat.ideas
             ? "💡 Weekly ideas: off here (/chats)"
             : idea

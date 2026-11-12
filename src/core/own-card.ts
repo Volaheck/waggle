@@ -8,6 +8,7 @@ import { editProject, MAX_PROJECT_TAGLINE_CHARS, MAX_STACK_ITEM_CHARS, PROJECT_S
 import { canonicalStackValue, splitStackValue } from "./stack.js";
 import { hasForbiddenTopic, nameKey, normalizeValue, safeHttpUrl, transliterateName } from "./text.js";
 import { SERVICE_TG_IDS, type User } from "./users.js";
+import { loosens, MAX_CHAT_WISHES, MAX_OWN_WISHES, MAX_WISH_CHARS, wishesOnCard, wishKey, wishWords, type Wish, type WishScope } from "./wishes.js";
 import type { ChosenSource } from "./zones.js";
 
 /**
@@ -60,7 +61,11 @@ export type OwnOp =
   | { action: "remove_memo"; memoId: number; projectName: string | null }
   | { action: "set_zone"; zone: string; place: string }
   | { action: "clear_zone" }
-  | { action: "edit_project"; projectId: number; projectName: string; change: ProjectChange };
+  | { action: "edit_project"; projectId: number; projectName: string; change: ProjectChange }
+  /** `asked`: the scope they asked for; one asked for the whole chat by someone who may not is kept as theirs alone. */
+  | { action: "add_wish"; scope: WishScope; asked: WishScope; text: string }
+  /** `lift`: the chat's wish for everyone that someone else asked for, which a chat's admin or a bot owner takes back. */
+  | { action: "remove_wish"; wishId: number; lift?: true };
 
 /** A project's entry as a request in the chat changes it: each of its two links on its own. */
 export interface ProjectSlots {
@@ -118,11 +123,15 @@ export interface OwnCard {
   projects: OwnProject[];
   /** The time zone they chose or their device gave, if any. */
   zone: { zone: string; source: ChosenSource } | null;
+  /** What they asked the bot not to write, or not in some way: for themselves, or for the whole chat. */
+  wishes: Wish[];
+  /** The chat's wishes for everyone that others asked for: its admins and the bot's owners may take one back. */
+  chatWishes: Wish[];
 }
 
 /** The subject's own visible card: what they may name in a request. */
 export async function ownCard(sql: Sql, subject: Subject): Promise<OwnCard> {
-  const [facts, aliases, [member], memos, projects] = await Promise.all([
+  const [facts, aliases, [member], memos, projects, listed] = await Promise.all([
     sql<OwnFact[]>`
       SELECT id, kind, value FROM facts
       WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} AND status IN ('auto', 'manual')
@@ -140,9 +149,10 @@ export async function ownCard(sql: Sql, subject: Subject): Promise<OwnCard> {
                        WHERE other.project_id = p.id AND other.user_id <> ${subject.userId}), '{}') AS coauthor_ids
       FROM projects p JOIN project_members pm ON pm.project_id = p.id
       WHERE p.chat_id = ${subject.chatId} AND pm.user_id = ${subject.userId} AND NOT p.hidden ORDER BY p.name, p.id`,
+    wishesOnCard(sql, subject.chatId, subject.userId),
   ]);
   const zone = member?.time_zone && member.time_zone_source ? { zone: member.time_zone, source: member.time_zone_source } : null;
-  return { facts, aliases, tagline: member?.tagline ?? null, optedOut: member?.opted_out ?? true, memos, projects, zone };
+  return { facts, aliases, tagline: member?.tagline ?? null, optedOut: member?.opted_out ?? true, memos, projects, zone, wishes: listed.own, chatWishes: listed.chat };
 }
 
 /** One form of a text for every check: NFKC, no invisible or tag characters, collapsed spaces. */
@@ -366,6 +376,83 @@ export function memoProblem(text: string, others: Named[], from?: { said: string
   return null;
 }
 
+export type WishProblem = "too_long" | "personal_data" | "names_someone" | "loosens" | "elsewhere" | "not_their_words";
+
+/** Short words a wish may hold that its sender did not say: they only say whom it is about, or negate, or join. */
+const WISH_FILLER = new Set(["не", "ни", "без", "мне", "мой", "моя", "мое", "мои", "мою", "про", "при", "о", "об", "обо", "в", "во", "на", "с", "со", "и", "а", "у", "к", "ко", "по", "за", "для", "от", "до", "из"]);
+
+/** The words of a wish or of its sender's words, lowercased, «don’t» as «dont», look-alike letters folded. */
+const foldedWords = (text: string) => wishWords(foldMixedScript(text));
+
+/** Words that stop what follows them in a wish: «хватит шутить» asks as much as «не шути». */
+const STOPPING = new Set([...NEGATIONS, "никогда", "хватит", "перестань", "перестаньте", "прекрати", "прекратите", "isnt", "wont", "cant", "doesnt", "stop", "quit"]);
+
+/**
+ * What the bot writes that no wish reaches: the chronicle and its summaries are written about everything said, and a
+ * reminder goes where it was asked to. Only the answers, the lines it says uninvited and the weekly idea keep to wishes.
+ */
+const ELSEWHERE =
+  /(?<!\p{L})(?:хроник\p{L}*|летопис\p{L}*|сводк\p{L}*|дайджест\p{L}*|личк\p{L}*|лс|личн\p{L}*\s+(?:сообщени\p{L}*|переписк\p{L}*|чат\p{L}*)|напоминани\p{L}*)(?!\p{L})|\/(?:today|week|chronicle|catchup)\b|\b(?:chronicle|digests?|dms?|direct\s+messages?|private\s+(?:messages?|chats?)|privately|reminders?)\b/iu;
+
+/**
+ * Whether a wish keeps every negation of its sender's: a word they said with a negation or a «хватит» among the three
+ * words before it keeps one in the wish, so «не надо шутить» never becomes «шути». A negation the wish adds only
+ * narrows it.
+ */
+function negationsKept(value: string, said: string): boolean {
+  const stopped = (words: string[], index: number) => words.slice(Math.max(0, index - 3), index).some((word) => STOPPING.has(word));
+  const heard = foldedWords(said);
+  const wish = foldedWords(value);
+  return wish.every((word, index) => {
+    if (STOPPING.has(word) || word.length < 3 || stopped(wish, index)) return true;
+    const uses = heard.flatMap((use, at) => (sameStem(word, use) ? [stopped(heard, at)] : []));
+    return uses.length === 0 || uses.includes(false);
+  });
+}
+
+/**
+ * Whether a wish is drawn from its sender's own words, never from the message they reply to, as a worded note is
+ * (drawnFrom) but stricter: its words are theirs (wishDrawnFrom), and none of their negations is lost, though one added
+ * only narrows it.
+ */
+function wishFromOwnWords(value: string, said: string): boolean {
+  return negationsKept(value, said) && wishDrawnFrom(value, said);
+}
+
+/**
+ * Whether the words of a wish come from a text: each short word of it, two thirds of the longer ones, which may change
+ * form («называешь» → «называй»), and every number as it is. The words that only say whom it is about or negate need
+ * not.
+ */
+export function wishDrawnFrom(value: string, said: string): boolean {
+  const theirs = wordMatcher(said);
+  const heard = foldedWords(said);
+  const found = (word: string) => theirs(word) || heard.some((use) => sameStem(word, use));
+  const words = foldedWords(value).filter((word) => !STOPPING.has(word) && !WISH_FILLER.has(word));
+  const short = words.filter((word) => word.length < 4 && !/[a-z0-9]/.test(word));
+  const long = words.filter((word) => !short.includes(word));
+  if (words.length === 0 || !short.every(found) || long.filter(found).length < long.length * DRAWN_SHARE) return false;
+  const numbers = new Set(said.match(/\d+(?:[.,]\d+)?/g) ?? []);
+  return (value.match(/\d+(?:[.,]\d+)?/g) ?? []).every((number) => numbers.has(number));
+}
+
+/**
+ * What is wrong with a wish, if anything: it is the sender's own words, names no other member (only they can ask about
+ * themselves), holds no personal data, only narrows what the bot writes, and is about what keeps to wishes (its
+ * answers, its lines and the weekly idea, not the chronicle, the summaries or reminders). A topic the bot never keeps is
+ * no problem: keeping off one is what many wishes are for.
+ */
+export function wishProblem(text: string, said: string, others: Named[]): WishProblem | null {
+  const clean = cleanText(text);
+  if (!clean || clean.length > MAX_WISH_CHARS) return "too_long";
+  if (maskPersonalData(clean) !== clean) return "personal_data";
+  if (namesSomeoneElse(clean, others)) return "names_someone";
+  if (loosens(clean)) return "loosens";
+  if (ELSEWHERE.test(clean)) return "elsewhere";
+  if (!wishFromOwnWords(clean, said)) return "not_their_words";
+  return null;
+}
+
 /** Whether an alias would make the subject answer to a name that is someone else's, a project's or the bot's. */
 export async function aliasTaken(sql: Sql, subject: Subject, alias: string, others: Named[], botNames: string[]): Promise<boolean> {
   const key = nameKey(alias);
@@ -387,7 +474,19 @@ export type Applied =
   | { kind: "memo_removed"; row: MemoRow; projectName: string | null }
   | { kind: "zone"; before: ZoneState; value: string | null; place: string | null }
   /** The slots of a project the request changed, each as it was and as the request left it. */
-  | { kind: "project"; projectId: number; projectName: string; before: Partial<ProjectSlots>; after: Partial<ProjectSlots> };
+  | { kind: "project"; projectId: number; projectName: string; before: Partial<ProjectSlots>; after: Partial<ProjectSlots> }
+  | { kind: "wish_added"; wishId: number; scope: WishScope; asked: WishScope; text: string }
+  | { kind: "wish_removed"; row: WishRow };
+
+interface WishRow {
+  id: number;
+  chat_id: number;
+  user_id: number;
+  scope: WishScope;
+  text: string;
+  source_msg_id: number | null;
+  created_at: Date;
+}
 
 interface ZoneState {
   time_zone: string | null;
@@ -710,6 +809,41 @@ async function undoProjectEdit(tx: Queryable, subject: Subject, change: ProjectA
 }
 
 /**
+ * Whether a wish has room in the subject's chat: no wish of its kind says the same in any wording (theirs for one of
+ * their own, which outlives a twin the chat keeps; the chat's for one for everyone), and its scope is under its cap.
+ * The self-edit role reads the chat's wishes for this.
+ */
+async function wishFits(tx: Queryable, subject: Subject, scope: WishScope, text: string): Promise<boolean> {
+  const inForce = await tx<{ user_id: number; scope: WishScope; text: string }[]>`
+    SELECT user_id, scope, text FROM wishes WHERE chat_id = ${subject.chatId} AND scope = ${scope} AND (scope = 'chat' OR user_id = ${subject.userId})`;
+  if (inForce.some((wish) => wishKey(wish.text) === wishKey(text))) return false;
+  return inForce.length < (scope === "chat" ? MAX_CHAT_WISHES : MAX_OWN_WISHES);
+}
+
+/** What change_log keeps of a wish: never its words, which may name what someone wants kept quiet, and which /forgetme erases. */
+const loggedWish = (scope: WishScope, chatId: number, userId: number) => ({ scope, chat_id: chatId, user_id: userId });
+
+async function addOwnWish(tx: Queryable, subject: Subject, op: Extract<OwnOp, { action: "add_wish" }>, msgId: number): Promise<Applied[]> {
+  const text = cleanText(op.text);
+  if (!(await wishFits(tx, subject, op.scope, text))) return [];
+  const [row] = await tx<{ id: number }[]>`
+    INSERT INTO wishes (chat_id, user_id, scope, text, source_msg_id) VALUES (${subject.chatId}, ${subject.userId}, ${op.scope}, ${text}, ${msgId})
+    RETURNING id`;
+  await log(tx, subject, "wish", row!.id, "add", null, loggedWish(op.scope, subject.chatId, subject.userId), msgId);
+  return [{ kind: "wish_added", wishId: row!.id, scope: op.scope, asked: op.asked, text }];
+}
+
+/** Takes back a wish of the subject's own, or, lifted by a chat's admin, one the chat keeps for everyone. */
+async function removeOwnWish(tx: Queryable, subject: Subject, op: Extract<OwnOp, { action: "remove_wish" }>, msgId: number): Promise<Applied[]> {
+  const [row] = await tx<WishRow[]>`
+    DELETE FROM wishes WHERE id = ${op.wishId} AND chat_id = ${subject.chatId} AND (user_id = ${subject.userId} OR (${op.lift === true} AND scope = 'chat'))
+    RETURNING id, chat_id, user_id, scope, text, source_msg_id, created_at`;
+  if (!row) return [];
+  await log(tx, subject, "wish", row.id, "remove", loggedWish(row.scope, subject.chatId, row.user_id), null, msgId);
+  return [{ kind: "wish_removed", row }];
+}
+
+/**
  * Applies the operations to the subject's own card, all or nothing, and records them on the request in the same
  * transaction, so a receipt that fails to go out never leaves a change nobody can undo. Someone who opted out gets
  * nothing added. `fromStatus` is what the request must still be (a tap on an old preview finds it changed). `asPlan`
@@ -720,7 +854,7 @@ export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgI
     const [request] = await tx`SELECT 1 FROM self_edits WHERE id = ${requestId} AND status = ${fromStatus} FOR UPDATE`;
     if (!request) return null;
     const [member] = await tx<{ opted_out: boolean }[]>`SELECT opted_out FROM members WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} FOR UPDATE`;
-    const adds = new Set(["add", "replace", "set_tagline", "add_alias", "add_memo", "set_zone"]);
+    const adds = new Set(["add", "replace", "set_tagline", "add_alias", "add_memo", "set_zone", "add_wish"]);
     const applied: Applied[] = [];
     const memoCount = async (projectId: number | null) =>
       (await tx<{ count: number }[]>`SELECT count(*)::int AS count FROM memos WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId} AND project_id IS NOT DISTINCT FROM ${projectId}`)[0]?.count ?? 0;
@@ -740,6 +874,8 @@ export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgI
       else if (op.action === "set_zone") applied.push(...(await setOwnZone(tx, subject, op.zone, op.place, msgId)));
       else if (op.action === "clear_zone") applied.push(...(await setOwnZone(tx, subject, null, null, msgId)));
       else if (op.action === "edit_project") applied.push(...(await editOwnProject(tx, subject, op, msgId)));
+      else if (op.action === "add_wish") applied.push(...(await addOwnWish(tx, subject, op, msgId)));
+      else if (op.action === "remove_wish") applied.push(...(await removeOwnWish(tx, subject, op, msgId)));
       else applied.push(...(await removeOwnMemo(tx, subject, op, msgId)));
     }
     if (applied.length === 0) return applied;
@@ -754,9 +890,10 @@ export async function applyOwnOps(sql: Sql, subject: Subject, ops: OwnOp[], msgI
  * Undoes what applyOwnOps recorded on the request, newest first, on the subject's own card and projects only, and gives
  * what it took back: on a project, only the slots nobody changed since. The request's plan becomes what a Redo brings
  * back, on a project only while nothing changed it since the Undo. Null when there is nothing to undo; empty, with the
- * request left as it was, when everything it changed was changed since.
+ * request left as it was, when everything it changed was changed since. A wish for the whole chat they took back comes
+ * back only while `chatWide` says they may still keep the chat's wishes: one of its admins or a bot owner.
  */
-export async function undoOwnOps(sql: Sql, subject: Subject, requestId: number, msgId: number): Promise<Applied[] | null> {
+export async function undoOwnOps(sql: Sql, subject: Subject, requestId: number, msgId: number, chatWide = false): Promise<Applied[] | null> {
   return asSubject(sql, subject, async (tx) => {
     const [request] = await tx<{ applied: Applied[] | null; plan: OwnOp[] | null }[]>`
       SELECT applied, plan FROM self_edits
@@ -765,7 +902,7 @@ export async function undoOwnOps(sql: Sql, subject: Subject, requestId: number, 
     if (!request?.applied) return null;
     const [member] = await tx<{ opted_out: boolean }[]>`SELECT opted_out FROM members WHERE chat_id = ${subject.chatId} AND user_id = ${subject.userId}`;
     // Nothing comes back onto the card of someone who has opted out since.
-    const restores = new Set(["fact_removed", "alias_removed", "tagline", "memo_removed", "zone"]);
+    const restores = new Set(["fact_removed", "alias_removed", "tagline", "memo_removed", "zone", "wish_removed"]);
     const undone: Applied[] = [];
     /** What a Redo brings back to each project, the Undo having taken it back. */
     const redo = new Map<number, ProjectChange>();
@@ -822,6 +959,17 @@ export async function undoOwnOps(sql: Sql, subject: Subject, requestId: number, 
           INSERT INTO memos (id, chat_id, user_id, project_id, text, source_msg_id, created_at)
           SELECT ${row.id}, ${subject.chatId}, ${subject.userId}, ${row.project_id}, ${row.text}, ${row.source_msg_id}, ${row.created_at}
           WHERE ${row.project_id}::int IS NULL OR EXISTS (SELECT 1 FROM projects WHERE id = ${row.project_id}::int AND NOT hidden)
+          ON CONFLICT DO NOTHING`;
+      } else if (change.kind === "wish_added") {
+        await tx`DELETE FROM wishes WHERE id = ${change.wishId} AND chat_id = ${subject.chatId} AND user_id = ${subject.userId}`;
+      } else if (change.kind === "wish_removed") {
+        // A wish comes back only while it has room: no twin of it asked for since, and its scope under its cap; one for
+        // the whole chat only while they may keep the chat's, under whoever asked for it.
+        const row = change.row;
+        if ((row.scope === "chat" && !chatWide) || !(await wishFits(tx, subject, row.scope, row.text))) continue;
+        await tx`
+          INSERT INTO wishes (id, chat_id, user_id, scope, text, source_msg_id, created_at)
+          VALUES (${row.id}, ${subject.chatId}, ${row.scope === "chat" ? row.user_id : subject.userId}, ${row.scope}, ${row.text}, ${row.source_msg_id}, ${row.created_at})
           ON CONFLICT DO NOTHING`;
       } else if (change.kind === "alias_added") {
         await tx`DELETE FROM aliases WHERE id = ${change.aliasId} AND chat_id = ${subject.chatId} AND user_id = ${subject.userId}`;

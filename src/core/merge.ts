@@ -2,6 +2,7 @@ import type { Sql } from "./db.js";
 import { moveNotesToUser } from "./notes.js";
 import { nameKey } from "./text.js";
 import type { User } from "./users.js";
+import { moveWishesToUser } from "./wishes.js";
 
 /** A card from imported history that no Telegram account has taken over yet. */
 export interface UnlinkedCard {
@@ -50,7 +51,7 @@ export function rankCards<T extends Pick<UnlinkedCard, "display_name">>(cards: T
 
 /**
  * Folds a seeded card (a user row without a Telegram account) into a real account:
- * memberships, facts, aliases, project roles, votes, messages and reminders move over, the seed row disappears.
+ * memberships, facts, aliases, project roles, votes, messages, reminders, notes and wishes move over, the seed row disappears.
  */
 export async function mergeSeedUser(sql: Sql, seedUserId: number, intoUserId: number, actorUserId: number): Promise<void> {
   await sql.begin(async (tx) => {
@@ -121,6 +122,7 @@ export async function mergeSeedUser(sql: Sql, seedUserId: number, intoUserId: nu
     await tx`UPDATE reminders SET user_id = ${intoUserId} WHERE user_id = ${seedUserId}`;
     await tx`DELETE FROM reminders r USING members m WHERE m.user_id = ${intoUserId} AND m.opted_out AND r.chat_id = m.chat_id AND r.user_id = ${intoUserId}`;
     await moveNotesToUser(tx, seedUserId, intoUserId);
+    await moveWishesToUser(tx, seedUserId, intoUserId);
     // Aliases the account already had are left on the card, and deleting the card deletes those copies.
     await tx`DELETE FROM users WHERE id = ${seedUserId}`;
     if (seed.username) {

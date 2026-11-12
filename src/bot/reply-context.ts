@@ -16,9 +16,10 @@ import {
   type ProjectListItem,
   type RatingBreakdown,
 } from "../core/projects.js";
-import { slugify, transliterateName, truncate } from "../core/text.js";
+import { hasForbiddenTopic, slugify, transliterateName, truncate } from "../core/text.js";
 import { recurringThemes, wordTerms, type Theme } from "../core/themes.js";
 import { peopleOfChat, SERVICE_TG_IDS, type Person } from "../core/users.js";
+import { wishesOfChat, wishKey, type ChatWishes, type NamedWish } from "../core/wishes.js";
 import { chatClocks, isoDayIn, localDay, localStamp, localTimeOf, offsetAt, zoneGap, zoneLabel, type MemberClock } from "../core/zones.js";
 import { skippedMessageIds } from "../worker/extract.js";
 import { realReply } from "./kit.js";
@@ -409,6 +410,7 @@ export function aboutYouBlock(input: {
     entry
       ? `In the catalog you are the project ${safe(entry.project.name)}: #${entry.rank} of ${entry.total}, ${entry.project.score} rating points, ${entry.project.votes} vote(s).`
       : "",
+    "A member also asks you plainly in the chat not to write something, or not to write in some way, to them or about them («не шути про мой вес», «пиши мне короче»), and a chat admin or an owner asks it for the whole chat («не пиши в этом чате про политику»): you keep it as a wish, post a receipt with ↩️ Undo and keep to it from then on, in your answers, when you speak up uninvited and in the weekly idea, never in the chronicle or reminders; «можно снова шутить про мой вес» takes one back, and a chat admin or an owner one for the whole chat. A wish only ever narrows what you write.",
     input.saidAboutYou.length ? `What members say about you: ${input.saidAboutYou.join("; ")}.` : "",
     "</about_you>",
   ]
@@ -758,6 +760,46 @@ export function localTimesBlock(focus: { person: Person; reason: FocusReason }[]
   return `<local_times note="the time now by each one's own clock; the days and times people write («завтра», «вечером», «в 10») are theirs">\n${[chat, ...people].join("\n")}\n</local_times>`;
 }
 
+/** Room the wishes of everyone but the asker share in a prompt: the asker's own and the chat's always go in whole. */
+const OTHERS_WISHES_CHARS = 6000;
+
+/** Someone whose own wishes a prompt may hold, and why they bear on it: asking, replied to, named. */
+export interface WishHolder {
+  person: Pick<Person, "id" | "display_name" | "username">;
+  label?: string;
+}
+
+/**
+ * Each person's own wishes as a prompt holds them, in the order given: the asker's whole, everyone else's within
+ * OTHERS_WISHES_CHARS. Someone else's wish on a topic the bot never keeps stays out: no answer touches such a topic of
+ * anyone anyway, and none should repeat what they asked to keep quiet. One the chat keeps for everyone is not said twice.
+ */
+export function wishesOfPeople(wishes: ChatWishes, people: WishHolder[], askerId?: number): (WishHolder & { wishes: NamedWish[] })[] {
+  const chatKeys = new Set(wishes.chat.map((wish) => wishKey(wish.text)));
+  const seen = new Set<number>();
+  let room = OTHERS_WISHES_CHARS;
+  return people.flatMap((holder) => {
+    if (seen.has(holder.person.id)) return [];
+    seen.add(holder.person.id);
+    const asking = holder.person.id === askerId;
+    const kept = (wishes.own.get(holder.person.id) ?? []).filter((wish) => !chatKeys.has(wishKey(wish.text)) && (asking || !hasForbiddenTopic(wish.text)));
+    const fits = asking ? kept : kept.filter((wish) => (room -= wish.text.length + 4) >= 0);
+    return fits.length ? [{ ...holder, wishes: fits }] : [];
+  });
+}
+
+/**
+ * What people asked the bot not to write, or not to write in some way, that bears on what it writes now: the chat's
+ * wishes for everyone, and the own wishes of the people given, each line saying whose.
+ */
+export function wishesBlock(chatWide: NamedWish[], people: (WishHolder & { wishes: NamedWish[] })[]): string {
+  const quoted = (wishes: NamedWish[]) => wishes.map((wish) => `«${line(wish.text, 300)}»`).join("; ");
+  const chat = chatWide.map((wish) => `- the whole chat, asked by ${safe(wish.display_name)}: ${quoted([wish])}`);
+  const own = people.map(({ person, label, wishes }) => `- ${safe(person.display_name)}${person.username ? ` (@${person.username})` : ""}${label ? `, ${label}` : ""}, for writing to them or about them: ${quoted(wishes)}`);
+  const lines = [...chat, ...own];
+  return lines.length ? `<wishes note="what people asked you not to write, or not to write in some way: each one narrows what you write">\n${lines.join("\n")}\n</wishes>` : "";
+}
+
 /** When they asked for what is done now, by their own clock: «Thu 12 Nov 2026, 21:30». */
 export function askedEarlierBlock(askedAt: Date, zone: string): string {
   const when = `${localDay(askedAt, zone)} ${isoDayIn(askedAt, zone).slice(0, 4)}, ${localTimeOf(askedAt, zone)}`;
@@ -942,6 +984,8 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
         AND NOT EXISTS (SELECT 1 FROM reminders r WHERE r.chat_id = m.chat_id AND m.msg_id IN (r.chat_msg_id, r.receipt_msg_id))
       ORDER BY m.msg_id DESC LIMIT ${SPENT_MESSAGES}`,
   ]);
+  // The wishes this answer keeps to: the chat's for everyone, and every member's own, since any of them may come up in it.
+  const wishes = await wishesOfChat(sql, chatId);
   // What the bot's own words of the last days already used: the notes they brought up, and the words they wore out.
   const noteText = (note: ContextNote) => `${note.about ?? ""} ${note.value}`;
   const askerNames = asker ? [asker.display_name, ...(aliasesOf.get(asker.id) ?? []).map((alias) => alias.alias)] : [];
@@ -1082,6 +1126,19 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     question.scheduled ? askedEarlierBlock(question.scheduled.askedAt, (asker && clocks.get(asker.id)?.zone) || options.timezone) : "",
     worn.length ? `<worn_out note="what your own answers kept coming back to lately: leave it out">${worn.map(safe).join(", ")}</worn_out>` : "",
     `<if_insulted motif="${options.insultMotif}" />`,
+    wishesBlock(
+      wishes.chat,
+      wishesOfPeople(
+        wishes,
+        [
+          ...focusPeople.map(({ person, reason }) => ({ person, label: reason })),
+          ...people.map((person) => ({ person })),
+          // Someone who left the chat may still come up in it.
+          ...[...wishes.own.values()].map(([wish]) => ({ person: { id: wish!.user_id, display_name: wish!.display_name, username: null } })),
+        ],
+        asker?.id,
+      ),
+    ),
     // Right before the question, where a smaller model still has it in mind: the tone of the answer follows this message.
     `<answer_in_kind>kindness, thanks or a gift: a short, warm thank-you about the gesture, never their projects or card, no jab, yet it buys no side; banter: light banter about what they just said, no nagging about work; an insult: one dry, unbothered comeback, no threats</answer_in_kind>`,
     `<question from="${safe(askerName).replace(/"/g, "'")}">\n${line(asked, 1500)}\n</question>`,
