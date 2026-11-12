@@ -33,7 +33,7 @@ import { localTimeOf, zoneLabel, zoneName } from "../core/zones.js";
 import { chatBudgetUsd } from "../worker/scheduler.js";
 import { realReply, type BotContext } from "./kit.js";
 import { chatLanguage, handleReminderRequest, REMIND_CUE, REMINDER_KINDS, reminderFailedText, type ReminderSettled, type RepliedTo, type Written } from "./reminders.js";
-import { questionText, type Answered, type Question } from "./reply-context.js";
+import { questionText, questionWords, type Answered, type Question } from "./reply-context.js";
 
 /**
  * Every message addressed to the bot passes here first. A model reads the sender's own words, their own card and the
@@ -49,8 +49,12 @@ import { questionText, type Answered, type Question } from "./reply-context.js";
 export const SELF_EDIT_PURPOSE = "self_edit";
 /** What the answer is told when a message asked for a change and none was made. */
 const NOTHING_CHANGED = "nothing was changed on any card";
-/** A member's requests read in an hour; past that, messages go straight to the answer and its own limits. */
-const READS_PER_HOUR = 20;
+/**
+ * A member's requests read in an hour; past that, their messages go straight to the answer and its own limits. Only a
+ * message read for a request counts: plain talk to the bot never uses one up.
+ */
+const READS_PER_HOUR = 30;
+const HOUR_MS = 3_600_000;
 const READ_TIMEOUT_MS = 30_000;
 /** What the answer is told when a message asked for a change and the reading could not tell which. */
 const UNCLEAR = `${NOTHING_CHANGED}: they asked to change something on their card or in their notes, but the bot could not tell what; ask in one short line for just what is missing (which entry, which project, what text): a reply to your message with it is enough, so never dictate a phrase for them to repeat`;
@@ -728,6 +732,21 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
   const log = deps.log ?? ((line: string) => console.log(line));
   const queues = new Map<string, Promise<void>>();
   const inFlight = new Set<Promise<void>>();
+  /** When each member's requests of the last hour were read, by chat and member. */
+  const readTimes = new Map<string, number[]>();
+
+  /** Counts a reading of a member's request, or, past the limit, says in how many minutes the next one can be read. */
+  const takeRead = (chatId: number, userId: number): { ok: true } | { ok: false; minutes: number } => {
+    const key = `${chatId}:${userId}`;
+    const now = Date.now();
+    const recent = (readTimes.get(key) ?? []).filter((at) => now - at < HOUR_MS);
+    if (recent.length >= READS_PER_HOUR) {
+      readTimes.set(key, recent);
+      return { ok: false, minutes: Math.max(1, Math.ceil((recent[0]! + HOUR_MS - now) / 60_000)) };
+    }
+    readTimes.set(key, [...recent, now]);
+    return { ok: true };
+  };
 
   const languageOf = (chatId: number): Promise<Language> => chatLanguage(sql, chatId);
 
@@ -753,7 +772,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
       replied && !repliedRequest && replied.from?.id === subject.tgId && !replied.forward_origin && !replied.via_bot
         ? [{ original: replied.text ?? replied.caption ?? "", at: new Date(replied.date * 1000) }]
         : [];
-    return [{ original: questionText(message, me), at: new Date(message.date * 1000) }, ...recent.map((row) => ({ original: row.text, at: row.sent_at })), ...ownReply]
+    return [{ original: questionWords(message, me), at: new Date(message.date * 1000) }, ...recent.map((row) => ({ original: row.text, at: row.sent_at })), ...ownReply]
       .map((written) => ({ ...written, text: cleanText(maskPersonalData(written.original)) }))
       .filter((written) => written.text);
   };
@@ -866,12 +885,15 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
       await done("not_a_request", "answered");
       return deps.answer(api, question);
     }
-    const [reads] = await sql<{ count: number }[]>`
-      SELECT count(*)::int AS count FROM self_edits WHERE chat_id = ${chatId} AND user_id = ${subject.userId} AND created_at > now() - interval '1 hour'`;
-    if (reads!.count > READS_PER_HOUR) {
-      log(`[self-edit] chat ${chatId}: user ${subject.userId} wrote to the bot over ${READS_PER_HOUR} times within an hour; msg ${message.message_id} goes to the answer unread`);
+    const slot = takeRead(chatId, subject.userId);
+    if (!slot.ok) {
+      log(`[self-edit] chat ${chatId}: user ${subject.userId} asked for over ${READS_PER_HOUR} requests within an hour; msg ${message.message_id} goes to the answer unread`);
       await done("not_a_request", "answered");
-      return deps.answer(api, question, `${NOTHING_CHANGED}: a request in it was not read, too many messages to the bot this hour; it can be asked again later`);
+      return deps.answer(
+        api,
+        question,
+        `${NOTHING_CHANGED}: the bot reads at most ${READS_PER_HOUR} requests from one member an hour and this one was over, so nothing in it was read; it can be asked again in ${slot.minutes} min; give exactly this reason and no other`,
+      );
     }
     try {
       await assertBudget(sql, config.MONTHLY_LLM_BUDGET_USD, { id: chatId, limitUsd: chatBudgetUsd(chat, config.CHAT_MONTHLY_BUDGET_USD) });

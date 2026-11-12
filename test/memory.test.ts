@@ -349,6 +349,29 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
       expect(await contextFor(asking(chat, kit, "как дела у всех?"))).not.toContain("<project_details>");
     });
 
+    it("lets neither its own earlier lines in a thread nor its own day of answers keep a project on its tongue", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      const dora = await member(chat, "Dora");
+      await addUserProject(sql, { chatId: chat, name: "Nova", actorUserId: dora.id });
+      // The bot brought Nova up itself, twice today, down a thread where Kit never named it.
+      const root = await say(chat, kit, "как дела?");
+      const first = await botSays(chat, "Nova всё ещё в работе, а у тебя как?", { replyTo: root });
+      const fine = await say(chat, kit, "нормально", { replyTo: first, toBot: true });
+      const second = await botSays(chat, "Nova подождёт, а ты молодец", { replyTo: fine });
+      const thanks = await say(chat, kit, "спасибо", { replyTo: second, toBot: true });
+      const welcome = await botSays(chat, "пожалуйста", { replyTo: thanks });
+      const replyTo = (msgId: number, text: string) => ({ reply_to_message: { message_id: msgId, date: now(), chat: { id: chat, type: "supergroup", title: "Hive" }, from: me, text } });
+      const worn = (context: string) => /<worn_out[^>]*>([^<]*)<\/worn_out>/.exec(context)?.[1] ?? "";
+
+      const later = await contextFor(asking(chat, kit, "лол", replyTo(welcome, "пожалуйста")));
+      expect(later).not.toContain("<project_details>");
+      expect(worn(later)).toContain("Nova (2× in your messages today)");
+      // The bot's line the member answers is still what the question is about; a project the member names is never worn.
+      expect(await contextFor(asking(chat, kit, "лол", replyTo(second, "Nova подождёт, а ты молодец")))).toContain("<project_details>");
+      expect(worn(await contextFor(asking(chat, kit, "а что с Nova?", replyTo(welcome, "пожалуйста"))))).not.toContain("Nova");
+    });
+
     it("hands a referee the whole conversation since the last long pause instead of the latest messages", async () => {
       const chat = await newChat();
       const kit = await member(chat, "Kit");

@@ -4,7 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { signInitData } from "../src/api/init-data.js";
 import { createApi } from "../src/api/server.js";
 import { createBot } from "../src/bot/bot.js";
-import { buildReplyContext, promptText, wordedTexts, wornWords, type Question } from "../src/bot/reply-context.js";
+import { buildReplyContext, projectsNamedOften, promptText, questionWords, wordedTexts, wornWords, type Question } from "../src/bot/reply-context.js";
 import { addAlias } from "../src/core/aliases.js";
 import { migrateChat } from "../src/core/chat-migration.js";
 import { attachLegacyData, getChat, LEGACY_CHAT_ID, registerChat, setChatStatus } from "../src/core/chats.js";
@@ -64,6 +64,27 @@ describe("theme terms", () => {
     } finally {
       await sql.end();
     }
+  });
+});
+
+describe("what the bot keeps coming back to", () => {
+  it("counts the projects its own messages keep naming, leaving out those the member names", () => {
+    const projects = [
+      { id: 1, forms: ["Nova"] },
+      { id: 2, forms: ["Atlas"] },
+      { id: 3, forms: ["Relic"] },
+    ];
+    const spoken = ["Спасибо за цветок, автор Nova", "Nova снова в деле", "Atlas в работе", "Как там Nova?", "Relic"];
+    expect(projectsNamedOften(spoken, projects, new Set())).toEqual([{ id: 1, times: 3 }]);
+    expect(projectsNamedOften(spoken, projects, new Set([1]))).toEqual([]);
+  });
+
+  it("drops only the mention that addresses the bot at the start of a message", () => {
+    const me = { username: "waggle_test_bot" } as UserFromGetMe;
+    const words = (text: string) => questionWords({ text } as Message, me);
+    expect(words("@waggle_test_bot напомни: держи цветок @waggle_test_bot")).toBe("напомни: держи цветок @waggle_test_bot");
+    expect(words("@Waggle_Test_Bot, ты тут?")).toBe("ты тут?");
+    expect(words("кто пишет на Rust, @waggle_test_bot?")).toBe("кто пишет на Rust, @waggle_test_bot?");
   });
 });
 

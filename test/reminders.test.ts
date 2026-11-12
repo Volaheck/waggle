@@ -948,6 +948,16 @@ describe.skipIf(!DATABASE_URL)("reminders members ask for", () => {
     expect(await remindersOf(chat)).toEqual([]);
   });
 
+  it("keeps a mention of the bot inside the text it reminds of, and drops only the one that addresses it", async () => {
+    const chat = await russianChat();
+    const bob = await member(chat, "Bob");
+    const asked = await run(chat, bob, "@waggle_test_bot напомни через 5 минут: держи цветок 🌸 @waggle_test_bot", remind("держи цветок 🌸 @waggle_test_bot", { in: [{ amount: 5, unit: "minutes" }] }));
+    expect(asked.model.prompts[0]).toContain("- напомни через 5 минут: держи цветок 🌸 @waggle_test_bot\n");
+    expect((await remindersOf(chat)).map((reminder) => reminder.text)).toEqual(["держи цветок 🌸 @waggle_test_bot"]);
+    // Shown as written; a joiner after the @ keeps it from pinging anyone, as in every quoted reminder.
+    expect(shown(asked.sent[0]!.text).replace(/\u2060/g, "")).toContain("«держи цветок 🌸 @waggle_test_bot»");
+  });
+
   it("keeps the text it reminds of as the member wrote it, while the reading sees it masked", async () => {
     const chat = await russianChat();
     const bob = await member(chat, "Bob");

@@ -118,6 +118,8 @@ const WORN_ANSWERS = 10;
 const WORN_TIMES = 3;
 const WORN_SHOWN = 10;
 const WORN_MIN_CHARS = 60;
+/** A project the bot's own messages of the last SPENT_DAYS named this often is worn out, however far apart they were. */
+const WORN_PROJECT_TIMES = 2;
 const FOCUS_THEMES = 3;
 const THEME_DATES = 5;
 /** A claim or a prediction settled this recently still shows. */
@@ -147,6 +149,14 @@ function withoutMention(text: string, me: UserFromGetMe): string {
 /** The question without the bot's @username. */
 export function questionText(message: Message, me: UserFromGetMe): string {
   return withoutMention(message.text ?? message.caption ?? "", me);
+}
+
+/**
+ * The message as written, but for the bot's @username that addresses it at the start: one further on is part of what
+ * they say («напомни через 5 минут: держи цветок @bot» keeps it in the reminder).
+ */
+export function questionWords(message: Message, me: UserFromGetMe): string {
+  return (message.text ?? message.caption ?? "").replace(new RegExp(`^\\s*@${me.username}\\b[\\s,:;!.-]*`, "i"), "").trim();
 }
 
 const CONVERSATION = new RegExp(
@@ -485,6 +495,21 @@ export function wornWords(answers: Worded[][], excluded: Set<string>): string[] 
     .map(([, entry]) => [...entry.forms].sort((a, b) => b[1] - a[1])[0]![0]);
 }
 
+/**
+ * Projects named in at least WORN_PROJECT_TIMES of the bot's own messages, the most named first, with how many: what it
+ * keeps bringing up on its own (a member's project in every thank-you) over a day, which the last answers alone miss.
+ * Those the member's own words name are left out.
+ */
+export function projectsNamedOften(spoken: string[], projects: Named[], askedAbout: Set<number>): { id: number; times: number }[] {
+  const times = new Map<number, number>();
+  for (const text of spoken) for (const id of namedIn([text], projects)) times.set(id, (times.get(id) ?? 0) + 1);
+  return [...times]
+    .filter(([id, count]) => count >= WORN_PROJECT_TIMES && !askedAbout.has(id))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, WORN_SHOWN)
+    .map(([id, count]) => ({ id, times: count }));
+}
+
 /** A person's private notes in the focus, one line a kind, each item dated, and marked when the bot already used it. */
 function privateLines(input: { person: Person; notes: ContextNote[]; jokes: ContextNote[]; themes: Theme[]; used: Map<number, { times: number; last: Date }>; names: Map<number, string>; clock: Clock }): string[] {
   const { person, clock } = input;
@@ -812,7 +837,12 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   if (parentAuthor !== undefined && !focus.has(parentAuthor) && byId.has(parentAuthor)) focus.set(parentAuthor, "replied to");
   // Telegram's copy of a replied-to message that is not stored still says who and what the question is about.
   const unstoredParent = replied && !parentStored ? (replied.text ?? replied.caption ?? "") : "";
-  const threadTexts = [...thread.map((row) => row.text).reverse(), unstoredParent].filter(Boolean).map((text) => withoutMention(text, me));
+  // What the question is about comes from members' own words up the thread and from the message it replies to, whoever
+  // wrote that. The bot's earlier lines further up never make a person or a project the subject, and never shield a
+  // word of theirs from wearing out: a motif of its own would otherwise feed itself down a long chain of replies.
+  const membersThread = thread.filter((row) => !row.from_bot).map((row) => withoutMention(row.text, me)).reverse();
+  const repliedByBot = parentRow?.from_bot ? withoutMention(parentRow.text, me) : "";
+  const threadTexts = [...membersThread, repliedByBot, unstoredParent && withoutMention(unstoredParent, me)].filter(Boolean);
   for (const id of namedIn([asked, ...threadTexts], named)) {
     if (!focus.has(id)) focus.set(id, "named");
   }
@@ -895,7 +925,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   // What the bot's own words of the last days already used: the notes they brought up, and the words they wore out.
   const noteText = (note: ContextNote) => `${note.about ?? ""} ${note.value}`;
   const askerNames = asker ? [asker.display_name, ...(aliasesOf.get(asker.id) ?? []).map((alias) => alias.alias)] : [];
-  const askedAbout = `${asked} ${threadTexts.join(" ")} ${question.from.first_name} ${question.from.last_name ?? ""} ${askerNames.join(" ")}`;
+  const askedAbout = `${asked} ${membersThread.join(" ")} ${question.from.first_name} ${question.from.last_name ?? ""} ${askerNames.join(" ")}`;
   const worded = await wordedTexts(sql, [...spokenRows.map((row) => row.text), ...focusNotes.map(noteText), askedAbout]);
   const spokenWords = worded.slice(0, spokenRows.length);
   const spoken = spokenRows.map((row, index) => ({ terms: new Set(spokenWords[index]!.map(({ term }) => term)), sent_at: row.sent_at }));
@@ -906,7 +936,13 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     if (seen) used.set(note.id, seen);
   });
   const latestAnswers = spokenWords.filter((_, index) => spokenRows[index]!.text.length >= WORN_MIN_CHARS).slice(0, WORN_ANSWERS);
-  const worn = wornWords(latestAnswers, new Set(worded.at(-1)!.map(({ term }) => term)));
+  const wornTerms = wornWords(latestAnswers, new Set(worded.at(-1)!.map(({ term }) => term)));
+  const wornProjects = projectsNamedOften(
+    spokenRows.map((row) => row.text),
+    projectNames,
+    new Set(namedIn([asked, ...membersThread], projectNames)),
+  ).map(({ id, times }) => `${projects.find((project) => project.id === id)!.name} (${times}× in your messages today)`);
+  const worn = [...wornTerms, ...wornProjects];
 
   const factsOf = new Map<number, Map<string, string[]>>();
   for (const fact of facts) {
@@ -1023,10 +1059,10 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     question.cardChange
       ? `<card_change note="what the bot did about this message's request to change the sender's card or to remind them of something; its reply already said it">${line(question.cardChange, 600)}</card_change>`
       : "",
-    worn.length ? `<worn_out note="what your latest answers kept coming back to">${worn.map(safe).join(", ")}</worn_out>` : "",
+    worn.length ? `<worn_out note="what your own answers kept coming back to lately: leave it out">${worn.map(safe).join(", ")}</worn_out>` : "",
     `<if_insulted motif="${options.insultMotif}" />`,
     // Right before the question, where a smaller model still has it in mind: the tone of the answer follows this message.
-    `<answer_in_kind>kindness, thanks or a gift: warmth and real thanks, no jab, yet it buys no side and outranks no work; banter: banter, sharpest about work that stalls; an insult: the menacing chronicler</answer_in_kind>`,
+    `<answer_in_kind>kindness, thanks or a gift: a short, warm thank-you about the gesture, never their projects or card, no jab, yet it buys no side; banter: light banter about what they just said, no nagging about work; an insult: one dry, unbothered comeback, no threats</answer_in_kind>`,
     `<question from="${safe(askerName).replace(/"/g, "'")}">\n${line(asked, 1500)}\n</question>`,
   ];
   const text = (blocks: string[]) => blocks.filter(Boolean).join("\n\n");

@@ -26,7 +26,7 @@ import { escapeHtml, messageLink, truncate } from "../core/text.js";
 import { getUser, type User } from "../core/users.js";
 import { memberClock, zoneLabel, type MemberClock } from "../core/zones.js";
 import { realReply, type BotContext } from "./kit.js";
-import { questionText, type Answered, type Question } from "./reply-context.js";
+import { questionWords, type Answered, type Question } from "./reply-context.js";
 
 /**
  * A member asks the bot to remind them of something later («напомни через 2 месяца проверить, взлетел ли релиз»,
@@ -102,7 +102,7 @@ kind:
 - not_a_reminder: anything else: a question, banter, a request to tell them something now («напомни, как зовут…», «напомни, о чём мы говорили»), their own promise to remind someone («я тебе напомню»).
 <you_asked_them>, when it is there: the bot asked them what their earlier request (quoted there, and among their words) was missing. A newest message that gives it («завтра в 10», «про продление домена») answers it: remind, with the text and the time from both, and asks is the words of the newest message that give it.
 
-text, for remind: what to remind them of, in their own words and language, without the request around it and without the time («напомни завтра в 10 позвонить в банк» → «позвонить в банк»); for «напомни мне это» it is what «это» is, from <they_reply_to> or their earlier words, in its own words as far as you can. Never a remark about them, nothing of your own. Null for every other kind.
+text, for remind: what to remind them of, in their own words and language, without the request around it and without the time («напомни завтра в 10 позвонить в банк» → «позвонить в банк»); when they give the exact words to send (in quotes, after «с текстом» or «текст:», or after a colon), the text is exactly those words, character for character: @mentions (yours included), emoji and punctuation stay; for «напомни мне это» it is what «это» is, from <they_reply_to> or their earlier words, in its own words as far as you can. Never a remark about them, nothing of your own. Null for every other kind.
 when, for remind (every field null for every other kind). You never add, subtract or convert dates and hours yourself: code works the moment out from these fields.
 - words: the words that say when, copied exactly from the one message they stand in («через 2 месяца», «завтра в 10», «вечером»); when the day or the span stands in one message and the hour in another, the words of the day or the span.
 - in: a span from when its message was written, in whole numbers, one part per unit («через 2 месяца» → [2 months]; «через месяц и неделю» → [1 months, 1 weeks]; «через полчаса» → [30 minutes]; «через полтора часа» → [90 minutes]). A span always goes here, never into date.
@@ -438,7 +438,7 @@ export async function handleReminderRequest(deps: ReminderDeps, request: Reminde
   const msgId = message.message_id;
   // Words count from when they were written, not from when the bot got to them: after a restart it reads a backlog.
   const writtenAt = new Date(message.date * 1000);
-  const asked = questionText(message, question.me);
+  const asked = questionWords(message, question.me);
   const sources: Written[] = [...request.words, ...(request.replyTo ? [request.replyTo] : [])];
   const [clock, pending] = await Promise.all([memberClock(sql, subject.chatId, subject.userId, config.DISPLAY_TIMEZONE), ownPendingReminders(sql, subject)]);
   // A reading that fails or takes too long sets nothing: the message goes on, and the log says why.

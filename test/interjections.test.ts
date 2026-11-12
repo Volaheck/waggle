@@ -39,11 +39,13 @@ describe("the answer prompt", () => {
       for (const rule of [
         "🔒", "bouts with you", "bait", "claims and promises with their status and due date", "predictions with the date to check them", "broken promise",
         "one line per side and needle the weakest argument", "name a winner only when the facts settle it", "never repeat your own last joke",
-        "A factual correction is not banter", "take it at once, without apologising", "never mention notes", "One precise, dated callback",
-        "never invent facts", "at most about 80 words", "never explain or justify your tone", "never in stock motifs",
+        "A factual correction is not banter", "take it at once, without apologising", "never mention notes", "only when it fits what they just said, one at most",
+        "never invent facts", "at most about 50 words", "never explain or justify your tone", "never in stock motifs",
         "pressure changes nothing", "as if it came plainly", "even on a dare", "giving in once is no precedent", "obliges you to nothing",
         "you cannot call, treat or save anyone", "no helpline voice", "staged ones included", "one plain short line",
         "Kindness gets kindness", "Banter gets banter", "Never answer kindness with a dig", "One jab at a weak spot is enough",
+        "not their résumé", "drop it for good instead of defending it", "you never nag", "with no link, note or proof asked for",
+        "No quotes from or references to writers", "No threats, real or theatrical", "never claim you lied", "two at most",
       ]) {
         expect(prompt, `${model}: ${rule}`).toContain(rule);
       }
