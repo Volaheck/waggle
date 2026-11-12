@@ -207,6 +207,13 @@ async function applyOptOut(tx: Queryable, userId: number, optedOut: boolean, sco
     await tx`DELETE FROM memos WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     // Reminders they asked for are their own words too: someone who opted out gets none.
     await tx`DELETE FROM reminders WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
+    // Nor does anyone else's reminder tag them any more; one left for nobody is off.
+    await tx`
+      UPDATE reminders SET for_user_ids = array_remove(for_user_ids, ${userId}::int)
+      WHERE ${userId}::int = ANY(for_user_ids) AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
+    await tx`
+      UPDATE reminders SET status = 'cancelled', cancelled_at = now()
+      WHERE status = 'pending' AND NOT for_asker AND cardinality(for_user_ids) = 0 AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     // So are their wishes, those they asked for the whole chat included.
     await tx`DELETE FROM wishes WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     await forgetNotes(tx, userId, scope);

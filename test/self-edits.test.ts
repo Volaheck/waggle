@@ -878,7 +878,7 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
       await proposeFact(sql, { chatId: chat, userId: bob.id, kind: "timezone", value: "Канада", confidence: 1, sourceMsgIds: [], source: "user" });
       await sql`UPDATE facts SET zones = ${CANADA} WHERE chat_id = ${chat} AND user_id = ${bob.id}`;
       // «завтра» has it read for something to do later, which it is not: the question is answered now, and no card is read.
-      const notLater = { kind: "not_a_reminder", asks: null, also_asks: false, text: null, action: null, when: { words: null, in: null, date: null, time: null, before: null }, ref: null };
+      const notLater = { kind: "not_a_reminder", asks: null, also_asks: false, for: null, text: null, action: null, when: { words: null, in: null, date: null, time: null, before: null }, ref: null };
       const asked = await run(chat, bob, "@waggle_test_bot что у нас завтра?", notLater as unknown as Reading);
       expect(asked.sent).toEqual([]);
       expect(asked.parser.prompts).toHaveLength(1);

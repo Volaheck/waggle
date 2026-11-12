@@ -165,10 +165,13 @@ describe("a reminder's words", () => {
     expect(reminderStandsIn(read("cancel", "завтра в 10"), "завтра в 10", true)).toBe(false);
   });
 
-  it("takes no field that names a person, a chat or a row", () => {
+  it("takes no field that points at a person, a chat or a row: whom to remind comes as their words, for code to find", () => {
     const when = { words: "завтра в 10", in: null, date: "2026-11-13", time: "10:00", before: null };
-    const reading = { kind: "remind", asks: "напомни", also_asks: false, text: "позвонить в банк", action: null, when, ref: null };
+    const reading = { kind: "remind", asks: "напомни", also_asks: false, for: null, text: "позвонить в банк", action: null, when, ref: null };
     expect(ReminderReadingSchema.safeParse(reading).success).toBe(true);
+    expect(ReminderReadingSchema.safeParse({ ...reading, kind: "for_others", for: [{ name: "Оле", ref: "u2" }] }).success).toBe(true);
+    expect(ReminderReadingSchema.safeParse({ ...reading, kind: "for_others", for: [{ name: "Оле", ref: "u2", user_id: 7 }] }).success).toBe(false);
+    expect(ReminderReadingSchema.safeParse({ ...reading, kind: "for_others", for: [7] }).success).toBe(false);
     expect(ReminderReadingSchema.safeParse({ ...reading, user_id: 7 }).success).toBe(false);
     expect(ReminderReadingSchema.safeParse({ ...reading, when: { ...when, chat_id: -100 } }).success).toBe(false);
     expect(ReminderReadingSchema.safeParse({ ...reading, when: { ...when, in: [{ amount: 2, unit: "fortnights" }] } }).success).toBe(false);
@@ -307,7 +310,7 @@ describe.skipIf(!DATABASE_URL)("reminders members ask for", () => {
           const payload =
             "card" in result
               ? { ...result.card, asks: asked }
-              : { asks: result.kind === "not_a_reminder" ? null : asked, also_asks: false, text: null, action: null, when: { words: null, in: null, date: null, time: null, before: null }, ref: null, ...result };
+              : { asks: result.kind === "not_a_reminder" ? null : asked, also_asks: false, for: null, text: null, action: null, when: { words: null, in: null, date: null, time: null, before: null }, ref: null, ...result };
           const message = { stop_reason: "end_turn", stop_details: null, content: [{ type: "text", text: JSON.stringify(payload) }], usage: { input_tokens: 600, output_tokens: 60 } };
           return { currentMessage: message, finalMessage: async () => message };
         },
@@ -520,17 +523,140 @@ describe.skipIf(!DATABASE_URL)("reminders members ask for", () => {
     expect((await reminderRow(check!.id)).status).toBe("cancelled");
   });
 
-  it("refuses to remind anyone else, and anyone who opted out, in its own fixed words", async () => {
+  it("refuses to remind the whole chat, and anyone who opted out, in its own fixed words", async () => {
     const chat = await russianChat();
     const bob = await member(chat, "Bob");
-    const others = await run(chat, bob, "@waggle_test_bot напомни Киту завтра сдать отчёт", { kind: "for_others" });
-    expect(others.sent[0]!.text).toBe("🔒 Напоминаю только тому, кто просит: ни другим людям, ни всему чату.");
-    expect(others.answered).toEqual([]);
-    expect(await requestOf(chat, others.message.message_id)).toMatchObject({ kind: "reminder", status: "refused" });
+    const everyone = await run(chat, bob, "@waggle_test_bot напомни всем завтра про созвон", { kind: "for_everyone" });
+    expect(everyone.sent[0]!.text).toBe("🔒 Всему чату не напоминаю: назови, кому именно, по имени или через @, до трёх человек.");
+    expect(everyone.answered).toEqual([]);
+    expect(await requestOf(chat, everyone.message.message_id)).toMatchObject({ kind: "reminder", status: "refused" });
     await setOptOut(sql, bob.id, true, chat);
     const opted = await run(chat, bob, "@waggle_test_bot напомни через день позвонить в банк", remind("позвонить в банк", { in: [{ amount: 1, unit: "days" }] }));
     expect(opted.sent[0]!.text).toBe("Ничего не поставил: ты просил ничего о тебе не хранить; включить обратно: /me → 🔒");
     expect(await remindersOf(chat)).toEqual([]);
+  });
+
+  it("reminds other members it finds in the chat by name or @username, tagging them there when it is due and nobody privately", async () => {
+    const chat = await russianChat();
+    const bob = { ...(await member(chat, "Bob")), dm_started: true };
+    await sql`UPDATE users SET dm_started = true WHERE id = ${bob.id}`;
+    const olya = await member(chat, "Оля");
+    await sql`UPDATE users SET username = 'olya_test' WHERE id = ${olya.id}`;
+    const hour = { in: [{ amount: 1, unit: "hours" as const }] };
+    const asked = await run(chat, bob, "@waggle_test_bot напомни Оле через час ответить мне", { ...remind("ответить мне", hour), kind: "for_others", for: [{ name: "Оле", ref: "u2" }] });
+    expect(asked.sent[0]!.text).toMatch(/^⏰ Напомню .+ \(по времени чата, Europe\/Warsaw\): «ответить мне»\. Напишу здесь и отмечу: Оля\.$/);
+    expect(asked.lines).toEqual([]);
+    const [forOlya] = await remindersOf(chat);
+    expect(forOlya).toMatchObject({ user_id: bob.id, kind: "remind", text: "ответить мне", for_user_ids: [olya.id], for_asker: false });
+    expect(await requestOf(chat, asked.message.message_id)).toMatchObject({ kind: "reminder", status: "applied" });
+
+    // The reading sees the other members it may pick, by ref; a short form of a name it resolves itself.
+    expect(asked.model.prompts[0]).toContain('<members note="the other members of this chat a reminder may be for">\nu1 Ann\nu2 Оля (@olya_test)\n</members>');
+
+    // By @username, with the asker among them: they are reminded privately too, as of a reminder of their own.
+    const both = await run(chat, bob, "@waggle_test_bot напомни мне и @olya_test через 2 часа про созвон", {
+      ...remind("про созвон", { in: [{ amount: 2, unit: "hours" }] }),
+      kind: "for_others",
+      for: [{ name: "мне", ref: null }, { name: "@olya_test", ref: "u2" }],
+    });
+    expect(both.sent[0]!.text).toMatch(/Напишу здесь и отмечу: тебя, Оля; тебе ещё и в личку\.$/);
+    const [, forBoth] = await remindersOf(chat);
+    expect(forBoth).toMatchObject({ for_user_ids: [olya.id], for_asker: true });
+
+    // Their own list says whom each is for, and the reading sees it too.
+    const listed = await run(chat, bob, "@waggle_test_bot мои напоминания", { kind: "list" });
+    expect(listed.sent[0]!.text.split("\n").slice(1)).toEqual([
+      `1. ${dueLabel(forOlya!.due_at, WARSAW, "Russian")}, для Оля: «ответить мне»`,
+      `2. ${dueLabel(forBoth!.due_at, WARSAW, "Russian")}, для тебя, Оля: «про созвон»`,
+    ]);
+    expect(listed.model.prompts[0]).toMatch(/r1 [^\n]*, reminder for Оля: ответить мне\nr2 [^\n]*, reminder for you, Оля: про созвон/);
+
+    await sql`UPDATE reminders SET due_at = now() - interval '1 minute' WHERE chat_id = ${chat}`;
+    const telegram = deliveryApi();
+    await telegram.deliver();
+    const olyaTag = `<a href="tg://user?id=${olya.tg.id}">Оля</a>`;
+    const inChat = telegram.calls.filter((call) => call.chatId === chat);
+    expect(inChat.map((call) => call.text).sort()).toEqual(
+      [`⏰ ${olyaTag}, Bob просит напомнить: «ответить мне»`, `⏰ <a href="tg://user?id=${bob.tg.id}">Bob</a>, ${olyaTag}, Bob просит напомнить: «про созвон»`].sort(),
+    );
+    expect(inChat.find((call) => call.text.includes("ответить мне"))!.options.reply_parameters).toEqual({ message_id: asked.message.message_id, allow_sending_without_reply: true });
+    // Privately, only the asker, and only of the one they are among; nobody else ever.
+    expect(telegram.calls.filter((call) => call.chatId === bob.tg.id).map((call) => call.text.split("\n")[0])).toEqual(["⏰ Напоминание из «Hive»: «про созвон»"]);
+    expect(telegram.calls.filter((call) => call.chatId === olya.tg.id)).toEqual([]);
+    expect((await remindersOf(chat)).map((reminder) => reminder.status)).toEqual(["sent", "sent"]);
+  });
+
+  it("sets nothing for a name it can't find, one that fits several people, someone it can't remind, or too many people", async () => {
+    const chat = await russianChat();
+    const bob = await member(chat, "Bob");
+    const olya = await member(chat, "Оля");
+    await member(chat, "Катя");
+    await member(chat, "Катя");
+    const hour = remind("сдать отчёт", { in: [{ amount: 1, unit: "hours" }] });
+    const ask = (text: string, names: string[], ref: string | null = null) =>
+      run(chat, bob, `@waggle_test_bot ${text}`, { ...hour, kind: "for_others", for: names.map((name) => ({ name, ref })) });
+    expect((await ask("напомни Киту через час сдать отчёт", ["Киту"])).sent[0]!.text).toBe("Ничего не поставил: не нашёл в чате «Киту»");
+    expect((await ask("напомни Кате через час сдать отчёт", ["Кате"])).sent[0]!.text).toBe("Ничего не поставил: «Кате» — так зовут не одного человека здесь, отметь нужного через @");
+    expect((await ask("напомни ему через час сдать отчёт", ["ему"])).sent[0]!.text).toBe("Ничего не поставил: не понял, кому напомнить: назови по имени или отметь через @");
+    const many = await Promise.all(["Женя", "Вера", "Гоша", "Дина"].map((name) => member(chat, name)));
+    expect((await ask("напомни Жене, Вере, Гоше и Дине через час сдать отчёт", many.map((one) => one.display_name))).sent[0]!.text).toBe(
+      "Ничего не поставил: напоминаю не больше чем 3 людям за раз",
+    );
+    await setOptOut(sql, olya.id, true, chat);
+    // Someone who opted out is told apart by nothing: the reading is never shown them, and no name finds them.
+    const opted = await ask("напомни Оле через час сдать отчёт", ["Оле"]);
+    expect(opted.sent[0]!.text).toBe("Ничего не поставил: не нашёл в чате «Оле»");
+    expect(opted.model.prompts[0]).not.toContain("Оля");
+    // A pick the reading makes for words that name nobody, or for someone it was never shown, finds nobody either.
+    expect((await ask("напомни Киту через час сдать отчёт", ["Киту"], "u1")).sent[0]!.text).toBe("Ничего не поставил: не нашёл в чате «Киту»");
+    expect((await ask("напомни Оле через час сдать отчёт", ["Оле"], "u99")).sent[0]!.text).toBe("Ничего не поставил: не нашёл в чате «Оле»");
+    expect(await remindersOf(chat)).toEqual([]);
+  });
+
+  it("finds a member by the short form of their name, and by words that point at them only when the asker's words name them", async () => {
+    const chat = await russianChat();
+    const bob = await member(chat, "Bob");
+    const alexander = await member(chat, "Alexander");
+    const olya = await member(chat, "Оля");
+    const hour = remind("ответить мне", { in: [{ amount: 1, unit: "hours" }] });
+    const ask = (text: string, name: string, ref: string | null, extra: Partial<Message> = {}) =>
+      run(chat, bob, `@waggle_test_bot ${text}`, { ...hour, kind: "for_others", for: [{ name, ref }] }, extra);
+    // The list the reading sees: Alexander, Ann, Оля, by name.
+    expect((await ask("напомни Саше через час ответить мне", "Саше", "u1")).sent[0]!.text).toMatch(/отмечу: Alexander\.$/);
+    expect((await ask("напомни Саше через час ответить мне", "Саше", null)).sent[0]!.text).toMatch(/отмечу: Alexander\.$/);
+    // «ему» alone names nobody, whatever the reading picked; replying to them, or naming them earlier, it does.
+    expect((await ask("напомни ему через час ответить мне", "ему", "u3")).sent[0]!.text).toBe("Ничего не поставил: не понял, кому напомнить: назови по имени или отметь через @");
+    const theirs = await say(chat, olya, "Отвечу вечером, честно");
+    const reply = { reply_to_message: { ...theirs, from: olya.tg } } as unknown as Partial<Message>;
+    expect((await ask("напомни ей через час ответить мне", "ей", "u3", reply)).sent[0]!.text).toMatch(/отмечу: Оля\.$/);
+    // Replying to them, «ей» means them even when the reading picked nobody, or someone their words never name.
+    expect((await ask("напомни ей через час ответить мне", "ей", null, reply)).sent[0]!.text).toMatch(/отмечу: Оля\.$/);
+    expect((await ask("напомни ей через час ответить мне", "ей", "u2", reply)).sent[0]!.text).toMatch(/отмечу: Оля\.$/);
+    await say(chat, bob, "Саша обещал мне ответ ещё вчера");
+    expect((await ask("напомни ему через час ответить мне", "ему", "u1")).sent[0]!.text).toMatch(/отмечу: Alexander\.$/);
+    expect((await remindersOf(chat)).map((reminder) => reminder.for_user_ids)).toEqual([[alexander.id], [alexander.id], [olya.id], [olya.id], [olya.id], [alexander.id]]);
+  });
+
+  it("takes a member who opts out out of everyone's reminders, and drops one left for nobody", async () => {
+    const chat = await russianChat();
+    const bob = await member(chat, "Bob");
+    const olya = await member(chat, "Оля");
+    const kit = await member(chat, "Кит");
+    const hour = remind("сдать отчёт", { in: [{ amount: 1, unit: "hours" }] });
+    await run(chat, bob, "@waggle_test_bot напомни Оле через час сдать отчёт", { ...hour, kind: "for_others", for: [{ name: "Оле", ref: null }] });
+    await run(chat, bob, "@waggle_test_bot напомни Оле и Киту через час сдать отчёт", { ...hour, kind: "for_others", for: [{ name: "Оле", ref: null }, { name: "Киту", ref: null }] });
+    await setOptOut(sql, olya.id, true, chat);
+    expect((await remindersOf(chat)).map((reminder) => [reminder.status, reminder.for_user_ids])).toEqual([
+      ["cancelled", []],
+      ["pending", [kit.id]],
+    ]);
+    // One that went out meanwhile tags only those still in the chat with their card there.
+    await setOptOut(sql, olya.id, false, chat);
+    await sql`UPDATE reminders SET for_user_ids = ${[olya.id, kit.id]}::int[], due_at = now() - interval '1 minute' WHERE chat_id = ${chat} AND status = 'pending'`;
+    await sql`UPDATE members SET left_at = now() WHERE chat_id = ${chat} AND user_id = ${kit.id}`;
+    const telegram = deliveryApi();
+    await telegram.deliver();
+    expect(telegram.calls.filter((call) => call.chatId === chat).map((call) => call.text)).toEqual([`⏰ <a href="tg://user?id=${olya.tg.id}">Оля</a>, Bob просит напомнить: «сдать отчёт»`]);
   });
 
   it("keeps the limits: no time gone by, none past five years, a text from their words of at most 500 characters, 20 waiting", async () => {

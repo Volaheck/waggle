@@ -16,7 +16,9 @@ import {
 
 /**
  * Delivers the reminders members asked for (src/bot/reminders.ts) once they are due: in their private chat with the
- * bot when they started it there, and in the chat, as a reply to their request that mentions them. Every tick takes the
+ * bot when they started it there, and in the chat, as a reply to their request that mentions them. One for other
+ * members of the chat goes only to the chat, tagging those still in it with their card there (and its asker, when it
+ * is for them too, privately as well); with none of them left and not for its asker, it is dropped. Every tick takes the
  * due ones in one statement, so a reminder is taken once however the ticks run, and takes again what a crash left half
  * sent. Each place is recorded the moment a reminder goes out there and never gets it again; a failure Telegram may get
  * over (the network, a flood wait, its own errors) in either place leaves the reminder for a later tick, after a wait
@@ -74,12 +76,21 @@ async function deliver(deps: MemberRemindersDeps, reminder: MemberReminder): Pro
   // Opting out deletes a member's reminders; one that was on its way meanwhile goes nowhere either.
   if (!to?.tg_id || to.opted_out !== false) return "cancelled";
   const tgId = to.tg_id;
+  // The other members it is for, those still in the chat with their card there: nobody else is ever tagged.
+  const others = reminder.for_user_ids.length
+    ? await sql<{ tg_id: number; display_name: string }[]>`
+        SELECT u.tg_id, u.display_name FROM users u JOIN members m ON m.user_id = u.id AND m.chat_id = ${reminder.chat_id}
+        WHERE u.id = ANY(${reminder.for_user_ids}::int[]) AND u.tg_id IS NOT NULL AND NOT m.opted_out AND m.left_at IS NULL
+        ORDER BY array_position(${reminder.for_user_ids}::int[], u.id)`
+    : [];
+  if (reminder.for_user_ids.length && others.length === 0 && !reminder.for_asker) return "cancelled";
   const lateMs = (deps.now?.() ?? new Date()).getTime() - reminder.due_at.getTime();
   let retry = false;
 
   let dmMsgId = reminder.dm_msg_id;
   let dmError = reminder.dm_error;
-  if (dmMsgId === null && dmError === null && to.dm_started) {
+  // Privately it reminds only its asker, and only of a reminder for them.
+  if (dmMsgId === null && dmError === null && to.dm_started && reminder.for_asker) {
     const outcome = await sendOnce(() =>
       api.sendMessage(
         tgId,
@@ -104,7 +115,17 @@ async function deliver(deps: MemberRemindersDeps, reminder: MemberReminder): Pro
 
   let chatMsgId = reminder.chat_msg_id;
   if (chatMsgId === null && to.chat_status === "approved" && to.left_at === null) {
-    const text = chatReminderText({ tgId, name: to.display_name, text: reminder.text, lateMs, privateMissed: dmMsgId === null && dmError !== null, botUsername: deps.botUsername, language: reminder.language });
+    const text = chatReminderText({
+      tgId,
+      name: to.display_name,
+      text: reminder.text,
+      lateMs,
+      privateMissed: dmMsgId === null && dmError !== null,
+      botUsername: deps.botUsername,
+      language: reminder.language,
+      others: others.map((other) => ({ tgId: other.tg_id, name: other.display_name })),
+      forAsker: reminder.for_asker,
+    });
     const inTopic = reminder.thread_id !== null && reminder.thread_id > 0;
     // Where it was asked: in its topic, as a reply to the request. Messages kept from before a group became a supergroup
     // have ids below zero and nothing to reply to; outside the topic, a reply to the request would go back into it.

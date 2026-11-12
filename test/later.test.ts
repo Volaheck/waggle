@@ -130,7 +130,7 @@ describe("asking the bot to do something later", () => {
 
   it("reads what to do as a field of its own, and nothing that names a person, a chat or a row", () => {
     const when = { words: "через 2 часа", in: [{ amount: 2, unit: "hours" }], date: null, time: null, before: null };
-    const reading = { kind: "later", asks: "через 2 часа поставь мне статус", also_asks: false, text: null, action: "поставь мне статус «в отпуске»", when, ref: null };
+    const reading = { kind: "later", asks: "через 2 часа поставь мне статус", also_asks: false, for: null, text: null, action: "поставь мне статус «в отпуске»", when, ref: null };
     expect(ReminderReadingSchema.safeParse(reading).success).toBe(true);
     expect(ReminderReadingSchema.safeParse({ ...reading, chat_id: -100 }).success).toBe(false);
     expect(ReminderReadingSchema.safeParse({ ...reading, when: { ...when, user_id: 7 } }).success).toBe(false);
@@ -208,7 +208,7 @@ describe.skipIf(!DATABASE_URL)("things members ask the bot to do later", () => {
           if (params.system === REMINDER_SYSTEM_PROMPT) {
             prompts.readings.push(prompt);
             const reading = readings.shift() ?? { kind: "not_a_reminder" };
-            return structured({ asks: reading.kind === "not_a_reminder" ? null : newestOf(prompt), also_asks: false, text: null, action: null, when: noWhen, ref: null, ...reading });
+            return structured({ asks: reading.kind === "not_a_reminder" ? null : newestOf(prompt), also_asks: false, for: null, text: null, action: null, when: noWhen, ref: null, ...reading });
           }
           if (params.system === SELF_EDIT_SYSTEM_PROMPT) {
             prompts.cards.push(prompt);

@@ -36,6 +36,10 @@ export interface MemberReminder {
   reply_to_msg_id: number | null;
   reply_text: string | null;
   reply_author: "bot" | "self" | null;
+  /** The other members of the chat it reminds, tagging them there (migrations/017_reminders_for_others.sql). */
+  for_user_ids: number[];
+  /** Whether it reminds its asker too, in the chat and privately: always, for a reminder with nobody else in it. */
+  for_asker: boolean;
   receipt_msg_id: number | null;
   status: ReminderStatus;
   attempts: number;
@@ -58,6 +62,9 @@ export interface NewReminder {
   threadId: number | null;
   /** The message an action's request replied to; its text only when it is the bot's own or the requester's own. */
   replyTo?: { msgId: number; kept: { text: string; author: "bot" | "self" } | null };
+  /** Other members of the chat to remind, tagging them there, and whether the asker is reminded too. */
+  forUserIds?: number[];
+  forAsker?: boolean;
 }
 
 export type AddedReminder = { status: "added"; reminder: MemberReminder } | { status: "opted_out" } | { status: "too_many" } | { status: "handled_already" };
@@ -89,9 +96,10 @@ export async function addOwnReminder(sql: Sql, subject: Subject, reminder: NewRe
     if (settleAs !== null) await tx`UPDATE self_edits SET kind = ${settleAs}, status = 'applied', decided_at = now() WHERE id = ${requestId}`;
     const replyTo = reminder.replyTo;
     const [row] = await tx<MemberReminder[]>`
-      INSERT INTO reminders (chat_id, user_id, kind, text, due_at, time_zone, language, source_msg_id, thread_id, reply_to_msg_id, reply_text, reply_author)
+      INSERT INTO reminders (chat_id, user_id, kind, text, due_at, time_zone, language, source_msg_id, thread_id, reply_to_msg_id, reply_text, reply_author, for_user_ids, for_asker)
       VALUES (${subject.chatId}, ${subject.userId}, ${kind}, ${reminder.text}, ${reminder.dueAt}, ${reminder.timeZone}, ${reminder.language}, ${reminder.sourceMsgId},
-              ${reminder.threadId}, ${replyTo?.msgId ?? null}, ${replyTo?.kept ? [...replyTo.kept.text].slice(0, MAX_REPLY_CHARS).join("") : null}, ${replyTo?.kept?.author ?? null})
+              ${reminder.threadId}, ${replyTo?.msgId ?? null}, ${replyTo?.kept ? [...replyTo.kept.text].slice(0, MAX_REPLY_CHARS).join("") : null}, ${replyTo?.kept?.author ?? null},
+              ${reminder.forUserIds ?? []}::int[], ${reminder.forAsker ?? true})
       RETURNING *`;
     return { status: "added", reminder: row! };
   });

@@ -109,7 +109,7 @@ const HELP_TEXT = [
   "<b>Chat</b>",
   "/catchup — what you missed (sent to DM; /catchup 12 — last 12 hours)",
   "/chronicle — chronicle: what people talked about",
-  "Mention me with «remind me in 2 months to …» (any language) — I'll remind you here and in DM",
+  "Mention me with «remind me in 2 months to …» (any language) — I'll remind you here and in DM; «remind Kate in an hour to …» — I'll tag them here then",
   "Mention me with «in 2 hours set my tagline to …», «tomorrow at 9 sum up the night» or «on Monday at 9 /top» — I'll do it then, as if you had just asked",
   "Mention me with «don't joke about my weight» or «write to me shorter» (a chat admin: «don't write about politics here») — I'll keep to it in my answers; ↩️ under my receipt or «you can joke about it again» takes it back",
   "",
