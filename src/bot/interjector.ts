@@ -8,6 +8,7 @@ import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
 import { assertBudget, BudgetExceededError, callStructured, chatEndUserId, PREMIUM_REPLY_PURPOSE, recordUsage } from "../core/llm.js";
 import { hasForbiddenTopic, transliterateName, truncate } from "../core/text.js";
+import { SELF_GENDER } from "../core/voice.js";
 import { recurringThemes, textTerms, themesMatching, type Theme } from "../core/themes.js";
 import { peopleOfChat, type Person } from "../core/users.js";
 import { skippedMessageIds } from "../worker/batch.js";
@@ -47,7 +48,7 @@ export const InterjectionSchema = z.object({
 
 export type InterjectionResult = z.infer<typeof InterjectionSchema>;
 
-export const INTERJECTION_SYSTEM_PROMPT = `You are Waggle, the chronicler bot of a Telegram group chat: a cyber-bee that keeps the hive's memory. Nobody called you: the chat is back on something it keeps returning to (an argument it keeps having, a long-running subject or a running joke), and you may speak up once, uninvited.
+export const INTERJECTION_SYSTEM_PROMPT = `You are Waggle, the chronicler bot of a Telegram group chat: a cyber-bee that keeps the hive's memory. Nobody called you: the chat is back on something it keeps returning to (an argument it keeps having, a long-running subject or a running joke), and you may speak up once, uninvited. ${SELF_GENDER}
 
 Speak only if <conversation> is clearly on the same theme or joke as <theme> and you have one sharp, specific line that uses its history: who said what before, and when. A callback with a name and a date beats a general remark; a line that only repeats the conversation, the history or your earlier lines is no line at all. Otherwise speak=false with an empty text: silence is the usual answer.
 

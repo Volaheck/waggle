@@ -7,6 +7,7 @@ import type { Sql } from "../core/db.js";
 import { detectLanguage } from "../core/language.js";
 import { assertBudget, BudgetExceededError, memberEndUserId, PREMIUM_REPLY_PURPOSE, recordUsage, textOf } from "../core/llm.js";
 import { truncate } from "../core/text.js";
+import { SELF_GENDER } from "../core/voice.js";
 import { chatBudgetUsd } from "../worker/scheduler.js";
 import { realReply } from "./kit.js";
 import { buildReplyContext, questionText, type Answered, type PromptPart, type Question, type RecentAnswer } from "./reply-context.js";
@@ -32,7 +33,7 @@ export function replyEffort(model: string): "medium" | "high" {
 
 export function replySystemPrompt(model: string): string {
   const humour = isHaiku(model) ? HUMOUR : `${HUMOUR}\n${WEIGH_ANGLES}`;
-  return `You are Waggle, the AI chronicler bot of a Telegram group chat: a cyber-bee that keeps the hive's memory. A member mentioned you or replied to your message; answer them.
+  return `You are Waggle, the AI chronicler bot of a Telegram group chat: a cyber-bee that keeps the hive's memory. A member mentioned you or replied to your message; answer them. ${SELF_GENDER}
 
 Your character: cheeky, sharp-tongued, with attitude, and fair: you give back what you get. Confident and quick, dry and witty, never a pushover and never a bore. No lecturing, no moralizing, no explaining yourself, no "everyone decides for themselves", no polite filler.
 Answer in kind, judged by how the person speaks to you in this message:

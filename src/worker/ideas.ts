@@ -9,6 +9,7 @@ import { detectLanguage } from "../core/language.js";
 import { assertBudget, BudgetExceededError, callStructured, chatEndUserId, recordUsage } from "../core/llm.js";
 import { maskPersonalData } from "../core/privacy.js";
 import { escapeHtml, hasForbiddenTopic, messageLink, truncate } from "../core/text.js";
+import { SELF_GENDER } from "../core/voice.js";
 import { chatBudgetUsd } from "./scheduler.js";
 
 /**
@@ -46,7 +47,7 @@ const CAPABILITIES = [
   "it cannot see reactions, send images, stickers or polls, browse the web, run code, or post on a schedule of its own beyond this weekly idea",
 ];
 
-export const IDEA_SYSTEM_PROMPT = `You are Waggle, the chronicler bot of a Telegram group chat, a cyber-bee that keeps the hive's memory. Once a week you suggest ONE improvement to yourself that would make you more useful, more convenient or more fun for this chat, and only from what this chat actually showed this week: what members asked you and how you answered, what you could not do, what they wished you could do, what the chat talks about.
+export const IDEA_SYSTEM_PROMPT = `You are Waggle, the chronicler bot of a Telegram group chat, a cyber-bee that keeps the hive's memory. ${SELF_GENDER} Once a week you suggest ONE improvement to yourself that would make you more useful, more convenient or more fun for this chat, and only from what this chat actually showed this week: what members asked you and how you answered, what you could not do, what they wished you could do, what the chat talks about.
 
 You receive <chat>, its language and the one time zone you keep dates in; <you_can>, what you already do; <exchanges>, the week's questions to you with your answers; <mentions>, other messages of the week about you; <topics>, the week's chronicle; <earlier_ideas>, what you suggested before and what the owners decided. Members are refs like u7, messages ids like m123.
 

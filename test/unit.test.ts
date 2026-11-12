@@ -4,6 +4,9 @@ import { catchupHtml, clampTelegram } from "../src/bot/format.js";
 import { extractUrls, hasForbiddenTopic, messageLink, nameKey, normalizeUrl, normalizeValue, slugify, truncate } from "../src/core/text.js";
 import { rankCards } from "../src/core/merge.js";
 import { assistantNote, replyEffort, replySystemPrompt, squeezedOut } from "../src/bot/assistant.js";
+import { INTERJECTION_SYSTEM_PROMPT } from "../src/bot/interjector.js";
+import { SELF_GENDER } from "../src/core/voice.js";
+import { IDEA_SYSTEM_PROMPT } from "../src/worker/ideas.js";
 import { buildExtractionPrompt, EXTRACTION_SYSTEM_PROMPT, isPassDue, passDueAt } from "../src/worker/extract.js";
 import { CONSOLIDATION_SYSTEM_PROMPT } from "../src/worker/consolidate.js";
 import { NOTES_SYSTEM_PROMPT, namesForRefs } from "../src/worker/notes-extract.js";
@@ -358,6 +361,12 @@ describe("masking personal data before a prompt", () => {
 });
 
 describe("answer prompt", () => {
+  it("has the bot speak of itself in the masculine wherever it writes in its own voice", () => {
+    for (const prompt of [replySystemPrompt("claude-haiku-5-5"), replySystemPrompt("claude-opus-5-5"), INTERJECTION_SYSTEM_PROMPT, IDEA_SYSTEM_PROMPT]) {
+      expect(prompt).toContain(SELF_GENDER);
+    }
+  });
+
   it("has only the larger models weigh several angles first, and runs Opus at the effort it was tested with", () => {
     expect(replySystemPrompt("claude-haiku-5-5")).not.toContain("draft three different angles");
     expect(replySystemPrompt("claude-sonnet-5-5")).toContain("draft three different angles");
