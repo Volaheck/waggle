@@ -167,7 +167,7 @@ describe("a reminder's words", () => {
 
   it("takes no field that names a person, a chat or a row", () => {
     const when = { words: "завтра в 10", in: null, date: "2026-11-13", time: "10:00", before: null };
-    const reading = { kind: "remind", asks: "напомни", also_asks: false, text: "позвонить в банк", when, ref: null };
+    const reading = { kind: "remind", asks: "напомни", also_asks: false, text: "позвонить в банк", action: null, when, ref: null };
     expect(ReminderReadingSchema.safeParse(reading).success).toBe(true);
     expect(ReminderReadingSchema.safeParse({ ...reading, user_id: 7 }).success).toBe(false);
     expect(ReminderReadingSchema.safeParse({ ...reading, when: { ...when, chat_id: -100 } }).success).toBe(false);
@@ -207,7 +207,7 @@ describe("a reminder's words", () => {
     const prompt = reminderPrompt({ words, replyTo: { author: "member", text: "релиз в пятницу", original: "релиз в пятницу", at: new Date("2026-11-12T09:00:00Z") }, pending, zone: JAKARTA, now });
     expect(prompt).toContain("<their_words>\n- напомни мне это через неделю\n</their_words>");
     expect(prompt).toContain('<they_reply_to from="another member" written="2026-11-12 Thu 16:00">\nрелиз в пятницу\n</they_reply_to>');
-    expect(prompt).toContain("r1 2026-11-20 Fri 16:00: позвонить в банк срочно");
+    expect(prompt).toContain("r1 2026-11-20 Fri 16:00, reminder: позвонить в банк срочно");
     expect(prompt).toContain("<now>2026-11-12 Thu 17:00, Asia/Jakarta</now>");
     expect(prompt).toContain("2026-11-13 Fri (tomorrow)");
     expect(prompt).not.toContain("(past)");
@@ -307,7 +307,7 @@ describe.skipIf(!DATABASE_URL)("reminders members ask for", () => {
           const payload =
             "card" in result
               ? { ...result.card, asks: asked }
-              : { asks: result.kind === "not_a_reminder" ? null : asked, also_asks: false, text: null, when: { words: null, in: null, date: null, time: null, before: null }, ref: null, ...result };
+              : { asks: result.kind === "not_a_reminder" ? null : asked, also_asks: false, text: null, action: null, when: { words: null, in: null, date: null, time: null, before: null }, ref: null, ...result };
           const message = { stop_reason: "end_turn", stop_details: null, content: [{ type: "text", text: JSON.stringify(payload) }], usage: { input_tokens: 600, output_tokens: 60 } };
           return { currentMessage: message, finalMessage: async () => message };
         },
@@ -501,7 +501,7 @@ describe.skipIf(!DATABASE_URL)("reminders members ask for", () => {
 
     // Someone else's request reaches only their own reminders, whatever it names.
     const stranger = await run(chat, kit, "@waggle_test_bot отмени напоминание Боба про банк", { kind: "cancel", ref: "r1" });
-    expect(stranger.sent[0]!.text).toBe("Отменять нечего: напоминаний здесь у тебя нет.");
+    expect(stranger.sent[0]!.text).toBe("Отменять нечего: ни напоминаний, ни отложенных дел здесь у тебя нет.");
     expect((await reminderRow(call!.id)).status).toBe("pending");
 
     const cancelled = await run(chat, bob, "@waggle_test_bot отмени напоминание про банк", { kind: "cancel", ref: "r1" });
@@ -511,7 +511,7 @@ describe.skipIf(!DATABASE_URL)("reminders members ask for", () => {
 
     // Nothing tells which: the list comes with its buttons.
     const unsure = await run(chat, bob, "@waggle_test_bot отмени напоминание", { kind: "cancel", ref: "r7" });
-    expect(unsure.sent[0]!.text.split("\n")[0]).toBe("Какое отменить? Нажми ✖️ с его номером.");
+    expect(unsure.sent[0]!.text.split("\n")[0]).toBe("Что отменить? Нажми ✖️ с его номером.");
     expect(unsure.sent[0]!.markup!.inline_keyboard).toEqual([[{ text: "✖️ 1", callback_data: `rm:cancel:${check!.id}` }]]);
 
     // A reply to a reminder's receipt is about that reminder.
@@ -550,7 +550,7 @@ describe.skipIf(!DATABASE_URL)("reminders members ask for", () => {
       await sql`INSERT INTO reminders (chat_id, user_id, text, due_at, time_zone, source_msg_id) VALUES (${chat}, ${bob.id}, ${`дело ${index}`}, now() + interval '1 day', ${WARSAW}, ${index + 1})`;
     }
     const full = await run(chat, bob, "@waggle_test_bot напомни через день позвонить в банк", remind("позвонить в банк", { in: [{ amount: 1, unit: "days" }] }));
-    expect(full.sent[0]!.text).toBe("Ничего не поставил: у тебя здесь уже 20 напоминаний, сначала отмени ненужные");
+    expect(full.sent[0]!.text).toBe("Ничего не поставил: у тебя здесь уже 20 напоминаний и отложенных дел, сначала отмени ненужные");
     expect(await remindersOf(chat)).toHaveLength(20);
   });
 
@@ -593,10 +593,12 @@ describe.skipIf(!DATABASE_URL)("reminders members ask for", () => {
     expect((await remindersOf(chat)).map((reminder) => reminder.text)).toEqual(["позвонить в банк"]);
     expect(answered.sent[0]!.text).toMatch(/^⏰ Напомню /);
 
-    // The same words in reply to any other message of the bot's are not read for a reminder.
+    // The same words in reply to any other message of the bot's answer none of its questions: they say when, so they are
+    // read for something to do later, and a reminder read from them is turned down without a reminder word of their own.
     const elsewhere = { reply_to_message: { message_id: ++nextBotMsgId, date: 0, chat: { id: chat, type: "supergroup", title: "Hive" }, from: me, text: "Как дела?" } } as unknown as Partial<Message>;
     const other = await run(chat, bob, "завтра в 10", remind("позвонить в банк", { date: tomorrow, time: "10:00" }, { asks: "завтра в 10" }), elsewhere);
-    expect(other.model.prompts).toEqual([]);
+    expect(other.model.prompts[0]).not.toContain("<you_asked_them>");
+    expect(other.sent).toEqual([]);
     expect(await remindersOf(chat)).toHaveLength(1);
   });
 
@@ -836,7 +838,7 @@ describe.skipIf(!DATABASE_URL)("reminders members ask for", () => {
     // A reply to a receipt that names another reminder is asked about; one that names none cancels the receipt's own,
     // whatever the reading picked; and once that one is gone, it says so rather than cancel another.
     const crossed = await run(chat, bob, "@waggle_test_bot отмени напоминание про банк", { kind: "cancel", ref: "r1" }, toReceipt(release.sent[0]!.messageId));
-    expect(crossed.sent[0]!.text.split("\n")[0]).toBe("Какое отменить? Нажми ✖️ с его номером.");
+    expect(crossed.sent[0]!.text.split("\n")[0]).toBe("Что отменить? Нажми ✖️ с его номером.");
     const pointed = await run(chat, bob, "@waggle_test_bot отмени это напоминание", { kind: "cancel", ref: "r1" }, toReceipt(release.sent[0]!.messageId));
     expect(pointed.sent[0]!.text).toBe(`✖️ Отменил напоминание на ${dueLabel(check!.due_at, WARSAW, "Russian")}: «проверить релиз».`);
     const again = await run(chat, bob, "@waggle_test_bot отмени это напоминание", { kind: "cancel", ref: "r1" }, toReceipt(release.sent[0]!.messageId));
@@ -847,7 +849,7 @@ describe.skipIf(!DATABASE_URL)("reminders members ask for", () => {
     await sql`UPDATE reminders SET status = 'sent', sent_at = now() WHERE id = ${bank!.id}`;
     const second = await run(chat, bob, "@waggle_test_bot отмени второе напоминание", { kind: "cancel", ref: "r2" });
     expect(second.sent[0]!.text.split("\n")).toEqual([
-      "Какое отменить? Нажми ✖️ с его номером.",
+      "Что отменить? Нажми ✖️ с его номером.",
       `1. ${dueLabel(domain!.due_at, WARSAW, "Russian")}: «продлить домен»`,
       `2. ${dueLabel(tickets!.due_at, WARSAW, "Russian")}: «купить билеты»`,
     ]);
@@ -891,7 +893,7 @@ describe.skipIf(!DATABASE_URL)("reminders members ask for", () => {
     expect(await sql`SELECT text FROM memos WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toEqual([{ text: "напомнить себе продлить домен" }]);
     // …and a question with a reminder word is answered as one, told only that a reminder, if it asked for one, was not set.
     const question = await run(chat, bob, "@waggle_test_bot напомни, о чём мы вчера говорили?", new Error("overloaded"));
-    expect(question.lines).toEqual([expect.stringMatching(/^if the message asks to be reminded of something, no reminder was set: .*answer it as usual and leave reminders out$/)]);
+    expect(question.lines).toEqual([expect.stringMatching(/^if the message asks to be reminded of something or for something to be done later, no reminder was set .*answer it as usual and leave reminders out$/)]);
     expect(await requestOf(chat, question.message.message_id)).toMatchObject({ kind: "not_a_request", status: "answered" });
   });
 

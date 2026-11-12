@@ -1,8 +1,18 @@
 import { GrammyError, type Api } from "grammy";
+import { topicGone, type Performed } from "../bot/later.js";
 import { chatReminderText, privateReminderText } from "../bot/reminders.js";
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
-import { claimDueReminders, clearFinishedReminders, finishReminder, recordDelivery, releaseReminders, type MemberReminder, type ReminderStatus } from "../core/member-reminders.js";
+import {
+  claimDueReminders,
+  clearFinishedReminders,
+  executionStarted,
+  finishReminder,
+  recordDelivery,
+  releaseReminders,
+  type MemberReminder,
+  type ReminderStatus,
+} from "../core/member-reminders.js";
 
 /**
  * Delivers the reminders members asked for (src/bot/reminders.ts) once they are due: in their private chat with the
@@ -12,7 +22,8 @@ import { claimDueReminders, clearFinishedReminders, finishReminder, recordDelive
  * over (the network, a flood wait, its own errors) in either place leaves the reminder for a later tick, after a wait
  * that doubles with every try (src/core/member-reminders.ts), which tries only the place still missing: MAX_ATTEMPTS
  * tries in all, some three hours of them. A reminder counts as sent once either place took it, and its receipt loses
- * the cancel button then.
+ * the cancel button then. What a member asked the bot to do later is handed to `perform` (src/bot/later.ts) when it is
+ * due, which does it at most once, and is finished the same way; without `perform` it waits.
  */
 
 const TICK_MS = 30_000;
@@ -28,6 +39,8 @@ export interface MemberRemindersDeps {
   botUsername: string;
   /** Finished reminders are deleted as long after they finished as the chat keeps message texts. */
   config: Pick<Config, "MESSAGE_RETENTION_DAYS">;
+  /** Does what a member asked the bot to do later, as if they had just asked (src/bot/later.ts). */
+  perform?: (reminder: MemberReminder) => Promise<Performed>;
   log?: (line: string) => void;
   now?: () => Date;
 }
@@ -45,7 +58,7 @@ interface Recipient {
 /** A failure Telegram may get over: the network, a flood wait, an error on its side. */
 const passing = (error: unknown) => !(error instanceof GrammyError) || error.error_code === 429 || error.error_code >= 500;
 /** The forum topic the request was asked in is gone or closed: the chat still takes the reminder outside it. */
-const topicGone = (error: unknown) => error instanceof GrammyError && error.error_code === 400 && /thread|topic/i.test(error.description);
+const outsideTopic = (error: unknown) => error instanceof GrammyError && topicGone(error.error_code, error.description);
 const describe = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 async function deliver(deps: MemberRemindersDeps, reminder: MemberReminder): Promise<Exclude<ReminderStatus, "sending">> {
@@ -105,7 +118,7 @@ async function deliver(deps: MemberRemindersDeps, reminder: MemberReminder): Pro
         }),
       );
     let outcome = await send(true);
-    if ("error" in outcome && inTopic && topicGone(outcome.error)) {
+    if ("error" in outcome && inTopic && outsideTopic(outcome.error)) {
       log(`[reminder delivery] reminder ${reminder.id}: its topic did not take it (${describe(outcome.error)}); posting it outside the topic`);
       outcome = await send(false);
     }
@@ -121,6 +134,16 @@ async function deliver(deps: MemberRemindersDeps, reminder: MemberReminder): Pro
   // The place that missed it gets another try while tries are left; the one that took it is never tried again.
   if (retry && reminder.attempts < MAX_ATTEMPTS) return "pending";
   return chatMsgId !== null || dmMsgId !== null ? "sent" : "failed";
+}
+
+/**
+ * Has an action done, once. One Telegram could not be asked about by its last try is given up, and so is one that failed
+ * on the bot's side try after try, unless it was started by then.
+ */
+async function performOnce(deps: MemberRemindersDeps, perform: NonNullable<MemberRemindersDeps["perform"]>, reminder: MemberReminder): Promise<Exclude<ReminderStatus, "sending">> {
+  if (reminder.attempts > MAX_ATTEMPTS) return (await executionStarted(deps.sql, reminder)) ? "sent" : "failed";
+  const performed = await perform(reminder);
+  return performed === "pending" && reminder.attempts >= MAX_ATTEMPTS ? "failed" : performed;
 }
 
 /** A sent reminder's receipt keeps its text and loses its cancel button, which would only say it is too late. */
@@ -142,14 +165,14 @@ async function sendOnce(send: () => Promise<{ message_id: number }>): Promise<{ 
 export async function deliverDueReminders(deps: MemberRemindersDeps, stopping: () => boolean = () => false): Promise<Record<Exclude<ReminderStatus, "sending">, number>> {
   const log = deps.log ?? ((line: string) => console.log(line));
   const counts = { pending: 0, sent: 0, cancelled: 0, failed: 0 };
-  const claimed = await claimDueReminders(deps.sql, BATCH, STALE_MINUTES);
+  const claimed = await claimDueReminders(deps.sql, BATCH, STALE_MINUTES, deps.perform ? ["remind", "action"] : ["remind"]);
   for (const [index, reminder] of claimed.entries()) {
     if (stopping()) {
       await releaseReminders(deps.sql, claimed.slice(index).map((left) => left.id));
       break;
     }
     // A failure here (the database, say) leaves the reminder sending, and the next ticks take it again after STALE_MINUTES.
-    const status = await deliver(deps, reminder).catch((error: unknown) => {
+    const status = await (reminder.kind === "action" && deps.perform ? performOnce(deps, deps.perform, reminder) : deliver(deps, reminder)).catch((error: unknown) => {
       log(`[reminder delivery] reminder ${reminder.id} failed on the bot's side: ${describe(error)}`);
       return undefined;
     });
@@ -157,7 +180,7 @@ export async function deliverDueReminders(deps: MemberRemindersDeps, stopping: (
     await finishReminder(deps.sql, reminder.id, status);
     if (status === "sent") await retireReceipt(deps.api, reminder);
     counts[status] += 1;
-    if (status === "failed") log(`[reminder delivery] reminder ${reminder.id} could not be delivered after ${reminder.attempts} attempt(s)`);
+    if (status === "failed") log(`[reminder delivery] reminder ${reminder.id} could not be ${reminder.kind === "action" ? "done" : "delivered"} after ${reminder.attempts} attempt(s)`);
   }
   return counts;
 }

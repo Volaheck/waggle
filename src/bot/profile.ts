@@ -56,7 +56,7 @@ const KIND_PROMPTS: Record<FactKind, string> = {
   project: "Describe the project in a few words",
 };
 
-/** How much of each reminder «What do you know about me» shows: twenty of them still fit one message. */
+/** How much of each reminder or thing to do later «What do you know about me» shows: twenty of them still fit one message. */
 const REMINDER_SHOWN_CHARS = 120;
 
 /** Buttons are made for one chat and carry it («me:c100123:privacy»), so a tap acts there whatever chat is current. */
@@ -226,7 +226,11 @@ export function registerProfile(kit: BotKit): ProfileHandlers {
         ? ["", "<b>Your notes</b>:", ...memos.map((memo) => `📝 ${escapeHtml(memo.text)}${memo.project_name ? ` <i>— on ${escapeHtml(memo.project_name)}</i>` : ""}`)]
         : []),
       ...(reminders.length
-        ? ["", "<b>Your reminders</b> (✖️ under a receipt cancels one):", ...reminders.map((reminder) => `⏰ ${escapeHtml(dueLabel(reminder.due_at, clock.zone, "English"))}: ${escapeHtml(truncate(reminder.text, REMINDER_SHOWN_CHARS))}`)]
+        ? [
+            "",
+            "<b>Your reminders and things to do later</b> (✖️ under a receipt cancels one):",
+            ...reminders.map((reminder) => `${reminder.kind === "action" ? "⏳" : "⏰"} ${escapeHtml(dueLabel(reminder.due_at, clock.zone, "English"))}: ${escapeHtml(truncate(reminder.text, REMINDER_SHOWN_CHARS))}`),
+          ]
         : []),
       "",
       `Message texts are kept for ${retention} for the chronicle and /catchup, then deleted once the chronicler has gone through them. To delete everything about you in all chats — /forgetme.`,

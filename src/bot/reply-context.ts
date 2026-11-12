@@ -48,6 +48,11 @@ export interface Question {
   me: UserFromGetMe;
   /** What the sender's own request in this message just changed on their card (src/bot/self-edits.ts). */
   cardChange?: string;
+  /**
+   * A request they made earlier for now, done at its time (src/bot/later.ts): the message is its words again, as theirs,
+   * under the id of the message that asked for it.
+   */
+  scheduled?: { reminderId: number; askedAt: Date };
 }
 
 /** The answer the bot posted to a question, or null when it posted none (a refusal, a limit, a failure). */
@@ -399,7 +404,7 @@ export function aboutYouBlock(input: {
     "<about_you>",
     `You are ${safe(me.first_name)} (@${me.username}), the chat's chronicler bot; this answer is written by ${input.model}.`,
     owners.length ? `Your ${owners.length > 1 ? "owners, who built you and pay" : "owner, who built you and pays"} for you: ${owners.join("; ")}.` : "",
-    "You read the chat and keep the members' cards, the project catalog with its rating and the chronicle, and you answer when someone mentions you or replies to you. A member changes their own card, tagline, time zone, names and notes (about themselves or on a project of theirs) by asking you plainly in the chat: you do it and post a receipt with ↩️ Undo, and ↪️ Redo after an Undo; the Mini App (/app) does the same. A member asks you to remind them of something later the same way: you post a receipt with ✖️ Cancel and, when it is due, write to them in the chat and in a private message; only ever the person who asks, and once, never on repeat. Nobody changes anyone else's data, a project's catalog entry, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets. /forgetme erases what you know about a person.",
+    "You read the chat and keep the members' cards, the project catalog with its rating and the chronicle, and you answer when someone mentions you or replies to you. A member changes their own card, tagline, time zone, names and notes (about themselves or on a project of theirs) by asking you plainly in the chat: you do it and post a receipt with ↩️ Undo, and ↪️ Redo after an Undo; the Mini App (/app) does the same. A member asks you to remind them of something later the same way: you post a receipt with ✖️ Cancel and, when it is due, write to them in the chat and in a private message; only ever the person who asks, and once, never on repeat. They also ask you to do, at a later time, anything you do when asked (an answer, a summary of the chat, a change to their card or notes, a reminder, a /command): you post a receipt with ✖️ Cancel and at that time do it as if they had just asked, once. Nobody changes anyone else's data, a project's catalog entry, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets. /forgetme erases what you know about a person.",
     entry
       ? `In the catalog you are the project ${safe(entry.project.name)}: #${entry.rank} of ${entry.total}, ${entry.project.score} rating points, ${entry.project.votes} vote(s).`
       : "",
@@ -741,6 +746,12 @@ export function localTimesBlock(focus: { person: Person; reason: FocusReason }[]
   return `<local_times note="the time now by each one's own clock; the days and times people write («завтра», «вечером», «в 10») are theirs">\n${[chat, ...people].join("\n")}\n</local_times>`;
 }
 
+/** When they asked for what is done now, by their own clock: «Thu 12 Nov 2026, 21:30». */
+export function askedEarlierBlock(askedAt: Date, zone: string): string {
+  const when = `${localDay(askedAt, zone)} ${isoDayIn(askedAt, zone).slice(0, 4)}, ${localTimeOf(askedAt, zone)}`;
+  return `<asked_earlier note="this question is a request they made earlier, to be done now">they asked for it on ${when}, ${zoneLabel(zone)}, to be done now: do it now as asked</asked_earlier>`;
+}
+
 /**
  * Everything the app knows about the chat, as the reply prompt's data: the chat's memory first, the same for every
  * question, then what the chronicler has not processed yet, then all that depends on the question.
@@ -748,6 +759,9 @@ export function localTimesBlock(focus: { person: Person; reason: FocusReason }[]
 export async function buildReplyContext(sql: Sql, question: Question, options: ReplyContextOptions): Promise<PromptPart[]> {
   const { chatId, message, me } = question;
   const now = new Date();
+  // The messages before the question are the ones before it was asked; for something asked for earlier and done now,
+  // every message up to now, so it sees what was written after it was asked.
+  const before = question.scheduled ? Number.MAX_SAFE_INTEGER : message.message_id;
   const clock: Clock = { timezone: options.timezone, today: dayOf(now, options.timezone) };
   const asked = questionText(message, me);
   const aboutConversation = refersToConversation(asked);
@@ -769,7 +783,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     sql<ContextMessage[]>`
       SELECT ${sql.unsafe(MESSAGE_COLUMNS)}
       FROM messages m LEFT JOIN users u ON u.id = m.user_id
-      WHERE m.chat_id = ${chatId} AND m.msg_id < ${message.message_id} AND m.msg_id <> ALL(${skipped}::bigint[])
+      WHERE m.chat_id = ${chatId} AND m.msg_id < ${before} AND m.msg_id <> ALL(${skipped}::bigint[])
         AND (btrim(m.text) <> '' OR m.media_type IS NOT NULL)
       ORDER BY m.msg_id DESC LIMIT ${aboutConversation ? SEGMENT_MESSAGES : CONTEXT_MESSAGES}`,
     // Enough of the newest waiting messages to fill the window before the latest ones. Only those since the last pass:
@@ -779,7 +793,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
       SELECT * FROM (
         SELECT ${sql.unsafe(MESSAGE_COLUMNS)}, (row_number() OVER (ORDER BY m.msg_id) - 1)::int AS position
         FROM messages m LEFT JOIN users u ON u.id = m.user_id
-        WHERE m.chat_id = ${chatId} AND m.extracted_at IS NULL AND m.msg_id < ${message.message_id}
+        WHERE m.chat_id = ${chatId} AND m.extracted_at IS NULL AND m.msg_id < ${before}
           AND m.msg_id > (SELECT coalesce(max(last_msg_id), 0) FROM extraction_runs WHERE chat_id = ${chatId} AND status = 'done')
           AND m.msg_id <> ALL(${skipped}::bigint[]) AND btrim(m.text) <> ''
           AND NOT EXISTS (SELECT 1 FROM members mb WHERE mb.chat_id = m.chat_id AND mb.user_id = m.user_id AND mb.opted_out)
@@ -817,7 +831,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   const parentStored = replied ? chain.some((row) => row.msg_id === replied.message_id) : false;
   const conversation = aboutConversation ? currentSegment(latest) : [...latest].reverse();
   // The window ends where the latest 30 begin in either mode, so a referee's question reuses the same cached chunks.
-  const latestFrom = (latest[CONTEXT_MESSAGES - 1] ?? latest.at(-1))?.msg_id ?? message.message_id;
+  const latestFrom = (latest[CONTEXT_MESSAGES - 1] ?? latest.at(-1))?.msg_id ?? before;
   const earlier = earlierParts(earlierWindow(waiting.filter((row) => row.msg_id < latestFrom).reverse()), clock);
 
   // The people this question is about: who asks, whose message it answers, and whoever it or its thread names.
@@ -1057,8 +1071,9 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     // A message of the bot's from before it kept its own messages: Telegram's copy stands in.
     repliedToBot && unstoredParent ? `<your_message_they_reply_to>\n${line(unstoredParent, 1500)}\n</your_message_they_reply_to>` : "",
     question.cardChange
-      ? `<card_change note="what the bot did about this message's request to change the sender's card or to remind them of something; its reply already said it">${line(question.cardChange, 600)}</card_change>`
+      ? `<card_change note="what the bot did about this message's request to change the sender's card, to remind them of something or to do something for them later; its reply already said it">${line(question.cardChange, 600)}</card_change>`
       : "",
+    question.scheduled ? askedEarlierBlock(question.scheduled.askedAt, (asker && clocks.get(asker.id)?.zone) || options.timezone) : "",
     worn.length ? `<worn_out note="what your own answers kept coming back to lately: leave it out">${worn.map(safe).join(", ")}</worn_out>` : "",
     `<if_insulted motif="${options.insultMotif}" />`,
     // Right before the question, where a smaller model still has it in mind: the tone of the answer follows this message.

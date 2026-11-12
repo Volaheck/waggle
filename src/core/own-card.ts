@@ -198,6 +198,28 @@ export function drawnFrom(value: string, source: string): boolean {
   });
 }
 
+/**
+ * Whether `value` is copied from `source`: a run of the source's own words, in their order and in some form («удалить»
+ * for «удали»), with nothing left out of its middle but words `spare` lets go (the words that say when, say), and with
+ * no negation lost or added: a word has a negation among the two words before it in both or in neither («не ставь», «не
+ * надо ставить» never become «ставь»). What someone asks to be done is copied from their words, never reworded.
+ */
+export function copiedFrom(value: string, source: string, spare: (word: string) => boolean = () => false): boolean {
+  const words = wordsWithNegation(foldMixedScript(value)).map(({ word }) => word);
+  const said = wordsWithNegation(foldMixedScript(source)).map(({ word }) => word);
+  const negatedAt = (text: string[], index: number) => text.slice(Math.max(0, index - 2), index).some((word) => NEGATIONS.has(word));
+  const same = (index: number, at: number) => sameStem(words[index]!, said[at]!) && negatedAt(words, index) === negatedAt(said, at);
+  if (words.length === 0) return false;
+  return said.some((_, start) => {
+    let index = 0;
+    for (let at = start; at < said.length && index < words.length; at += 1) {
+      if (same(index, at)) index += 1;
+      else if (index === 0 || !spare(said[at]!)) return false;
+    }
+    return index === words.length;
+  });
+}
+
 /** Two forms of one word: the same, or differing only in a short ending («делаем», «делаете»). */
 function sameStem(one: string, other: string): boolean {
   if (one === other) return true;

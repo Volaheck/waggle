@@ -1,6 +1,6 @@
 import type Anthropic from "@anthropic-ai/sdk";
-import { Bot, GrammyError, InlineKeyboard, type Transformer } from "grammy";
-import type { Message, User as TelegramUser } from "grammy/types";
+import { Api, Bot, BotError, GrammyError, InlineKeyboard, type Transformer } from "grammy";
+import type { Message, Update, User as TelegramUser } from "grammy/types";
 import { migrateChat } from "../core/chat-migration.js";
 import {
   allChats,
@@ -21,6 +21,7 @@ import {
 import type { Config } from "../core/config.js";
 import type { Sql } from "../core/db.js";
 import { chatEndUserId, monthSpendUsd, PREMIUM_REPLY_PURPOSE, recordUsage } from "../core/llm.js";
+import type { MemberReminder } from "../core/member-reminders.js";
 import { mergeSeedUser, rankCards, unlinkedCards, type UnlinkedCard } from "../core/merge.js";
 import { saveMessage, updateEditedMessage } from "../core/messages.js";
 import { catchupFor } from "../core/chronicle.js";
@@ -41,6 +42,7 @@ import { createAssistant, isAddressedToBot, repliesSpendUsd, type Assistant, typ
 import { registerReminders } from "./reminders.js";
 import { createSelfEdits, registerSelfEdits, type SelfEdits } from "./self-edits.js";
 import { createInterjector, type Interjector } from "./interjector.js";
+import { createPerformer, topicGone, type Performed, type Replay } from "./later.js";
 import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
 import { isInChat, MembershipCache } from "./membership.js";
 import { registerNotes } from "./notes.js";
@@ -107,6 +109,7 @@ const HELP_TEXT = [
   "/catchup — what you missed (sent to DM; /catchup 12 — last 12 hours)",
   "/chronicle — chronicle: what people talked about",
   "Mention me with «remind me in 2 months to …» (any language) — I'll remind you here and in DM",
+  "Mention me with «in 2 hours set my tagline to …», «tomorrow at 9 sum up the night» or «on Monday at 9 /top» — I'll do it then, as if you had just asked",
   "",
   "<b>Privacy</b>",
   "/whatyouknow — everything I know about you · /forgetme — delete it",
@@ -173,6 +176,56 @@ const CARD_OFFERS_PER_CHAT_PER_DAY = 10;
 
 const CHAT_LABELS: Record<string, string> = { pending: "⏳ pending", approved: "✅ active", rejected: "🚫 rejected", left: "👋 left" };
 
+/** Calls that delete, edit, pin or react to a message: none of them may touch the request a later action came from. */
+const MESSAGE_CHANGES = new Set([
+  "deleteMessage",
+  "deleteMessages",
+  "editMessageText",
+  "editMessageCaption",
+  "editMessageMedia",
+  "editMessageReplyMarkup",
+  "editMessageLiveLocation",
+  "stopMessageLiveLocation",
+  "stopPoll",
+  "setMessageReaction",
+  "pinChatMessage",
+  "unpinChatMessage",
+]);
+
+/** Turns down, as Telegram turns down a bad request, every call that would change the message a later action was asked in. */
+function sparing(replay: Replay): Transformer {
+  return (prev, method, payload, signal) => {
+    const call = payload as { chat_id?: unknown; message_id?: unknown; message_ids?: unknown };
+    const touches =
+      MESSAGE_CHANGES.has(method) && call.chat_id === replay.chatId && (call.message_id === replay.msgId || (Array.isArray(call.message_ids) && call.message_ids.includes(replay.msgId)));
+    if (!touches) return prev(method, payload, signal);
+    return Promise.resolve({ ok: false as const, error_code: 400, description: "Bad Request: the message a later action was asked in stays as it is" });
+  };
+}
+
+/**
+ * What a later action posts into the forum topic it was asked in goes outside it, as a message of its own, once Telegram
+ * turns it down there (the topic closed or deleted since), as a reminder does. The bot still keeps it as its reply to
+ * the message it answered, so the requester's /forgetme blanks it with their messages.
+ */
+function outsideGoneTopic(sql: Sql, replay: Replay): Transformer {
+  return async (prev, method, payload, signal) => {
+    const response = await prev(method, payload, signal);
+    const call = payload as { chat_id?: unknown; message_thread_id?: unknown; reply_parameters?: { message_id?: number } };
+    const intoTopic = call.message_thread_id === replay.threadId || (call.message_thread_id === undefined && call.reply_parameters?.message_id === replay.msgId);
+    if (response.ok || replay.threadId === null || call.chat_id !== replay.chatId || !intoTopic || !topicGone(response.error_code, response.description)) return response;
+    const { message_thread_id: _thread, reply_parameters: answered, ...outside } = call;
+    const retried = await prev(method, outside as typeof payload, signal);
+    const sent = retried.ok ? (retried.result as { message_id?: number }) : undefined;
+    if (sent?.message_id !== undefined && answered?.message_id !== undefined) {
+      await sql`
+        UPDATE messages SET reply_to_msg_id = ${answered.message_id}
+        WHERE chat_id = ${replay.chatId} AND msg_id = ${sent.message_id} AND from_bot AND reply_to_msg_id IS NULL`.catch(() => {});
+    }
+    return retried;
+  };
+}
+
 export function createBot(deps: BotDeps): {
   bot: Bot<BotContext>;
   membership: MembershipCache;
@@ -183,6 +236,8 @@ export function createBot(deps: BotDeps): {
   onJoined: (chatId: number, user: User) => void;
   /** Resolves once the questions to the owners about accounts seen so far have been sent. */
   cardOffersIdle: () => Promise<void>;
+  /** Does what a member asked the bot to do later, once it is due (src/bot/later.ts). */
+  perform: (reminder: MemberReminder) => Promise<Performed>;
 } {
   const { sql, config } = deps;
   // Answers are off without a key or with a zero cap; a mention then gets the help text instead.
@@ -228,6 +283,25 @@ export function createBot(deps: BotDeps): {
   const bot = new Bot<BotContext>(config.BOT_TOKEN);
   if (deps.transport) bot.api.config.use(deps.transport);
   bot.api.config.use(outgoingLog(sql));
+  // What a later action does leaves the request that asked for it as it is, whatever a handler does with the message in
+  // front of it, and goes outside the request's forum topic once that is closed or gone. A command goes through the bot's
+  // own handlers in an update the bot makes itself; anything else gets an API of its own.
+  const replayed = (replay: Replay) => [sparing(replay), outsideGoneTopic(sql, replay)];
+  const replays = new WeakMap<Update, Replay>();
+  bot.use((ctx, next) => {
+    const replay = replays.get(ctx.update);
+    if (replay) ctx.api.config.use(...replayed(replay));
+    return next();
+  });
+  const dispatch = async (update: Update, replay: Replay) => {
+    replays.set(update, replay);
+    await bot.handleUpdate(update).catch((error: unknown) => (error instanceof BotError ? bot.errorHandler(error) : Promise.reject(error)));
+  };
+  const apiFor = (replay: Replay) => {
+    const api = new Api(bot.token);
+    api.config.use(...bot.api.config.installedTransformers(), ...replayed(replay));
+    return api;
+  };
   const membership = new MembershipCache(bot.api);
   const pendingOffers = new Set<Promise<void>>();
   const onJoined = (chatId: number, user: User) => {
@@ -939,7 +1013,9 @@ export function createBot(deps: BotDeps): {
     if (error.ctx.callbackQuery) void error.ctx.answerCallbackQuery({ text: "Something went wrong 😕" }).catch(() => {});
   });
 
-  return { bot, membership, assistant, selfEdits, interjector, onJoined, cardOffersIdle: async () => void (await Promise.allSettled([...pendingOffers])) };
+  const perform = createPerformer({ sql, api: bot.api, apiFor, me: () => bot.botInfo, commands: COMMAND_NAMES, dispatch, selfEdits, assistant });
+
+  return { bot, membership, assistant, selfEdits, interjector, onJoined, cardOffersIdle: async () => void (await Promise.allSettled([...pendingOffers])), perform };
 }
 
 const OWNER_COMMANDS = [
@@ -949,6 +1025,12 @@ const OWNER_COMMANDS = [
   { command: "notes", description: "Private notes the bot keeps (owners only)" },
   { command: "reminders", description: "Promises and plans from your own DMs" },
 ];
+
+/** Every name the bot's commands answer to, menus or not: something asked for later that starts with one is that command. */
+export const COMMAND_NAMES: ReadonlySet<string> = new Set([
+  ...[...GROUP_COMMANDS, ...OWNER_COMMANDS].map(({ command }) => command),
+  ...["start", "members", "projects", "project", "today", "week", "alias", "unalias", "link", "app"],
+]);
 
 /**
  * With `sql`, owners removed from ADMIN_TG_IDS also lose their owner menu, and the stored is_admin flag is

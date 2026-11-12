@@ -63,7 +63,7 @@ for (const [name, model] of [
 }
 
 const anthropic = config.ANTHROPIC_API_KEY ? createAnthropic(config.ANTHROPIC_API_KEY) : undefined;
-const { bot, membership, assistant, interjector, onJoined } = createBot({ sql, config, anthropic });
+const { bot, membership, assistant, interjector, onJoined, perform } = createBot({ sql, config, anthropic });
 await bot.init();
 // With sql, owners removed from ADMIN_TG_IDS also lose their owner command menu.
 await registerCommands(bot, config.ADMIN_TG_IDS, sql).catch((error) => console.warn("[bot] could not register commands:", error));
@@ -121,8 +121,9 @@ const stopBusinessReminders =
   anthropic && businessRemindersOn(anthropic, config) ? startBusinessReminders({ sql, anthropic, api: bot.api, config }) : async () => {};
 const stopPortraits = anthropic && portraitsOn(anthropic, config) ? startPortraits({ sql, anthropic, api: bot.api, config }) : async () => {};
 const stopWeeklyIdeas = anthropic ? startWeeklyIdeas({ sql, anthropic, api: bot.api, config, botUsername: bot.botInfo.username }) : async () => {};
-// Delivering what members asked to be reminded of needs no model: reminders set earlier still come without a key.
-const stopMemberReminders = startMemberReminders({ sql, api: bot.api, config, botUsername: bot.botInfo.username });
+// Delivering what members asked to be reminded of needs no model: reminders set earlier still come without a key. What
+// they asked the bot to do later is done through the bot itself, as if they had just asked.
+const stopMemberReminders = startMemberReminders({ sql, api: bot.api, config, botUsername: bot.botInfo.username, perform });
 const stopNameSync = startNameSync(bot.api, sql, config.ADMIN_TG_IDS);
 if (config.ADMIN_TG_IDS.length === 0) {
   console.warn("[bot] ADMIN_TG_IDS is empty — nobody can approve new chats. Get your Telegram ID from a bot like @userinfobot and add it to ADMIN_TG_IDS.");

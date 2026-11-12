@@ -26,13 +26,27 @@ import {
   type Subject,
   type ValueProblem,
 } from "../core/own-card.js";
+import { EXECUTION_ID_BASE, executionMsgId, type NewReminder } from "../core/member-reminders.js";
 import { maskPersonalData } from "../core/privacy.js";
 import { escapeHtml, truncate } from "../core/text.js";
 import { getUser, type User } from "../core/users.js";
 import { localTimeOf, zoneLabel, zoneName } from "../core/zones.js";
 import { chatBudgetUsd } from "../worker/scheduler.js";
 import { realReply, type BotContext } from "./kit.js";
-import { chatLanguage, handleReminderRequest, REMIND_CUE, REMINDER_KINDS, reminderFailedText, type ReminderSettled, type RepliedTo, type Written } from "./reminders.js";
+import {
+  CANCEL_CUE,
+  chatLanguage,
+  handleReminderRequest,
+  LATER_CUE,
+  PUT_OFF_CUE,
+  REMIND_CUE,
+  REMINDER_KINDS,
+  reminderFailedText,
+  remindersNamedIn,
+  type ReminderSettled,
+  type RepliedTo,
+  type Written,
+} from "./reminders.js";
 import { questionText, questionWords, type Answered, type Question } from "./reply-context.js";
 
 /**
@@ -41,9 +55,11 @@ import { questionText, questionWords, type Answered, type Question } from "./rep
  * those words, applies it to the sender's card alone (src/core/own-card.ts) and posts a receipt it writes itself,
  * with an Undo button only the sender can use. Anything else goes on to the answer as before. Only a note may be
  * worded by the bot, from the sender's words or the message they point at; everything else is their own words.
- * A message with a reminder word is read for a reminder first (src/bot/reminders.ts), in the same queue and on the
- * same record; one that turns out to ask for none goes on here as if it had never been read for one, and one that also
- * asks for a change to the sender's card goes on here once its reminder is done, the answer told about both.
+ * A message with a reminder word, or with words that say when, is read for a reminder or for something to do later first
+ * (src/bot/reminders.ts), in the same queue and on the same record; one that turns out to ask for neither goes on here
+ * as if it had never been read for one, and one that also asks for a change to the sender's card goes on here once its
+ * reminder is done, the answer told about both. Something they asked to have done later comes back here at its time
+ * (src/bot/later.ts) as a message of theirs again, and is read and done as if they had just asked.
  */
 
 export const SELF_EDIT_PURPOSE = "self_edit";
@@ -53,7 +69,7 @@ const NOTHING_CHANGED = "nothing was changed on any card";
  * A member's requests read in an hour; past that, their messages go straight to the answer and its own limits. Only a
  * message read for a request counts: plain talk to the bot never uses one up.
  */
-const READS_PER_HOUR = 30;
+export const READS_PER_HOUR = 30;
 const HOUR_MS = 3_600_000;
 const READ_TIMEOUT_MS = 30_000;
 /** What the answer is told when a message asked for a change and the reading could not tell which. */
@@ -69,8 +85,11 @@ const RECALL_CUE =
 const NOTES_CUE = /заметк|бэклог|\b(?:notes?|backlog)\b/iu;
 /** A reply to the bot's answer to a request it could not tell what to do with answers that answer this long. */
 const CLARIFY_MINUTES = 60;
-/** The kinds of a request the answer asked about, for what it was missing: a card request's, a reminder request's. */
-const UNCLEAR_KINDS = ["unclear", REMINDER_KINDS.unclear] as const;
+/**
+ * The kinds of a request the answer asked about, for what it was missing: a card request's, a reminder request's, and
+ * a request's for something to do later.
+ */
+const UNCLEAR_KINDS = ["unclear", REMINDER_KINDS.unclear, REMINDER_KINDS.laterUnclear] as const;
 /** Requests whose words still count among a sender's own words: nothing was done about them. */
 const UNHANDLED_KINDS = ["not_a_request", ...UNCLEAR_KINDS];
 /** Room the notes of one receipt share, so that it stays one Telegram message. */
@@ -125,7 +144,7 @@ kind:
 - fake_claim: they ask the bot to say, confirm or pretend that something was changed.
 - forget_all: they ask the bot to erase everything about them, not one entry.
 - unclear: they ask for a change of their card or their notes, but neither their words nor <they_reply_to> tell what, and it is nothing for you to recall or work out either (that is a note you answer first, below).
-- not_a_request: anything else: questions, banter, news about themselves without asking to record or change it.
+- not_a_request: anything else: questions, banter, news about themselves without asking to record or change it, and a request to make the change at a later time they name («через 2 часа поставь мне статус…», «завтра запиши мне…»), which the bot puts off itself. With <asked_earlier> there, though, this is such a request come due: they asked for it earlier, to be done now, so read it as if they had just asked.
 
 ops, only for edit (at most ${MAX_OPS}): add {field, value}; remove {ref}; replace {ref, field, value}; set_tagline {value}; clear_tagline; add_alias {value}; remove_alias {ref}; add_note {ref, value}; remove_note {ref: n…}; set_zone {value}; clear_zone.
 - set_zone is the time zone they live by, as they gave it: a city or a place («поставь мне пояс Торонто» → Торонто), a zone name (Asia/Jakarta) or an offset (UTC+7). A city they say they live in («запиши, что я живу в Торонто») is add {field: timezone}: their time zone follows from it by itself. clear_zone takes their time zone off.
@@ -624,12 +643,15 @@ async function settle(sql: Sql, requestId: number, attempt: () => Promise<Applie
   return { status: row?.status === "applied" ? "alreadyBack" : "expired" };
 }
 
+/** The message a request was made in: one asked for earlier and done later is on record under another id (executionMsgId). */
+const askedIn = (request: Pick<StoredRequest, "msg_id" | "source_msg_id">) => request.source_msg_id ?? request.msg_id;
+
 /** Brings an undone change of the subject's own back, the same day, checked again. */
-export async function redoOwn(sql: Sql, subject: Subject, request: Pick<StoredRequest, "id" | "msg_id" | "plan" | "created_at">, botNames: string[]): Promise<Outcome> {
+export async function redoOwn(sql: Sql, subject: Subject, request: Pick<StoredRequest, "id" | "msg_id" | "source_msg_id" | "plan" | "created_at">, botNames: string[]): Promise<Outcome> {
   if (!request.plan?.length || request.created_at.getTime() < Date.now() - UNDO_HOURS * 3_600_000) return { status: "expired" };
   const plan = await stillValid(sql, subject, request.plan, botNames);
   if (plan.length === 0) return { status: "cannotReturn" };
-  return settle(sql, request.id, () => applyOwnOps(sql, subject, plan, request.msg_id, request.id, "undone"));
+  return settle(sql, request.id, () => applyOwnOps(sql, subject, plan, askedIn(request), request.id, "undone"));
 }
 
 /**
@@ -660,9 +682,9 @@ const POINTED_AT_FROM = { bot: "you, the bot", member: "another member" } as con
 export function parserPrompt(
   ownWords: string[],
   card: OwnCard,
-  extra: { undone?: string; askedCity?: string; askedWhat?: string; replyTo?: PointedAt; bot?: string[] } = {},
+  extra: { undone?: string; askedCity?: string; askedWhat?: string; replyTo?: PointedAt; bot?: string[]; askedEarlier?: boolean } = {},
 ): string {
-  const { undone, askedCity, askedWhat, replyTo, bot } = extra;
+  const { undone, askedCity, askedWhat, replyTo, bot, askedEarlier } = extra;
   const rows = card.facts.map((fact, index) => `r${index + 1} ${fact.kind}: ${maskPersonalData(fact.value).replace(/[<>]/g, "")}`);
   const aliases = card.aliases.map((alias, index) => `a${index + 1} name: ${alias.alias.replace(/[<>]/g, "")}`);
   const plain = (text: string) => maskPersonalData(text).replace(/[<>]/g, "");
@@ -680,6 +702,7 @@ export function parserPrompt(
     replyTo
       ? `<they_reply_to from="${POINTED_AT_FROM[replyTo.author]}">\n${plain(replyTo.text)}\n</they_reply_to>`
       : "",
+    askedEarlier ? "<asked_earlier>they asked for this earlier, to be done now: it is a request now, whatever its words say about time</asked_earlier>" : "",
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -687,6 +710,12 @@ export function parserPrompt(
 
 /** A stored message without the bot's @username in it, as the reading takes a new one. */
 const withoutMention = (text: string, username: string) => text.replace(new RegExp(`@${username}(?![\\w])`, "giu"), " ");
+
+/** An earlier request the bot asked about, with what it replied to, kept as an action keeps it. */
+type Clarified = Written & { kind: (typeof UNCLEAR_KINDS)[number]; repliedTo: NewReminder["replyTo"] | null };
+
+/** The id a message's request is on record under: the message's own, or, for something asked for earlier and done now, its own. */
+const recordMsgIdOf = (question: Question) => (question.scheduled ? executionMsgId(question.scheduled.reminderId) : question.message.message_id);
 
 /** A note they ask to save from what the bot is about to answer them: it has no text until the answer is out. */
 const waitsForAnswer = (op: SelfEditResult["ops"][number]) => op.action === "add_note" && op.value === null;
@@ -720,8 +749,11 @@ function projectButtons(projects: { id: number; name: string }[], requestId: num
 }
 
 export interface SelfEdits {
-  /** Takes every message addressed to the bot; whatever is not about the sender's own card goes on to the answer. */
-  handle: (api: Api, question: Question, user: User) => void;
+  /**
+   * Takes every message addressed to the bot; whatever is not about the sender's own card goes on to the answer. Resolves
+   * with the request's record once it is on record, or undefined when the message was on record already.
+   */
+  handle: (api: Api, question: Question, user: User) => Promise<number | undefined>;
   /** Whether a message of the chat is being read right now. */
   busy: (chatId: number) => boolean;
   idle: () => Promise<void>;
@@ -758,12 +790,16 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
   const ownWordsOf = async (question: Question, subject: Subject): Promise<Written[]> => {
     const { message, me } = question;
     const thread = message.is_topic_message ? (message.message_thread_id ?? null) : null;
-    const recent = await sql<{ text: string; sent_at: Date }[]>`
-      SELECT m.text, m.sent_at FROM messages m
-      WHERE m.chat_id = ${subject.chatId} AND m.user_id = ${subject.userId} AND m.msg_id < ${message.message_id} AND NOT m.is_forward AND btrim(m.text) <> ''
-        AND m.sent_at > ${new Date(message.date * 1000 - OWN_MESSAGES_WINDOW_MS)} AND m.thread_id IS NOT DISTINCT FROM ${thread}
-        AND NOT EXISTS (SELECT 1 FROM self_edits s WHERE s.chat_id = m.chat_id AND s.msg_id = m.msg_id AND s.kind <> ALL(${UNHANDLED_KINDS}::text[]))
-      ORDER BY m.msg_id DESC LIMIT ${OWN_MESSAGES}`;
+    // Something asked for earlier is its own words alone, and the message it replies to: what they wrote around it then
+    // was read when they asked.
+    const recent = question.scheduled
+      ? []
+      : await sql<{ text: string; sent_at: Date }[]>`
+          SELECT m.text, m.sent_at FROM messages m
+          WHERE m.chat_id = ${subject.chatId} AND m.user_id = ${subject.userId} AND m.msg_id < ${message.message_id} AND NOT m.is_forward AND btrim(m.text) <> ''
+            AND m.sent_at > ${new Date(message.date * 1000 - OWN_MESSAGES_WINDOW_MS)} AND m.thread_id IS NOT DISTINCT FROM ${thread}
+            AND NOT EXISTS (SELECT 1 FROM self_edits s WHERE s.chat_id = m.chat_id AND s.msg_id = m.msg_id AND s.kind <> ALL(${UNHANDLED_KINDS}::text[]))
+          ORDER BY m.msg_id DESC LIMIT ${OWN_MESSAGES}`;
     const replied = message.reply_to_message;
     const [repliedRequest] = replied
       ? await sql`SELECT 1 FROM self_edits WHERE chat_id = ${subject.chatId} AND msg_id = ${replied.message_id} AND kind <> ALL(${UNHANDLED_KINDS}::text[])`
@@ -806,7 +842,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
         ? sql`s.id = ${target.redo_of}`
         : sql`s.decided_at > now() - ${`${REDO_MINUTES} minutes`}::interval`;
     const [request] = await sql<(StoredRequest & { text: string | null })[]>`
-      SELECT s.*, m.text FROM self_edits s LEFT JOIN messages m ON m.chat_id = s.chat_id AND m.msg_id = s.msg_id
+      SELECT s.*, m.text FROM self_edits s LEFT JOIN messages m ON m.chat_id = s.chat_id AND m.msg_id = coalesce(s.source_msg_id, s.msg_id)
       WHERE s.chat_id = ${subject.chatId} AND s.user_id = ${subject.userId} AND s.status = 'undone' AND s.plan IS NOT NULL
         AND s.created_at > now() - ${`${UNDO_HOURS} hours`}::interval AND ${which}
       ORDER BY s.decided_at DESC
@@ -818,21 +854,50 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
   /**
    * The sender's own request the bot could not tell what to do with, when the message replies to the bot's answer to it
    * within CLARIFY_MINUTES: the answer asked what was missing, and this message answers it. Its kind tells whether it
-   * asked to change their card or for a reminder.
+   * asked to change their card, for a reminder or for something to do later. One asked for earlier and done later is its
+   * words as they were done, and the answer replied to the message that asked for it.
    */
-  const clarifiedOf = async (question: Question, userId: number): Promise<(Written & { kind: (typeof UNCLEAR_KINDS)[number] }) | undefined> => {
+  const clarifiedOf = async (question: Question, userId: number): Promise<Clarified | undefined> => {
     const replied = realReply(question.message);
     if (!replied || replied.from?.id !== question.me.id) return undefined;
-    const [row] = await sql<{ text: string; sent_at: Date; kind: (typeof UNCLEAR_KINDS)[number] }[]>`
-      SELECT q.text, q.sent_at, s.kind FROM messages a
-      JOIN self_edits s ON s.chat_id = a.chat_id AND s.msg_id = a.reply_to_msg_id
-      JOIN messages q ON q.chat_id = s.chat_id AND q.msg_id = s.msg_id
+    // The message the earlier request replied to as well, kept as an action keeps it: what its «это» points at, its text
+    // only when it is their own or the bot's that answers them or nobody in particular.
+    const [row] = await sql<{ text: string; sent_at: Date; kind: (typeof UNCLEAR_KINDS)[number]; replied_id: number | null; replied_text: string | null; replied_by: "bot" | "self" | null }[]>`
+      SELECT coalesce(r.text, q.text) AS text, CASE WHEN r.id IS NULL THEN q.sent_at ELSE s.created_at END AS sent_at, s.kind,
+             coalesce(r.reply_to_msg_id, q.reply_to_msg_id) AS replied_id,
+             CASE WHEN r.id IS NOT NULL THEN r.reply_text ELSE p.text END AS replied_text,
+             CASE WHEN r.id IS NOT NULL THEN r.reply_author
+                  WHEN p.from_bot AND (p.reply_to_msg_id IS NULL OR pp.user_id = s.user_id) THEN 'bot'
+                  WHEN p.user_id = s.user_id AND NOT p.is_forward THEN 'self' END AS replied_by
+      FROM messages a
+      JOIN self_edits s ON s.chat_id = a.chat_id AND coalesce(s.source_msg_id, s.msg_id) = a.reply_to_msg_id
+      JOIN messages q ON q.chat_id = s.chat_id AND q.msg_id = a.reply_to_msg_id
+      LEFT JOIN reminders r ON s.source_msg_id IS NOT NULL AND r.id = -s.msg_id - ${EXECUTION_ID_BASE}::bigint
+      LEFT JOIN messages p ON p.chat_id = q.chat_id AND p.msg_id = q.reply_to_msg_id
+      LEFT JOIN messages pp ON pp.chat_id = p.chat_id AND pp.msg_id = p.reply_to_msg_id
       WHERE a.chat_id = ${question.chatId} AND a.msg_id = ${replied.message_id} AND a.from_bot
         AND s.user_id = ${userId} AND s.kind = ANY(${[...UNCLEAR_KINDS]}::text[]) AND s.created_at > now() - ${`${CLARIFY_MINUTES} minutes`}::interval
-      LIMIT 1`;
+      ORDER BY s.id DESC LIMIT 1`;
     const original = row ? cleanText(withoutMention(row.text, question.me.username)) : "";
     const text = cleanText(maskPersonalData(original));
-    return text ? { text, original, at: row!.sent_at, kind: row!.kind } : undefined;
+    if (!text) return undefined;
+    const kept = row!.replied_by && row!.replied_text?.trim() ? { text: row!.replied_text.trim(), author: row!.replied_by } : null;
+    return { text, original, at: row!.sent_at, kind: row!.kind, repliedTo: row!.replied_id === null ? null : { msgId: row!.replied_id, kept } };
+  };
+
+  /** Whether the message replies to the receipt of one of the sender's own reminders or things to do later. */
+  const repliesToOwnReceipt = async (question: Question, userId: number): Promise<boolean> => {
+    const replied = realReply(question.message);
+    if (!replied || replied.from?.id !== question.me.id) return false;
+    const [row] = await sql`SELECT 1 FROM reminders WHERE chat_id = ${question.chatId} AND user_id = ${userId} AND receipt_msg_id = ${replied.message_id}`;
+    return Boolean(row);
+  };
+
+  /** Whether the message names something the sender asked the bot to do later, by a word of it or by its command («отмени /top»). */
+  const namesOwnAction = async (question: Question, userId: number, asked: string): Promise<boolean> => {
+    const actions = await sql<{ text: string }[]>`
+      SELECT text FROM reminders WHERE chat_id = ${question.chatId} AND user_id = ${userId} AND kind = 'action' AND status = 'pending'`;
+    return remindersNamedIn(asked, actions).length > 0;
   };
 
   const cityAskedOf = async (question: Question, userId: number): Promise<{ id: number; place: string } | undefined> => {
@@ -866,13 +931,22 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     const asked = questionText(message, question.me);
     const open = chat?.status === "approved" && !chat.chronicle_paused_at;
     const cued = REQUEST_CUE.test(asked) || REDO_CUE.test(asked);
+    // Something asked for earlier and done now is read as a fresh request: it answers no question of the bot's.
+    const scheduled = question.scheduled !== undefined;
     // A reply to the bot's question about their city answers it, with request words or without; so does a reply to the
-    // answer that asked what an unclear request of theirs was for, a card request's or a reminder request's.
-    const cityAsked = open ? await cityAskedOf(question, user.id) : undefined;
-    const unclearAsked = open && !cityAsked ? await clarifiedOf(question, user.id) : undefined;
+    // answer that asked what an unclear request of theirs was for, a card request's, a reminder request's or one for later.
+    const cityAsked = open && !scheduled ? await cityAskedOf(question, user.id) : undefined;
+    const unclearAsked = open && !scheduled && !cityAsked ? await clarifiedOf(question, user.id) : undefined;
     const clarified = unclearAsked?.kind === "unclear" ? unclearAsked : undefined;
-    const reminderAsked = unclearAsked?.kind === REMINDER_KINDS.unclear ? unclearAsked : undefined;
-    const reminding = open && (REMIND_CUE.test(asked) || reminderAsked !== undefined);
+    const reminderAsked = unclearAsked && unclearAsked.kind !== "unclear" ? { ...unclearAsked, later: unclearAsked.kind === REMINDER_KINDS.laterUnclear } : undefined;
+    // Words that say when, or that speak of what waits for later, let a message be read for something to do later (one
+    // asked for earlier and done now is read as one too, and done now); a cancel word lets it be read for a cancel in a
+    // reply to one of their receipts, or with what names something they asked the bot to do later («отмени /top»), unless
+    // the message asks for a change to their card.
+    const cancelling =
+      open && CANCEL_CUE.test(asked) && ((await repliesToOwnReceipt(question, user.id)) || (!REQUEST_CUE.test(asked) && (await namesOwnAction(question, user.id, asked))));
+    const putOff = LATER_CUE.test(asked) || PUT_OFF_CUE.test(asked);
+    const reminding = open && (REMIND_CUE.test(asked) || putOff || reminderAsked !== undefined || cancelling);
     if (!open || (!cued && !cityAsked && !clarified && !reminding)) {
       await done("not_a_request", "answered");
       return deps.answer(api, question);
@@ -885,14 +959,21 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
       await done("not_a_request", "answered");
       return deps.answer(api, question);
     }
-    const slot = takeRead(chatId, subject.userId);
+    // A message let in by nothing but words that say when may ask nothing of the bot: what it is told when it goes unread says so.
+    const askedPlainly = cued || REMIND_CUE.test(asked) || cancelling || cityAsked !== undefined || clarified !== undefined || reminderAsked !== undefined;
+    const unread = (why: string) =>
+      askedPlainly
+        ? `${NOTHING_CHANGED}: a request in it was not read, ${why}`
+        : `if the message asks for a change to their card, a reminder or something to be done later, none of it was done: it was not read, ${why}; if it asks nothing of the kind, answer it as usual and leave this out`;
+    // Something asked for earlier is done at its time, whatever they wrote to the bot this hour.
+    const slot = scheduled ? ({ ok: true } as const) : takeRead(chatId, subject.userId);
     if (!slot.ok) {
       log(`[self-edit] chat ${chatId}: user ${subject.userId} asked for over ${READS_PER_HOUR} requests within an hour; msg ${message.message_id} goes to the answer unread`);
       await done("not_a_request", "answered");
       return deps.answer(
         api,
         question,
-        `${NOTHING_CHANGED}: the bot reads at most ${READS_PER_HOUR} requests from one member an hour and this one was over, so nothing in it was read; it can be asked again in ${slot.minutes} min; give exactly this reason and no other`,
+        unread(`the bot reads at most ${READS_PER_HOUR} requests from one member an hour and this one was over; it can be asked again in ${slot.minutes} min; give exactly this reason and no other`),
       );
     }
     try {
@@ -900,7 +981,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     } catch (error) {
       if (!(error instanceof BudgetExceededError)) throw error;
       await done("not_a_request", "answered");
-      return deps.answer(api, question, `${NOTHING_CHANGED}: a request in it was not read, the bot's budget is spent`);
+      return deps.answer(api, question, unread("the bot's budget is spent"));
     }
     const ownWords = await ownWordsOf(question, subject);
     /** Their words with the earlier request this message answers, when it is not among them already. */
@@ -926,7 +1007,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
           askedWhat: reminderAsked,
           language,
           optedOut: TEXTS[language].optedOut!,
-          cardRequest,
+          cardRequestIn: (words) => REQUEST_CUE.test(words) || undone !== undefined || cityAsked !== undefined || clarified !== undefined,
           reply: (html, keyboard) => reply(api, question, html, keyboard),
         },
       );
@@ -938,8 +1019,8 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
         await sql`UPDATE self_edits SET kind = 'parsing' WHERE id = ${id} AND status = 'parsing'`;
       } else if (!cardRequest) {
         await done("not_a_request", "answered");
-        return deps.answer(api, question, reminded.status === "unread" ? reminded.line : undefined);
-      } else if (reminded.status === "unread") alongside = reminded.line;
+        return deps.answer(api, question, reminded.line);
+      } else alongside = reminded.line;
     }
     /** The answer to the message, told about a reminder it asks for as well. */
     const answer = (cardChange?: string, onAnswered?: (answered: Answered) => void) =>
@@ -954,7 +1035,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
         maxTokens: 4000,
         effort: "low",
         system: SELF_EDIT_SYSTEM_PROMPT,
-        prompt: parserPrompt(words, card, { undone: undoneText, askedCity: cityAsked?.place, askedWhat: clarified?.text, replyTo: pointed, bot: deps.botNames() }),
+        prompt: parserPrompt(words, card, { undone: undoneText, askedCity: cityAsked?.place, askedWhat: clarified?.text, replyTo: pointed, bot: deps.botNames(), askedEarlier: scheduled }),
         schema: SelfEditSchema,
         onUsage: (usage) => recordUsage(sql, SELF_EDIT_PURPOSE, config.REPLY_MODEL, usage, chatId),
         signal: AbortSignal.timeout(READ_TIMEOUT_MS),
@@ -1137,21 +1218,25 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
     log(`[self-edit] chat ${question.chatId}: ${describe(error)}`);
     const rows = await sql<{ kind: string }[]>`
       UPDATE self_edits SET status = 'failed', decided_at = now()
-      WHERE chat_id = ${question.chatId} AND msg_id = ${question.message.message_id} AND status = 'parsing'
+      WHERE chat_id = ${question.chatId} AND msg_id = ${recordMsgIdOf(question)} AND status = 'parsing'
       RETURNING kind`.catch(() => null);
     const kind = rows ? rows[0]?.kind : "edit";
     if (kind === undefined) return;
     if (kind === "parsing") return deps.answer(api, question, NOTHING_CHANGED);
     const language = await languageOf(question.chatId).catch(() => "English" as const);
-    await reply(api, question, escapeHtml(kind === REMINDER_KINDS.handled ? reminderFailedText(language) : TEXTS[language].failed!)).catch(() => {});
+    const reminding = kind === REMINDER_KINDS.handled || kind === REMINDER_KINDS.later;
+    await reply(api, question, escapeHtml(reminding ? reminderFailedText(language, kind) : TEXTS[language].failed!)).catch(() => {});
   };
 
   return {
     handle(api, question, user) {
       const key = `${question.chatId}:${question.from.id}`;
-      // The request is on record before it waits its turn, so the chronicler never reads its text as a fact.
+      // The request is on record before it waits its turn, so the chronicler never reads its text as a fact. Something
+      // asked for earlier and done now is on record apart from the request that asked for it, once: a second try finds
+      // its record there and does nothing.
+      const sourceMsgId = question.scheduled ? question.message.message_id : null;
       const claimed = sql<{ id: number }[]>`
-        INSERT INTO self_edits (chat_id, msg_id, user_id, tg_id) VALUES (${question.chatId}, ${question.message.message_id}, ${user.id}, ${question.from.id})
+        INSERT INTO self_edits (chat_id, msg_id, source_msg_id, user_id, tg_id) VALUES (${question.chatId}, ${recordMsgIdOf(question)}, ${sourceMsgId}, ${user.id}, ${question.from.id})
         ON CONFLICT (chat_id, msg_id) DO NOTHING RETURNING id`.then(([row]) => row?.id);
       claimed.catch(() => {});
       const previous = queues.get(key) ?? Promise.resolve();
@@ -1164,6 +1249,7 @@ export function createSelfEdits(deps: SelfEditDeps): SelfEdits {
         });
       queues.set(key, work);
       inFlight.add(work);
+      return claimed;
     },
     busy(chatId) {
       return [...queues.keys()].some((key) => key.startsWith(`${chatId}:`));
@@ -1184,6 +1270,8 @@ interface StoredRequest {
   applied: Applied[] | null;
   receipt_msg_id: number | null;
   msg_id: number;
+  /** The message a request done later was made in; null when it is msg_id. */
+  source_msg_id: number | null;
   created_at: Date;
 }
 
@@ -1244,7 +1332,7 @@ export function registerSelfEdits(bot: Bot<BotContext>, deps: { sql: Sql; botNam
         ? { status: "expired" }
         : plan.length === 0
           ? { status: "cannotReturn" }
-          : await settle(sql, request.id, () => applyOwnOps(sql, subject, plan, request.msg_id, request.id, "proposed", Boolean(project)));
+          : await settle(sql, request.id, () => applyOwnOps(sql, subject, plan, askedIn(request), request.id, "proposed", Boolean(project)));
       if (outcome.status !== "applied") return ctx.answerCallbackQuery({ text: outcome.status === "alreadyBack" ? texts.alreadyDone : texts[outcome.status] });
       const applied = outcome.applied;
       await ctx.answerCallbackQuery();
@@ -1273,7 +1361,7 @@ export function registerSelfEdits(bot: Bot<BotContext>, deps: { sql: Sql; botNam
       log(`[self-edit] chat ${request.chat_id}: user ${subject.userId} brought back their undone change`);
       return;
     }
-    const undone = await undoOwnOps(sql, subject, request.id, request.msg_id);
+    const undone = await undoOwnOps(sql, subject, request.id, askedIn(request));
     if (!undone) return ctx.answerCallbackQuery({ text: texts.expired });
     await ctx.answerCallbackQuery({ text: texts.undone });
     await ctx
