@@ -196,7 +196,7 @@ describe.skipIf(!DATABASE_URL)("things members ask the bot to do later", () => {
     const readings: Later[] = [];
     const cards: Card[] = [];
     const prompts = { readings: [] as string[], cards: [] as string[], answers: [] as string[] };
-    const newestOf = (prompt: string) => /<their_words>\n- (.*)\n/.exec(prompt)?.[1] ?? "";
+    const newestOf = (prompt: string) => (/<their_message>\n(.*)\n/.exec(prompt) ?? /<their_words>\n- (.*)\n/.exec(prompt))?.[1] ?? "";
     const structured = (payload: unknown) => {
       const message = { stop_reason: "end_turn", stop_details: null, content: [{ type: "text", text: JSON.stringify(payload) }], usage: { input_tokens: 600, output_tokens: 60 } };
       return { currentMessage: message, finalMessage: async () => message };
@@ -512,7 +512,7 @@ describe.skipIf(!DATABASE_URL)("things members ask the bot to do later", () => {
     // It is read as a card request, the words that said when gone, and nothing reads it for later again.
     expect(h.claude.prompts.readings).toHaveLength(1);
     expect(h.claude.prompts.cards).toHaveLength(1);
-    expect(h.claude.prompts.cards[0]).toContain("<their_words>\n- поставь мне статус «в отпуске»\n</their_words>");
+    expect(h.claude.prompts.cards[0]).toContain("<their_message>\nпоставь мне статус «в отпуске»\n</their_message>");
     expect(h.claude.prompts.cards[0]).toContain("<asked_earlier>");
     expect(h.telegram.calls.slice(before).find((call) => call.method === "getChatMember")?.payload).toMatchObject({ chat_id: chat, user_id: bob.tg.id });
     expect(await taglineOf(chat, bob)).toBe("в отпуске");
@@ -719,7 +719,8 @@ describe.skipIf(!DATABASE_URL)("things members ask the bot to do later", () => {
     for (const row of [ownAction, kitsAction, botsAction]) await makeDue(row.id);
     await h.deliver();
     const [ownPrompt, kitsPrompt, botsPrompt] = h.claude.prompts.cards;
-    expect(ownPrompt).toContain("<their_words>\n- закинь это в заметки\n- релиз в пятницу; проверить метрики\n</their_words>");
+    expect(ownPrompt).toContain('<their_message>\nзакинь это в заметки\n</their_message>\n\n<their_earlier_words note="the newest first">\n- релиз в пятницу; проверить метрики\n</their_earlier_words>');
+    expect(ownPrompt).toContain('<they_reply_to from="themselves">\nрелиз в пятницу; проверить метрики\n</they_reply_to>');
     expect(kitsPrompt).toContain('<they_reply_to from="another member">\nсозвон в четверг в 15:00\n</they_reply_to>');
     expect(botsPrompt).toContain('<they_reply_to from="you, the bot">\nИтоги: выбрали Postgres\n</they_reply_to>');
 

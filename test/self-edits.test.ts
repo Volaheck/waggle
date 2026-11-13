@@ -573,6 +573,71 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     expect(await sql`SELECT 1 FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toHaveLength(0);
   });
 
+  it("words the notes from the message a request replies to when the reading leaves their text for later", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    await addUserProject(sql, { chatId: chat, name: "Beacon", actorUserId: bob.id });
+    await addUserProject(sql, { chatId: chat, name: "Waggle", actorUserId: bob.id });
+    const worded: Worded = { ref: null, notes: ["экспорт отчётов в CSV", "поиск по истории раз в 6 часов"] };
+    const saved = await run(
+      chat,
+      bob,
+      "Закинь мне в заметки это",
+      [{ kind: "edit", also_asks: false, ops: [{ action: "add_note", field: null, ref: "p?", value: null }] }, worded],
+      undefined,
+      replyTo(chat, LIST),
+    );
+    expect(saved.parser.prompts).toHaveLength(2);
+    expect(saved.parser.prompts[1]).toContain('<they_point_at from="you, the bot">');
+    expect(saved.parser.prompts[1]).toContain("поиск по истории раз в 6 часов");
+    expect(saved.parser.prompts[1]).toContain("p1 Beacon\np2 Waggle");
+    // On their card, as they asked, with a receipt and its Undo, and nothing left for the answer to say.
+    expect(await sql`SELECT project_id, text FROM memos WHERE chat_id = ${chat} ORDER BY id`).toEqual([
+      { project_id: null, text: "экспорт отчётов в CSV" },
+      { project_id: null, text: "поиск по истории раз в 6 часов" },
+    ]);
+    expect(saved.sent).toHaveLength(1);
+    expect(saved.sent[0]!.markup!.inline_keyboard[0]![0]!.callback_data).toMatch(/^se:undo:\d+$/);
+    expect(saved.answered).toEqual([]);
+    expect((await requestOf(chat, saved.message.message_id)).kind).toBe("edit");
+
+    // A reading that could tell nothing of a reply asked to go into notes: the same.
+    const lost = await run(chat, bob, "закинь это в заметки", [{ kind: "unclear", also_asks: false, ops: [] }, { ref: null, notes: ["ночные сборки"] }], undefined, replyTo(chat, LIST));
+    expect(lost.parser.prompts[1]).toContain("<they_point_at");
+    expect(await sql`SELECT text FROM memos WHERE chat_id = ${chat} AND text = 'ночные сборки'`).toHaveLength(1);
+
+    // Nothing made up: a worded note that is not in the message is not saved.
+    const made = await run(chat, bob, "запиши это в заметки", [{ kind: "edit", also_asks: false, ops: [{ action: "add_note", field: null, ref: null, value: null }] }, { ref: null, notes: ["переписать бота на Haskell к пятнице"] }], undefined, replyTo(chat, LIST));
+    expect(made.sent[0]!.text).toMatch(/nor in the message you replied to|ни в сообщении, на которое ты ответил/);
+    expect(await sql`SELECT 1 FROM memos WHERE chat_id = ${chat}`).toHaveLength(3);
+  });
+
+  it("points at their own message they reply to, which goes into notes too", async () => {
+    const chat = await newChat();
+    const bob = await member(chat, "Bob");
+    const own = await say(chat, bob, "Идея: тёмная тема для админки и экспорт в PDF");
+    const toOwn = { reply_to_message: { ...own, from: bob.tg } } as unknown as Partial<Message>;
+    const saved = await run(
+      chat,
+      bob,
+      "@waggle_test_bot и это мне в заметки",
+      [{ kind: "edit", also_asks: false, ops: [{ action: "add_note", field: null, ref: null, value: null }] }, { ref: null, notes: ["тёмная тема для админки", "экспорт в PDF"] }],
+      undefined,
+      toOwn,
+    );
+    expect(saved.parser.prompts[0]).toContain('<they_reply_to from="themselves">\nИдея: тёмная тема для админки и экспорт в PDF\n</they_reply_to>');
+    expect(saved.parser.prompts[1]).toContain('<they_point_at from="themselves">');
+    expect(await sql`SELECT user_id, project_id, text FROM memos WHERE chat_id = ${chat} ORDER BY id`).toEqual([
+      { user_id: bob.id, project_id: null, text: "тёмная тема для админки" },
+      { user_id: bob.id, project_id: null, text: "экспорт в PDF" },
+    ]);
+
+    // Worded by the reading itself, the note needs no call of its own.
+    const direct = await run(chat, bob, "@waggle_test_bot закинь в заметки", { kind: "edit", also_asks: false, ops: [{ action: "add_note", field: null, ref: null, value: "идея: экспорт в PDF" }] }, undefined, toOwn);
+    expect(direct.parser.prompts).toHaveLength(1);
+    expect(await sql`SELECT 1 FROM memos WHERE chat_id = ${chat} AND text = 'идея: экспорт в PDF'`).toHaveLength(1);
+  });
+
   it("asks which project the notes go on when nothing tells, and puts them where their author taps", async () => {
     const chat = await newChat();
     const bob = await member(chat, "Bob");

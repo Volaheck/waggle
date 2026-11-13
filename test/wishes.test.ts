@@ -824,7 +824,7 @@ describe.skipIf(!DATABASE_URL)("wishes", () => {
     function fakeClaude() {
       const cards: Reading[] = [];
       const prompts = { cards: [] as string[], answers: [] as string[] };
-      const newestOf = (prompt: string) => /<their_words>\n- (.*)\n/.exec(prompt)?.[1] ?? "";
+      const newestOf = (prompt: string) => /<their_message>\n(.*)\n/.exec(prompt)?.[1] ?? "";
       const client = {
         messages: {
           stream(params: { system: string; messages: { content: string }[] }) {
