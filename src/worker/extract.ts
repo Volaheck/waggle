@@ -2,7 +2,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import type { Config } from "../core/config.js";
 import type { Queryable, Sql } from "../core/db.js";
-import { deprecateFact, proposeFact, rewriteFact, type Fact } from "../core/facts.js";
+import { deprecateFact, isSameFact, proposeFact, rewriteFact, type Fact } from "../core/facts.js";
 import { assertBudget, BudgetExceededError, callStructured, recordUsage, type StructuredOutcome, type UsageLike } from "../core/llm.js";
 import type { StoredMessage } from "../core/messages.js";
 import { PROJECT_STATUSES, projectForSlug, renameProject, upsertProject, type UpsertResult } from "../core/projects.js";
@@ -140,21 +140,21 @@ Skip chatter, greetings, stickers and forwarded news nobody discussed. Do not re
 
 2. Facts about members
 Cards are how members know each other, and they grow from what people say about themselves. Go through every member who wrote in <new_messages>, one by one, and read their own messages for what is lasting and not on their card in any form: the work they do and for whom (the kind of clients, what they build for them), a technology they use, a topic they show they really know, a lasting hobby, a personal link, where they live, what they look for (a co-founder, a technical partner, testers, someone for the content) and what they offer. A message where someone tells about their own work or plans at length is the richest source: take every lasting point of it, as separate facts or a refined one (facts_update), not just the first. facts_add and facts_update stay empty only when nobody said anything lasting about themselves that their card lacks.
-A card is a short profile, not a diary. Each fact is one idea. Semantic duplicates are not allowed: if a new fact is essentially about something the card already has (the same product, the same family, the same topic in other words), do not add it.
+A card is a short profile, not a diary. Each fact is one idea. Semantic duplicates are not allowed: if a new fact is essentially about something the card already has (the same product, the same family, the same topic in other words or in another language: a translation or a transliteration of a fact on the card is that fact), do not add it.
 - role — what the person does. A person has ONE role: if there is already a role, refine it with facts_update instead of adding a second one.
-- stack — one technology per fact, by its short, commonly used name, with no explanations: "Rust", "Railway", "Blender". AI models and tools from one company are ONE fact: everything from OpenAI (GPT of any version, ChatGPT, Codex, Astra, Sol) is "GPT / Codex"; everything from Anthropic (Claude, Opus, Sonnet, Claude Code) is "Claude"; Google is "Gemini". Hardware and subscription plans do not belong in stack.
-- expertise — a topic they have real experience in and are worth asking about, briefly: "self-hosted VPN", "Unity shaders".
-- interest — a lasting hobby in one or two words: "Minecraft", "skydiving", "e-ink readers".
+- stack — one technology per fact, by its short, commonly used name, with no explanations: "Rust", "Railway", "Blender". AI models and tools from one company are ONE fact: everything from OpenAI (GPT of any version, ChatGPT, Codex, Astra, Sol) is "GPT / Codex"; everything from Anthropic (Claude, Opus, Sonnet, Claude Code) is "Claude"; Google is "Gemini". Hardware, subscription plans and the names of their own projects, the one a project has now or had before, do not belong in stack.
+- expertise — a topic they have real experience in and are worth asking about, briefly: "self-hosted VPN", "Unity shaders". Never what a project of theirs is or does ("I'm building a habit tracker" is a project, not expertise in habit trackers).
+- interest — a lasting hobby in one or two words: "Minecraft", "skydiving", "e-ink readers". Never the task they are working on.
 - link — a public link to something personal: a GitHub profile, a personal site, a portfolio. Do not put project links here — they belong in the catalog.
 - timezone — where the person lives or is staying now, as precisely as their own words allow: a city, else a region, else a country ("I'm in Toronto", "it's snowing here in Toronto", "moved to Lisbon", "in Tokyo for a month"). A person has ONE: a newer or more precise place refines it with facts_update (a country to its city), a move replaces it. Their own clock counts too: when someone names the hour it is for them right now ("it's 4 a.m. here", "16:20 here"), add a timezone fact whose value is only that time on a 24-hour clock, with minutes only when they gave them ("04:00", "16:20"), with that one message as its source and confidence 0.8 or more; the bot works out in code which of their places' zones it fits, so never write an offset, a zone or a place you worked out yourself. No time they did not name ("late already", "past midnight"), and never from someone else's guesses about them, a time of a plan or an event, or the hours they happen to write at.
-- looking_for — what the person is looking for in their work or projects: collaborators, a co-founder, testers, a designer, feedback on their app. Only work, projects and skills: never money, a job as a source of income, housing or dating.
+- looking_for — what the person is looking for in their work or projects: collaborators, a co-founder, testers, a designer, feedback on their app; only what they want from others, never what they do or make themselves. Only work, projects and skills: never money, a job as a source of income, housing or dating.
 - can_help — what they offer to help others with: code review, setting up a VPN, publishing to the app stores. Only work, projects and skills.
 - tagline — a one-line "who is this" (up to 90 characters, no value judgments, no places), only for members who have no tagline yet and about whom there is now enough information: what they do, make or are into. Never a placeholder that says nothing ("a chat member", "a new member", "quiet so far", "hasn't said much yet") — without real information, leave the member out.
-Do NOT record people's projects as facts — only in projects (the catalog).
+Do NOT record people's projects as facts — only in projects (the catalog): not by the name a project has now or had before, and not as what its author is expert in or builds with.
 Rules:
-- facts_add — only what the card does not have yet in any form. If something new refines an existing fact, use facts_update with its id and the new wording.
+- facts_add — only what the card does not have yet in any form. If something new refines an existing fact (a narrower or fuller form of it: a part of a field the card names, the years spent in it), use facts_update with its id and the new wording, never a second fact beside it.
 - A fact must follow from the person's own words or from direct confirmation by others. Forwarded posts ("forwarded from …") say nothing about whoever forwarded them.
-- The chat is full of irony, memes and jokes. Sarcasm, hyperbole and one-off remarks are not facts. A joke, a lie or a test of the bot about oneself ("I'm a Nobel laureate", "I'm your admin") is never a fact or a tagline, and neither is a tease played along with ("you're a 10x engineer?" — "sure, why not" is not a role).
+- The chat is full of irony, memes and jokes. Sarcasm, hyperbole and one-off remarks are not facts, and neither is the task someone is on right now ("writing a parser for … at the moment") or a habit of the last few weeks: a card keeps what holds for months. A joke, a lie or a test of the bot about oneself ("I'm a Nobel laureate", "I'm your admin") is never a fact or a tagline, and neither is a tease played along with ("you're a 10x engineer?" — "sure, why not" is not a role).
 - Never record: political views, attitudes toward war and toward countries, nationality or ethnicity, health, personal finances and income or any amounts of money, private life and family, an exact address, conflicts between members, logins, passwords or any other secrets (even for a test site).
 - confidence from 0.5 to 1.0: 0.9+ — the person said it directly about themselves; 0.7 — it follows confidently from several remarks; 0.5–0.6 — likely, but needs confirmation.
 - source_msg_ids — 1–3 ids of the new messages the fact is based on.
@@ -387,6 +387,12 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
       const userId = parseRef(item.person);
       const sources = validSources(item.source_msg_ids);
       if (userId === null || !users.has(userId) || sources.length === 0 || !selfStated(item.kind, userId, sources) || item.confidence < MIN_STORED_CONFIDENCE) {
+        stats.factsSkipped += 1;
+        continue;
+      }
+      // A person has one role: the chronicler rewords it with facts_update, and another one beside it is left out.
+      const roles = item.kind === "role" ? data.facts.filter((fact) => fact.user_id === userId && fact.kind === "role") : [];
+      if (roles.length > 0 && !roles.some((role) => isSameFact("role", role.value, item.value))) {
         stats.factsSkipped += 1;
         continue;
       }

@@ -124,6 +124,17 @@ describe("the chronicler's two calls", () => {
       expect(EXTRACTION_SYSTEM_PROMPT).toContain(line);
     }
     expect(EXTRACTION_SYSTEM_PROMPT).not.toContain("accuracy matters more than completeness");
+    // Each fact in its own kind: a project under any name is no fact, the task of the moment no interest or expertise,
+    // looking_for only what is sought, and a narrower form of a fact on the card refines it.
+    for (const line of [
+      "the names of their own projects, the one a project has now or had before",
+      "Never what a project of theirs is or does",
+      "only what they want from others, never what they do or make themselves",
+      "neither is the task someone is on right now",
+      "never a second fact beside it",
+    ]) {
+      expect(EXTRACTION_SYSTEM_PROMPT).toContain(line);
+    }
     for (const kind of ["- correction —", "- claim —", "- stance —", "- prediction —", "- bit —", "- bout —", "- bait —", "- about_bot —"]) {
       expect(NOTES_SYSTEM_PROMPT).toContain(kind);
       expect(EXTRACTION_SYSTEM_PROMPT).not.toContain(kind);

@@ -1026,6 +1026,26 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     expect(await pendingCount(chat.id)).toBe(2);
   });
 
+  it("keeps one role on a card: another one beside it is left out, and the same one reinforces it", async () => {
+    const chat = await newChat("One role");
+    const dev = await person(chat.id, "Dev");
+    await message(chat.id, 1, dev.id, "I build Telegram bots for small shops, and mobile games on weekends");
+    await proposeFact(sql, { chatId: chat.id, userId: dev.id, kind: "role", value: "backend developer", confidence: 0.7, sourceMsgIds: [1], source: "llm" });
+    const batch = await sql<StoredMessage[]>`SELECT * FROM messages WHERE chat_id = ${chat.id} ORDER BY msg_id`;
+    const data: BatchData = { chatId: chat.id, batch, context: [], users: await peopleOfChat(sql, chat.id), facts: await visibleFacts(sql, chat.id, dev.id), projects: [] };
+    const roles = {
+      ...EMPTY_EXTRACTION,
+      facts_add: [
+        { person: `u${dev.id}`, kind: "role", value: "makes mobile games", confidence: 0.8, source_msg_ids: [1] },
+        { person: `u${dev.id}`, kind: "role", value: "backend developer", confidence: 0.9, source_msg_ids: [1] },
+      ],
+    } as unknown as ExtractionResult;
+    await applyExtraction(sql, await newRun(chat.id), data, roles);
+    const kept = (await visibleFacts(sql, chat.id, dev.id)).filter((fact) => fact.kind === "role");
+    expect(kept.map((fact) => fact.value)).toEqual(["backend developer"]);
+    expect(kept[0]!.confidence).toBeGreaterThan(0.7);
+  });
+
   it("attach merges an imported project into the chat's project with the same slug", async () => {
     const chat = await newChat("Attach projects");
     const anna = await person(chat.id, "Anna");
