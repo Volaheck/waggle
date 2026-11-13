@@ -118,6 +118,12 @@ describe("the chronicler's two calls", () => {
     for (const line of ["- tagline —", "nationality or ethnicity", "logins, passwords", "no places", "where the person lives or is staying now", "debate (an argument"]) {
       expect(EXTRACTION_SYSTEM_PROMPT).toContain(line);
     }
+    // Cards grow from what people say about themselves: the chronicler goes through every member who wrote, and takes
+    // every lasting point of a long story about their own work, not just the first.
+    for (const line of ["Go through every member who wrote in <new_messages>, one by one", "take every lasting point of it", "never a lasting one they did say left out"]) {
+      expect(EXTRACTION_SYSTEM_PROMPT).toContain(line);
+    }
+    expect(EXTRACTION_SYSTEM_PROMPT).not.toContain("accuracy matters more than completeness");
     for (const kind of ["- correction —", "- claim —", "- stance —", "- prediction —", "- bit —", "- bout —", "- bait —", "- about_bot —"]) {
       expect(NOTES_SYSTEM_PROMPT).toContain(kind);
       expect(EXTRACTION_SYSTEM_PROMPT).not.toContain(kind);
