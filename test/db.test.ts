@@ -14,11 +14,17 @@ import { resolveUser, type Person } from "../src/core/users.js";
 import { importSeed, parseSeed } from "../src/scripts/seed.js";
 import { applyConsolidation, loadConsolidationInput } from "../src/worker/consolidate.js";
 import { applyExtraction, buildExtractionPrompt, runExtractionPass, type ExtractionResult } from "../src/worker/extract.js";
+import { FACT_REVIEW_SYSTEM_PROMPT } from "../src/worker/fact-review.js";
 import { NOTES_SYSTEM_PROMPT } from "../src/worker/notes-extract.js";
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
 const CHAT_ID = -1001234567890;
 const OTHER_CHAT_ID = -1009876543210;
+
+/** The review of proposed card facts, as a model that keeps every proposal it is shown. */
+const keepAll = (prompt: string) => ({
+  verdicts: [...prompt.matchAll(/^ {2}([au]\d+) (?:add|change|outdate) /gm)].map(([, item]) => ({ item, decision: "keep", why: "sound", kind: null, fact: null, value: null })),
+});
 const TOKEN = "123456:TEST-TOKEN";
 
 describe.skipIf(!DATABASE_URL)("with postgres", () => {
@@ -140,15 +146,18 @@ describe.skipIf(!DATABASE_URL)("with postgres", () => {
     let prompt = "";
     const fakeAnthropic = {
       messages: {
-        // The chronicle and the cards come from the first call; the second one, for the private notes, finds none.
+        // The chronicle and the cards come from the first call; the review of its card facts keeps them all, and the
+        // call for the private notes finds none.
         stream: (params: { system: string; messages: { content: string }[] }) => {
           const notesCall = params.system === NOTES_SYSTEM_PROMPT;
-          if (!notesCall) prompt = params.messages[0]!.content;
+          const reviewCall = params.system === FACT_REVIEW_SYSTEM_PROMPT;
+          if (!notesCall && !reviewCall) prompt = params.messages[0]!.content;
+          const answer = notesCall ? { notes: [], aliases: [] } : reviewCall ? keepAll(params.messages[0]!.content) : fakeResult;
           return {
             finalMessage: async () => ({
               stop_reason: "end_turn",
               stop_details: null,
-              content: [{ type: "text", text: JSON.stringify(notesCall ? { notes: [], aliases: [] } : fakeResult) }],
+              content: [{ type: "text", text: JSON.stringify(answer) }],
               usage: { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
             }),
           };
@@ -159,6 +168,8 @@ describe.skipIf(!DATABASE_URL)("with postgres", () => {
     const deps = { sql, anthropic: fakeAnthropic, chatId: CHAT_ID, chatBudgetUsd: 2, config: { EXTRACTION_MODEL: "claude-haiku-5-5", MONTHLY_LLM_BUDGET_USD: 5 } };
     const stats = await runExtractionPass(deps);
     expect(stats.calls).toBe(1);
+    expect(stats.reviewCalls).toBe(1);
+    expect(stats.reviewFailures).toEqual([]);
     expect(stats.notesCalls).toBe(1);
     expect(stats.notesFailures).toEqual([]);
     expect(stats.topics).toBe(1);

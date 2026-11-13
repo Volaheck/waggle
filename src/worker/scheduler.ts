@@ -196,8 +196,11 @@ export function createChatProcessor(options: SchedulerOptions, signals?: StopSig
           endUserId: options.endUserIdOf?.(chat.id),
         });
         log(
-          `[extract] ${title}: ${result.messages} messages in ${result.calls} call(s): ${result.topics} topics, facts +${result.factsAdded} ↑${result.factsReinforced} ✎${result.factsUpdated}, projects +${result.projectsCreated} ~${result.projectsUpdated}; notes ${result.notes}, aliases +${result.aliases} in ${result.notesCalls} call(s)`,
+          `[extract] ${title}: ${result.messages} messages in ${result.calls} call(s): ${result.topics} topics, facts +${result.factsAdded} ↑${result.factsReinforced} ✎${result.factsUpdated}, projects +${result.projectsCreated} ~${result.projectsUpdated}; facts reviewed in ${result.reviewCalls} call(s): kept ${result.review.kept}, refined ${result.review.refined}, dropped ${result.review.dropped}${result.review.dropped ? ` (${Object.entries(result.review.why).map(([why, count]) => `${why} ${count}`).join(", ")})` : ""}; notes ${result.notes}, aliases +${result.aliases} in ${result.notesCalls} call(s)`,
         );
+        if (result.reviewFailures.length) {
+          log(`[extract] ${title}: the review of proposed card facts failed for ${result.reviewFailures.map((failure) => `${failure.firstMsgId}–${failure.lastMsgId} (${failure.reason})`).join("; ")}; their facts were left out`);
+        }
         if (result.notesFailures.length) {
           log(`[extract] ${title}: the notes call failed for ${result.notesFailures.map((failure) => `${failure.firstMsgId}–${failure.lastMsgId} (${failure.reason})`).join("; ")}`);
         }

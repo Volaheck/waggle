@@ -9,6 +9,7 @@ import { SELF_GENDER } from "../src/core/voice.js";
 import { IDEA_SYSTEM_PROMPT } from "../src/worker/ideas.js";
 import { buildExtractionPrompt, EXTRACTION_SYSTEM_PROMPT, isPassDue, passDueAt } from "../src/worker/extract.js";
 import { CONSOLIDATION_SYSTEM_PROMPT } from "../src/worker/consolidate.js";
+import { FACT_REVIEW_SYSTEM_PROMPT } from "../src/worker/fact-review.js";
 import { NOTES_SYSTEM_PROMPT, namesForRefs } from "../src/worker/notes-extract.js";
 import { factCore, isNearDuplicate, isSameFact } from "../src/core/facts.js";
 import { detectLanguage } from "../src/core/language.js";
@@ -250,6 +251,7 @@ describe("chronicler prompts", () => {
       expect(prompt).not.toMatch(cyrillic);
     }
     expect(NOTES_SYSTEM_PROMPT).not.toMatch(cyrillic);
+    expect(FACT_REVIEW_SYSTEM_PROMPT).not.toMatch(cyrillic);
   });
 
   it("tell the model the chat's language when it can be measured", () => {

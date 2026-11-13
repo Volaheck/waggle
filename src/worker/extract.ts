@@ -8,9 +8,32 @@ import type { StoredMessage } from "../core/messages.js";
 import { PROJECT_STATUSES, projectForSlug, renameProject, upsertProject, type UpsertResult } from "../core/projects.js";
 import { hasForbiddenTopic, slugify, truncate } from "../core/text.js";
 import type { Person } from "../core/users.js";
-import { batchDataFor, chatLanguageOf, isOwner, MESSAGE_COLUMNS, memberSources, memberZones, messageBlocks, parseRef, skippedKey, type BatchData } from "./batch.js";
+import {
+  batchDataFor,
+  chatLanguageOf,
+  isOwner,
+  MESSAGE_COLUMNS,
+  memberSources,
+  memberZones,
+  messageBlocks,
+  MIN_STORED_CONFIDENCE,
+  parseRef,
+  skippedKey,
+  type BatchData,
+} from "./batch.js";
 import { CLOCK_TIME, noteClock, writtenZone } from "../core/zones.js";
 import { applyNotesResult, buildNotesPrompt, callNotesExtractor, NOTES_PURPOSE, type BatchDebate } from "./notes-extract.js";
+import {
+  applyFactReview,
+  buildFactReviewPrompt,
+  callFactReviewer,
+  emptyTally,
+  projectsOfMembers,
+  REVIEW_PURPOSE,
+  reviewItems,
+  withoutReviewed,
+  type ReviewTally,
+} from "./fact-review.js";
 
 export { batchDataFor, MESSAGE_COLUMNS, skippedMessageIds, type BatchData, type PromptNote } from "./batch.js";
 
@@ -21,10 +44,11 @@ export const FACT_ADD_KINDS = [...EXTRACTABLE_KINDS, "tagline"] as const;
 export const TOPIC_KINDS = ["discussion", "project", "link", "news", "debate"] as const;
 export const SIGNAL_KINDS = ["praise", "critique", "usage", "contribution", "interest", "milestone"] as const;
 
-const MIN_STORED_CONFIDENCE = 0.5;
 const MIN_PROJECT_CONFIDENCE = 0.6;
 /** After this many refused notes calls in a chat within a day, the notes call waits there for the rest of the day. */
 const NOTES_REFUSALS_PER_DAY = 2;
+/** After this many refused reviews of card facts in a chat within a day, the facts there wait for the rest of the day. */
+const REVIEW_REFUSALS_PER_DAY = 2;
 /** Safety valve for an abnormal burst; a normal interval fits into one call. */
 export const MAX_MESSAGES_PER_CALL = 2500;
 /** A batch the model keeps refusing is halved down to this size; a slice this small that still fails is skipped. */
@@ -658,6 +682,9 @@ export type SkippedRange = { firstMsgId: number; lastMsgId: number; messages: nu
 /** A notes call that came back unusable: the batch stays applied without notes. */
 export type NotesFailure = { firstMsgId: number; lastMsgId: number; reason: string; refusal: boolean };
 
+/** A review of proposed card facts that could not be had: the batch is applied without those proposals. */
+export type ReviewFailure = NotesFailure;
+
 /**
  * `calls`, `failedCalls` and `refusals` are about the first call: a refused one, each retry of a refused slice included,
  * is what pauses a chat (see the scheduler). The notes call keeps its own count, and its failures never pause anything.
@@ -673,16 +700,20 @@ export type PassResult = ApplyStats & {
   aliases: number;
   notesCalls: number;
   notesFailures: NotesFailure[];
+  /** The checks of proposed card facts (fact-review.ts): calls, what they kept, refined and dropped, and those not had. */
+  reviewCalls: number;
+  review: ReviewTally;
+  reviewFailures: ReviewFailure[];
 };
 
-/** Refused notes calls in the chat over the last day, this pass's own included. */
-async function notesRefusedToday(sql: Sql, chatId: number, runId: number, total: PassResult): Promise<number> {
+/** Refused calls of one of the second calls (the notes, the review of card facts) in the chat over the last day, this pass's own included. */
+async function refusedToday(sql: Sql, chatId: number, runId: number, failures: "notesFailures" | "reviewFailures", total: PassResult): Promise<number> {
   const [row] = await sql<{ refusals: number }[]>`
-    SELECT coalesce(sum((SELECT count(*) FROM jsonb_array_elements(coalesce(r.stats->'notesFailures', '[]'::jsonb)) AS failure
+    SELECT coalesce(sum((SELECT count(*) FROM jsonb_array_elements(coalesce(r.stats->(${failures}::text), '[]'::jsonb)) AS failure
                          WHERE failure->>'refusal' = 'true')), 0)::int AS refusals
     FROM extraction_runs r
     WHERE r.chat_id = ${chatId} AND r.id <> ${runId} AND r.started_at > now() - interval '1 day'`;
-  return (row?.refusals ?? 0) + total.notesFailures.filter((failure) => failure.refusal).length;
+  return (row?.refusals ?? 0) + total[failures].filter((failure) => failure.refusal).length;
 }
 
 /**
@@ -696,7 +727,7 @@ async function extractNotes(deps: ExtractorDeps, runId: number, data: BatchData,
   const { sql, config, chatId } = deps;
   if (deps.drain?.aborted) return;
   const [chat] = await sql<{ paused: boolean }[]>`SELECT chronicle_paused_at IS NOT NULL AS paused FROM chats WHERE id = ${chatId}`;
-  if (chat?.paused || (await notesRefusedToday(sql, chatId, runId, total)) >= NOTES_REFUSALS_PER_DAY) return;
+  if (chat?.paused || (await refusedToday(sql, chatId, runId, "notesFailures", total)) >= NOTES_REFUSALS_PER_DAY) return;
   try {
     await assertBudget(sql, config.MONTHLY_LLM_BUDGET_USD, { id: chatId, limitUsd: deps.chatBudgetUsd });
   } catch (error) {
@@ -728,8 +759,51 @@ async function extractNotes(deps: ExtractorDeps, runId: number, data: BatchData,
 }
 
 /**
- * One pass = everything pending since the previous pass, normally in a single call for the chronicle and the cards,
- * followed by one for the private notes (extractNotes). A batch the model refuses, cuts off or answers unusably in the
+ * The proposed card facts of an answer, checked before anything is applied (fact-review.ts). A review that comes back
+ * unusable, that the spending caps leave no room for, or that rests for the day after REVIEW_REFUSALS_PER_DAY refusals in
+ * the chat, leaves those proposals out and is recorded in the run's stats: the rest of the answer goes on, and nothing
+ * unchecked reaches a card. Once the bot is stopping no review starts, and a broken connection fails the pass as the
+ * first call's would: either way the batch is read again later, with its facts.
+ */
+async function reviewFacts(deps: ExtractorDeps, runId: number, data: BatchData, result: ExtractionResult, total: PassResult): Promise<ExtractionResult> {
+  const { sql, config, chatId } = deps;
+  const items = reviewItems(result, data);
+  if (items.length === 0) return withoutReviewed(result, data);
+  if (deps.drain?.aborted) throw new Error(INTERRUPTED_PASS_ERROR);
+  const batchIds = data.batch.map((message) => message.msg_id);
+  const failed = (reason: string, refusal: boolean) => {
+    total.reviewFailures.push({ firstMsgId: batchIds[0]!, lastMsgId: batchIds[batchIds.length - 1]!, reason, refusal });
+    total.review.dropped += items.length;
+    total.review.why.unreviewed = (total.review.why.unreviewed ?? 0) + items.length;
+    return withoutReviewed(result, data);
+  };
+  if ((await refusedToday(sql, chatId, runId, "reviewFailures", total)) >= REVIEW_REFUSALS_PER_DAY) {
+    return failed(`the review rests for the day after ${REVIEW_REFUSALS_PER_DAY} refusals in the chat`, false);
+  }
+  try {
+    await assertBudget(sql, config.MONTHLY_LLM_BUDGET_USD, { id: chatId, limitUsd: deps.chatBudgetUsd });
+  } catch (error) {
+    if (error instanceof BudgetExceededError) return failed(error.message, false);
+    throw error;
+  }
+  const projects = await projectsOfMembers(sql, chatId, [...new Set(items.map((item) => item.userId))]);
+  total.reviewCalls += 1;
+  const outcome = await callFactReviewer(
+    deps.anthropic,
+    config.EXTRACTION_MODEL,
+    buildFactReviewPrompt(data, items, projects, result),
+    (usage) => recordUsage(sql, REVIEW_PURPOSE, config.EXTRACTION_MODEL, usage, chatId),
+    deps.signal,
+    deps.endUserId,
+  );
+  if (!outcome.ok) return failed(outcome.message, outcome.failure === "refusal");
+  return applyFactReview(result, data, items, outcome.data, total.review);
+}
+
+/**
+ * One pass = everything pending since the previous pass, normally in a single call for the chronicle and the cards, whose
+ * proposed card facts are checked by a call of their own (reviewFacts), followed by one for the private notes
+ * (extractNotes). A batch the model refuses, cuts off or answers unusably in the
  * first call is retried in halves; a slice of
  * MIN_MESSAGES_PER_CALL messages or fewer that still fails is skipped, so no message can hold up
  * the chat's chronicle for good. Every response is recorded as spending, usable or not.
@@ -743,7 +817,21 @@ export async function runExtractionPass(deps: ExtractorDeps): Promise<PassResult
   const runId = run!.id;
   const [{ ceiling } = { ceiling: null }] = await sql<{ ceiling: number | null }[]>`
     SELECT max(msg_id) AS ceiling FROM messages WHERE chat_id = ${chatId} AND extracted_at IS NULL`;
-  const total: PassResult = { ...emptyStats(), calls: 0, failedCalls: 0, refusals: 0, messages: 0, skipped: [], notes: 0, aliases: 0, notesCalls: 0, notesFailures: [] };
+  const total: PassResult = {
+    ...emptyStats(),
+    calls: 0,
+    failedCalls: 0,
+    refusals: 0,
+    messages: 0,
+    skipped: [],
+    notes: 0,
+    aliases: 0,
+    notesCalls: 0,
+    notesFailures: [],
+    reviewCalls: 0,
+    review: emptyTally(),
+    reviewFailures: [],
+  };
   const onUsage = (usage: UsageLike) => recordUsage(sql, "extract", config.EXTRACTION_MODEL, usage, chatId);
   let firstMsgId: number | null = null;
   let lastMsgId: number | null = null;
@@ -771,7 +859,7 @@ export async function runExtractionPass(deps: ExtractorDeps): Promise<PassResult
       const outcome = await callExtractor(anthropic, config.EXTRACTION_MODEL, buildExtractionPrompt(data), onUsage, deps.signal, deps.endUserId);
       total.calls += 1;
       if (outcome.ok) {
-        const stats = await applyExtraction(sql, runId, data, outcome.data);
+        const stats = await applyExtraction(sql, runId, data, await reviewFacts(deps, runId, data, outcome.data, total));
         for (const key of Object.keys(stats) as (keyof ApplyStats)[]) total[key] += stats[key];
         total.messages += batchIds.length;
         await extractNotes(deps, runId, data, total);

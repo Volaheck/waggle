@@ -17,6 +17,7 @@ import { hasForbiddenTopic, transliterateName } from "../src/core/text.js";
 import { forgetUser, getPerson, resolveUser, setOptOut, type User } from "../src/core/users.js";
 import { EXTRACTABLE_KINDS, EXTRACTION_SYSTEM_PROMPT, INTERRUPTED_PASS_ERROR, runExtractionPass, type ExtractionResult } from "../src/worker/extract.js";
 import { nextExtractionRetryAt } from "../src/worker/scheduler.js";
+import { FACT_REVIEW_SYSTEM_PROMPT } from "../src/worker/fact-review.js";
 import { NOTES_SYSTEM_PROMPT } from "../src/worker/notes-extract.js";
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -719,15 +720,22 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
   });
 
   describe("the chronicler and the bot's lines", () => {
-    /** The first call answers with `result`; the second one, for the private notes, finds none and is not among the prompts. */
+    /**
+     * The first call answers with `result`; the review of its card facts keeps them all, and the call for the private notes
+     * finds none: neither is among the prompts.
+     */
     function fakeModel(result: ExtractionResult) {
       const prompts: string[] = [];
       const client = {
         messages: {
           stream(params: { system: string; messages: { content: string }[] }) {
             const notesCall = params.system === NOTES_SYSTEM_PROMPT;
-            if (!notesCall) prompts.push(params.messages[0]!.content);
-            const answer = notesCall ? { notes: [], aliases: [] } : result;
+            const reviewCall = params.system === FACT_REVIEW_SYSTEM_PROMPT;
+            if (!notesCall && !reviewCall) prompts.push(params.messages[0]!.content);
+            const keepAll = () => ({
+              verdicts: [...params.messages[0]!.content.matchAll(/^ {2}([au]\d+) (?:add|change|outdate) /gm)].map(([, item]) => ({ item, decision: "keep", why: "sound", kind: null, fact: null, value: null })),
+            });
+            const answer = notesCall ? { notes: [], aliases: [] } : reviewCall ? keepAll() : result;
             const message = { stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify(answer) }], usage: { input_tokens: 10_000, output_tokens: 1_000 } };
             return { currentMessage: message, finalMessage: async () => message };
           },

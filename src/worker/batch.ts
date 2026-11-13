@@ -232,6 +232,9 @@ export function parseRef(ref: string): number | null {
   return match ? Number(match[1]) : null;
 }
 
+/** The least confidence a fact or a tagline the chronicler proposes needs to be stored. */
+export const MIN_STORED_CONFIDENCE = 0.5;
+
 /** Message ids of the batch that a member wrote: the bot's own lines are context, never a source about anyone. */
 export function memberSources(batchById: Map<number, StoredMessage>) {
   return (ids: number[], max = 3) => ids.filter((id) => batchById.has(id) && !batchById.get(id)!.from_bot).slice(0, max);

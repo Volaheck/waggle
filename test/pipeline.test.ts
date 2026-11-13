@@ -15,6 +15,7 @@ import { applyConsolidation, CONSOLIDATION_SYSTEM_PROMPT, ConsolidationSchema, c
 import {
   applyExtraction,
   buildExtractionPrompt,
+  EXTRACTION_SYSTEM_PROMPT,
   ExtractionSchema,
   FACT_ADD_KINDS,
   INTERRUPTED_PASS_ERROR,
@@ -23,6 +24,7 @@ import {
   type BatchData,
   type ExtractionResult,
 } from "../src/worker/extract.js";
+import { FACT_REVIEW_SYSTEM_PROMPT } from "../src/worker/fact-review.js";
 import { NOTES_SYSTEM_PROMPT, NotesSchema } from "../src/worker/notes-extract.js";
 import { chatBudgetUsd, createChatProcessor, extractionRetryDelayMs, nextExtractionRetryAt, startExtractionScheduler, startMessageRetention } from "../src/worker/scheduler.js";
 
@@ -155,15 +157,27 @@ interface FakeAnswer {
 
 const EMPTY_NOTES = JSON.stringify({ notes: [], aliases: [] });
 
-/** Each pass makes a second call for the private notes after a batch is applied; unless `notes` says otherwise, it finds none. */
-function fakeAnthropic(answer: (request: { system: string; prompt: string }) => FakeAnswer, notes: (request: { system: string; prompt: string }) => FakeAnswer = () => ({ text: EMPTY_NOTES })) {
+/** The review of proposed card facts, as a model that keeps every proposal it is shown. */
+const keepAll = (prompt: string) => ({
+  verdicts: [...prompt.matchAll(/^ {2}([au]\d+) (?:add|change|outdate) /gm)].map(([, item]) => ({ item, decision: "keep", why: "sound", kind: null, fact: null, value: null })),
+});
+
+/**
+ * Each pass makes a second call for the private notes after a batch is applied; unless `notes` says otherwise, it finds
+ * none. The card facts a batch proposes are reviewed first, by a call that keeps them all unless `review` says otherwise.
+ */
+function fakeAnthropic(
+  answer: (request: { system: string; prompt: string }) => FakeAnswer,
+  notes: (request: { system: string; prompt: string }) => FakeAnswer = () => ({ text: EMPTY_NOTES }),
+  review: (request: { system: string; prompt: string }) => FakeAnswer = ({ prompt }) => ({ text: JSON.stringify(keepAll(prompt)) }),
+) {
   const requests: { system: string; prompt: string; userId?: string }[] = [];
   const client = {
     messages: {
       stream(params: { system: string; messages: { content: string }[]; metadata?: { user_id?: string } }) {
         const request = { system: params.system, prompt: params.messages[0]!.content, userId: params.metadata?.user_id };
         requests.push(request);
-        const reply = request.system === NOTES_SYSTEM_PROMPT ? notes(request) : answer(request);
+        const reply = request.system === NOTES_SYSTEM_PROMPT ? notes(request) : request.system === FACT_REVIEW_SYSTEM_PROMPT ? review(request) : answer(request);
         const message = {
           stop_reason: reply.stopReason ?? "end_turn",
           stop_details: reply.stopReason === "refusal" ? { type: "refusal", category: "cyber", explanation: null } : null,
@@ -464,6 +478,246 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     // The text stays as written for the chat's own members.
     const [stored] = await sql<{ text: string }[]>`SELECT text FROM messages WHERE chat_id = ${chat.id} AND msg_id = 1`;
     expect(stored!.text).toContain("+7 (912) 345-67-89");
+  });
+
+  it("checks the card facts a pass proposes before they are applied: keeps, moves to its kind, refines a card fact and drops the rest", async () => {
+    const chat = await newChat("Reviewed facts");
+    const lena = await person(chat.id, "Lena");
+    const kit = await person(chat.id, "Kit");
+    const lumen = await project(chat.id, "lumen", "Lumen", [lena.id]);
+    await sql`UPDATE projects SET tagline = 'a habit tracker with an open API' WHERE id = ${lumen}`;
+    const illustration = await fact(chat.id, lena.id, "expertise", "illustration");
+    const drawing = await fact(chat.id, lena.id, "interest", "drawing");
+    await message(chat.id, 1, lena.id, "I have drawn illustrations and comics for ten years");
+    await message(chat.id, 2, kit.id, "what editor do you use?");
+    await message(chat.id, 3, lena.id, "emacs, every day; right now I am writing a parser for a client, and Lumen has an open API");
+    const proposed: ExtractionResult = {
+      ...EMPTY_EXTRACTION,
+      topics: [{ title: "Lena's editor", summary: "Lena uses emacs.", kind: "discussion", importance: 2, project: null, msg_ids: [2, 3] }],
+      facts_add: [
+        { person: `u${lena.id}`, kind: "expertise", value: "comics (10 years)", confidence: 0.9, source_msg_ids: [1] },
+        { person: `u${lena.id}`, kind: "interest", value: "emacs", confidence: 0.8, source_msg_ids: [3] },
+        { person: `u${lena.id}`, kind: "expertise", value: "parsers", confidence: 0.7, source_msg_ids: [3] },
+        { person: `u${lena.id}`, kind: "stack", value: "Lumen API", confidence: 0.7, source_msg_ids: [3] },
+        { person: `u${lena.id}`, kind: "can_help", value: "code review", confidence: 0.7, source_msg_ids: [3] },
+        { person: `u${lena.id}`, kind: "tagline", value: "Illustrator who lives in emacs", confidence: 0.8, source_msg_ids: [1, 3] },
+      ],
+      facts_update: [{ fact_id: drawing, value: null, source_msg_ids: [3] }],
+    };
+    const verdicts = [
+      { item: "a1", decision: "refine", why: "refines", kind: null, fact: `[f${illustration}]`, value: "illustration and comics (10 years)" },
+      { item: "a2", decision: "keep", why: "sound", kind: "stack", fact: null, value: "Emacs" },
+      { item: "a3", decision: "drop", why: "not_lasting", kind: null, fact: null, value: null },
+      { item: "a4", decision: "drop", why: "project", kind: null, fact: null, value: null },
+      { item: "u1", decision: "drop", why: "other", kind: null, fact: null, value: null },
+      // A verdict on nothing that was proposed changes nothing; a5 gets none and is left out.
+      { item: "a9", decision: "keep", why: "sound", kind: null, fact: null, value: null },
+    ];
+    const { client, requests } = fakeAnthropic(
+      () => ({ text: JSON.stringify(proposed) }),
+      undefined,
+      () => ({ text: JSON.stringify({ verdicts }) }),
+    );
+    const result = await runExtractionPass(deps(chat.id, client));
+
+    expect(requests.map((request) => request.system)).toEqual([EXTRACTION_SYSTEM_PROMPT, FACT_REVIEW_SYSTEM_PROMPT, NOTES_SYSTEM_PROMPT]);
+    // The review sees the member's card, their projects with what each is, what is proposed and the messages around it;
+    // the tagline and the members with nothing proposed are not its business.
+    const review = requests[1]!.prompt;
+    expect(review).toContain(`u${lena.id} | Lena`);
+    expect(review).toContain(`[f${illustration}] expertise: illustration`);
+    expect(review).toContain("Lumen (in_progress): a habit tracker with an open API");
+    expect(review).toContain("a1 add expertise: «comics (10 years)», from 1");
+    expect(review).toContain(`u1 outdate [f${drawing}] interest: «drawing», from 3`);
+    expect(review).toContain("what editor do you use?");
+    expect(review).not.toContain("Illustrator who lives in emacs");
+    expect(review).not.toContain(`u${kit.id} |`);
+
+    const card = (await visibleFacts(sql, chat.id, lena.id)).map((row) => `${row.kind}: ${row.value}`).sort();
+    expect(card).toEqual(["expertise: illustration and comics (10 years)", "interest: drawing", "stack: Emacs"]);
+    expect((await getPerson(sql, chat.id, lena.id))?.tagline).toBe("Illustrator who lives in emacs");
+    expect(result).toMatchObject({ topics: 1, reviewCalls: 1, reviewFailures: [] });
+    expect(result.review).toEqual({ kept: 1, refined: 1, dropped: 4, why: { not_lasting: 1, project: 1, unreviewed: 1, other: 1 } });
+    const [usage] = await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM llm_usage WHERE chat_id = ${chat.id} AND purpose = 'extract_review'`;
+    expect(usage!.count).toBe(1);
+  });
+
+  it("leaves proposed card facts out when their review cannot be had, and fails the pass when the connection breaks", async () => {
+    const chat = await newChat("Unreviewed facts");
+    const lena = await person(chat.id, "Lena");
+    await message(chat.id, 1, lena.id, "I write Rust every day");
+    const rust = { person: `u${lena.id}`, kind: "stack" as const, value: "Rust", confidence: 0.9, source_msg_ids: [1] };
+    const proposed: ExtractionResult = {
+      ...EMPTY_EXTRACTION,
+      topics: [{ title: "Rust", summary: "Lena writes Rust.", kind: "discussion", importance: 2, project: null, msg_ids: [1] }],
+      facts_add: [rust],
+    };
+    const refused = fakeAnthropic(
+      () => ({ text: JSON.stringify(proposed) }),
+      undefined,
+      () => ({ stopReason: "refusal", text: "" }),
+    );
+    const result = await runExtractionPass(deps(chat.id, refused.client));
+    expect(result.reviewFailures).toEqual([{ firstMsgId: 1, lastMsgId: 1, reason: "the model refused (cyber)", refusal: true }]);
+    expect(result.review).toEqual({ kept: 0, refined: 0, dropped: 1, why: { unreviewed: 1 } });
+    expect(result.topics).toBe(1);
+    expect(await visibleFacts(sql, chat.id, lena.id)).toEqual([]);
+    expect(await pendingCount(chat.id)).toBe(0);
+
+    // A broken connection fails the pass, as the first call's would: the batch is read again later, with its facts.
+    await message(chat.id, 2, lena.id, "and Go at work");
+    const broken = fakeAnthropic(
+      () => ({ text: JSON.stringify({ ...EMPTY_EXTRACTION, facts_add: [{ ...rust, value: "Go", source_msg_ids: [2] }] }) }),
+      undefined,
+      () => ({ breaks: true }),
+    );
+    await expect(runExtractionPass(deps(chat.id, broken.client))).rejects.toThrow("socket hang up");
+    expect(await pendingCount(chat.id)).toBe(1);
+    expect(await visibleFacts(sql, chat.id, lena.id)).toEqual([]);
+  });
+
+  it("changes a card fact once a batch, never rewords a member's own fact, and shows every name a member's project goes by", async () => {
+    const chat = await newChat("One change a fact");
+    const lena = await person(chat.id, "Lena");
+    const lumen = await project(chat.id, "lumen", "Lumen", [lena.id]);
+    await sql`INSERT INTO aliases (chat_id, project_id, alias, alias_norm, source) VALUES (${chat.id}, ${lumen}, 'Lux', 'lux', 'owner')`;
+    await sql`INSERT INTO change_log (entity, entity_id, op, before, after, source) VALUES ('project', ${lumen}, 'rename', '{"name": "Apex"}', '{"name": "Lumen"}', 'user')`;
+    const backend = await fact(chat.id, lena.id, "expertise", "backend");
+    const music = await fact(chat.id, lena.id, "interest", "music", "manual");
+    await message(chat.id, 1, lena.id, "Eight years of backend now, mostly payments, and I play the guitar");
+    const proposed: ExtractionResult = {
+      ...EMPTY_EXTRACTION,
+      facts_add: [
+        { person: `u${lena.id}`, kind: "expertise", value: "backend, 8 years", confidence: 0.9, source_msg_ids: [1] },
+        { person: `u${lena.id}`, kind: "expertise", value: "payments", confidence: 0.8, source_msg_ids: [1] },
+        { person: `u${lena.id}`, kind: "interest", value: "guitar", confidence: 0.8, source_msg_ids: [1] },
+      ],
+      facts_update: [{ fact_id: backend, value: "backend development", source_msg_ids: [1] }],
+      projects: [{ slug: "tide", name: "Tide", tagline: "a payments sandbox", status: null, stack: [], repo: null, site: null, authors: [`u${lena.id}`], confidence: 0.9, source_msg_ids: [1] }],
+    };
+    // Both adds refine the same fact, and the change kept for it too: one wording, the last given, holds all of it.
+    const verdicts = [
+      { item: "u1", decision: "keep", why: "sound", kind: null, fact: null, value: null },
+      { item: "a1", decision: "refine", why: "refines", kind: null, fact: `f${backend}`, value: "backend development, 8 years" },
+      { item: "a2", decision: "refine", why: "refines", kind: null, fact: `f${backend}`, value: "backend development, 8 years, mostly payments" },
+      { item: "a3", decision: "refine", why: "refines", kind: null, fact: `f${music}`, value: "music, guitar" },
+    ];
+    const { client, requests } = fakeAnthropic(
+      () => ({ text: JSON.stringify(proposed) }),
+      undefined,
+      () => ({ text: JSON.stringify({ verdicts }) }),
+    );
+    const result = await runExtractionPass(deps(chat.id, client));
+
+    const review = requests.find((request) => request.system === FACT_REVIEW_SYSTEM_PROMPT)!.prompt;
+    expect(review).toContain(`[f${music}] their own, interest: music`);
+    expect(review).toContain(`[f${backend}] expertise: backend`);
+    expect(review).toContain("Lumen (also called Lux, Apex) (in_progress)");
+    expect(review).toContain("Tide (new in these messages): a payments sandbox");
+    const card = (await visibleFacts(sql, chat.id, lena.id)).filter((row) => row.kind !== "project").map((row) => `${row.kind}: ${row.value}`).sort();
+    expect(card).toEqual(["expertise: backend development, 8 years, mostly payments", "interest: music"]);
+    expect(result.review).toEqual({ kept: 1, refined: 2, dropped: 1, why: { duplicate: 1 } });
+  });
+
+  it("lets a point said again confirm a fact nobody sees yet, and rewords no fact from a point not confident enough to be shown", async () => {
+    const chat = await newChat("Unconfirmed facts");
+    const lena = await person(chat.id, "Lena");
+    const [hidden] = await sql<{ id: number }[]>`
+      INSERT INTO facts (chat_id, user_id, kind, value, value_norm, confidence, status, source_msg_ids)
+      VALUES (${chat.id}, ${lena.id}, 'expertise', 'illustration', 'illustration', 0.5, 'auto', '{1}') RETURNING id`;
+    const python = await fact(chat.id, lena.id, "stack", "Python");
+    await message(chat.id, 1, lena.id, "I do illustration, and some Django on the side");
+    const proposed: ExtractionResult = {
+      ...EMPTY_EXTRACTION,
+      facts_add: [
+        { person: `u${lena.id}`, kind: "expertise", value: "illustration", confidence: 0.8, source_msg_ids: [1] },
+        { person: `u${lena.id}`, kind: "stack", value: "Django", confidence: 0.5, source_msg_ids: [1] },
+      ],
+    };
+    const verdicts = [
+      { item: "a1", decision: "refine", why: "refines", kind: null, fact: `f${hidden!.id}`, value: "illustration for books" },
+      { item: "a2", decision: "refine", why: "refines", kind: null, fact: `f${python}`, value: "Python, Django" },
+    ];
+    const { client, requests } = fakeAnthropic(
+      () => ({ text: JSON.stringify(proposed) }),
+      undefined,
+      () => ({ text: JSON.stringify({ verdicts }) }),
+    );
+    const result = await runExtractionPass(deps(chat.id, client));
+    expect(requests.find((request) => request.system === FACT_REVIEW_SYSTEM_PROMPT)!.prompt).toContain(`[f${hidden!.id}] unconfirmed, expertise: illustration`);
+    // Said again, the hidden fact is confirmed as it was; the weak point stays off the card, and out of the shown fact.
+    const card = (await visibleFacts(sql, chat.id, lena.id)).map((row) => `${row.kind}: ${row.value}`).sort();
+    expect(card).toEqual(["expertise: illustration", "stack: Python"]);
+    expect(result.review).toEqual({ kept: 2, refined: 0, dropped: 0, why: {} });
+  });
+
+  it("leaves out of the review what the chronicler's own checks would not let on, and starts no review once the bot is stopping", async () => {
+    const chat = await newChat("Unreviewable");
+    const lena = await person(chat.id, "Lena");
+    const quiet = await person(chat.id, "Quiet");
+    await setOptOut(sql, quiet.id, true, chat.id);
+    await message(chat.id, 1, lena.id, "I write Rust every day");
+    await message(chat.id, 2, quiet.id, "I write Go");
+    await message(chat.id, 3, null, "a line with no author");
+    const unreviewable: ExtractionResult = {
+      ...EMPTY_EXTRACTION,
+      facts_add: [
+        { person: `u${lena.id}`, kind: "stack", value: "Rust", confidence: 0.3, source_msg_ids: [1] },
+        { person: `u${lena.id}`, kind: "stack", value: "Elixir", confidence: 0.9, source_msg_ids: [99] },
+        { person: `u${quiet.id}`, kind: "stack", value: "Go", confidence: 0.9, source_msg_ids: [2] },
+      ],
+    };
+    const { client, requests } = fakeAnthropic(() => ({ text: JSON.stringify(unreviewable) }));
+    const result = await runExtractionPass(deps(chat.id, client));
+    expect(requests.map((request) => request.system)).toEqual([EXTRACTION_SYSTEM_PROMPT, NOTES_SYSTEM_PROMPT]);
+    expect(result.reviewCalls).toBe(0);
+    expect(await visibleFacts(sql, chat.id, lena.id)).toEqual([]);
+    expect(await visibleFacts(sql, chat.id, quiet.id)).toEqual([]);
+
+    // The stop begins while the first call answers with a fact to review: no review starts, and the batch waits.
+    await message(chat.id, 4, lena.id, "and Go at work");
+    const drain = new AbortController();
+    const stopping = fakeAnthropic(() => {
+      drain.abort();
+      return { text: JSON.stringify({ ...EMPTY_EXTRACTION, facts_add: [{ person: `u${lena.id}`, kind: "stack", value: "Go", confidence: 0.9, source_msg_ids: [4] }] }) };
+    });
+    await expect(runExtractionPass({ ...deps(chat.id, stopping.client), drain: drain.signal })).rejects.toThrow(INTERRUPTED_PASS_ERROR);
+    expect(stopping.requests.map((request) => request.system)).toEqual([EXTRACTION_SYSTEM_PROMPT]);
+    expect(await pendingCount(chat.id)).toBe(1);
+  });
+
+  it("rests the review for the day after two refusals in a chat, leaving the facts it was to check out", async () => {
+    const chat = await newChat("Refused reviews");
+    const lena = await person(chat.id, "Lena");
+    let msgId = 0;
+    const passWithFact = async (review: () => FakeAnswer) => {
+      msgId += 1;
+      await message(chat.id, msgId, lena.id, `I use tool number ${msgId} every day`);
+      const proposed: ExtractionResult = { ...EMPTY_EXTRACTION, facts_add: [{ person: `u${lena.id}`, kind: "stack", value: `Tool${msgId}`, confidence: 0.9, source_msg_ids: [msgId] }] };
+      const { client, requests } = fakeAnthropic(() => ({ text: JSON.stringify(proposed) }), undefined, review);
+      return { result: await runExtractionPass(deps(chat.id, client)), requests };
+    };
+    for (let refusal = 0; refusal < 2; refusal += 1) {
+      const { result } = await passWithFact(() => ({ stopReason: "refusal", text: "" }));
+      expect(result.reviewFailures).toEqual([expect.objectContaining({ refusal: true })]);
+    }
+    const { result, requests } = await passWithFact(() => ({ text: JSON.stringify(keepAll(`  a1 add `)) }));
+    expect(requests.map((request) => request.system)).toEqual([EXTRACTION_SYSTEM_PROMPT, NOTES_SYSTEM_PROMPT]);
+    expect(result.reviewFailures).toEqual([expect.objectContaining({ reason: "the review rests for the day after 2 refusals in the chat", refusal: false })]);
+    expect(result.review).toEqual({ kept: 0, refined: 0, dropped: 1, why: { unreviewed: 1 } });
+    expect(await visibleFacts(sql, chat.id, lena.id)).toEqual([]);
+  });
+
+  it("makes no review call when a pass proposes no card facts of the kinds it checks, and lets a place on as it came", async () => {
+    const chat = await newChat("Places unreviewed");
+    const lena = await person(chat.id, "Lena");
+    await message(chat.id, 1, lena.id, "Moved to Lisbon last month");
+    const proposed: ExtractionResult = { ...EMPTY_EXTRACTION, facts_add: [{ person: `u${lena.id}`, kind: "timezone", value: "Lisbon", confidence: 0.9, source_msg_ids: [1] }] };
+    const { client, requests } = fakeAnthropic(() => ({ text: JSON.stringify(proposed) }));
+    const result = await runExtractionPass(deps(chat.id, client));
+    expect(requests.map((request) => request.system)).toEqual([EXTRACTION_SYSTEM_PROMPT, NOTES_SYSTEM_PROMPT]);
+    expect(result.reviewCalls).toBe(0);
+    expect((await visibleFacts(sql, chat.id, lena.id)).map((row) => [row.kind, row.value])).toEqual([["timezone", "Lisbon"]]);
   });
 
   it("splits a batch the model keeps refusing, skips only the slice it refuses and pays for every call", async () => {
