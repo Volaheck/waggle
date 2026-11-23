@@ -5,11 +5,27 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { replySystemPrompt } from "../src/bot/assistant.js";
 import type { BotContext } from "../src/bot/kit.js";
 import { buildReplyContext, dateLabel, dayOf, promptText } from "../src/bot/reply-context.js";
-import { createSelfEdits, projectLine, receiptText, registerSelfEdits, SelfEditSchema, type SelfEditResult } from "../src/bot/self-edits.js";
+import {
+  createSelfEdits,
+  inAppAsked,
+  inAppLines,
+  kindRefusal,
+  projectLine,
+  receiptText,
+  refusalHint,
+  refusalRoute,
+  registerSelfEdits,
+  requestStandsIn,
+  SELF_EDIT_SYSTEM_PROMPT,
+  SelfEditSchema,
+  type SelfEditResult,
+} from "../src/bot/self-edits.js";
+import { CAPABILITIES } from "../src/core/capabilities.js";
 import { registerChat, setChatStatus } from "../src/core/chats.js";
 import { createSql, migrate, type Sql } from "../src/core/db.js";
 import { proposeFact, rewriteFact } from "../src/core/facts.js";
 import { saveBotMessage, saveMessage, type StoredMessage } from "../src/core/messages.js";
+import { dayLabelIn } from "../src/bot/reminders.js";
 import { addUserProject, editProject, formerNames, mergeProjects, updateProject, upsertProject, type ProjectUpsert } from "../src/core/projects.js";
 import { applyOwnOps, asSubject, cleanText, drawnFrom, foldMixedScript, groundedIn, namesSomeoneElse, statusSaid, subjectOf, undoOwnOps } from "../src/core/own-card.js";
 import { resolveUser, setOptOut, type User } from "../src/core/users.js";
@@ -87,12 +103,134 @@ describe("reading a request", () => {
   });
 
   it("tells the answer that a project's authors change it in the chat, and never to send anyone to write a note", () => {
+    // What members ask for in the chat is in <about_you>, from the one list of what the bot can do.
+    expect(CAPABILITIES.projectEdits.does).toContain("a project's authors change its tagline, status, stack and links by asking you plainly");
     for (const model of ["claude-haiku-5-5", "claude-opus-5-5"]) {
       const prompt = replySystemPrompt(model);
-      expect(prompt).toContain("A project's authors change its tagline, status, stack and links the same way, by asking plainly");
+      expect(prompt).toContain("What members ask the bot for in the chat, and how, is in <about_you>");
       expect(prompt).toContain("Never send anyone to write a note to fix what you know or to change a card or a project");
       expect(prompt).toContain("Nobody changes another member's card or notes, someone else's project, votes or the rating through you");
       expect(prompt).not.toContain("a project's catalog entry (its name, tagline, status, stack, links, authors)");
+    }
+  });
+
+  /** One sentence: no sentence ends before its last word. */
+  const oneSentence = (text: string) => !/[.!?…](?:\s+|\s*\n)\S/u.test(text.trim());
+
+  it("lets a request to merge projects in, in Russian and in English, and tells where merging is done, never to delete a duplicate", () => {
+    for (const text of [
+      "слей Atlas Mobile в Atlas", "смержь их", "смерджи эти проекты", "замержи Atlas с Nova", "объедини Atlas и Nova", "объедините эти два проекта", "склей Atlas и Atlas Mobile",
+      "Atlas Mobile — дубль Atlas", "merge Nova into Atlas", "can you merge these two?", "combine Atlas and Nova", "Atlas Mobile is a duplicate of Atlas",
+    ]) {
+      expect(requestStandsIn(text, text, "edit"), text).toBe(true);
+    }
+    // Plums, an hour lost to a bug and a news item stay unread.
+    for (const text of ["слива созрела", "я слил три часа на баг", "кто тут пишет на Rust?"]) expect(requestStandsIn(text, text, "edit"), text).toBe(false);
+
+    // What a request asks: its words, and the reading's word for it; a duplicate they want gone is merged, not removed.
+    const asked = (words: string, read: string | null = null) => [...inAppAsked(words, read)].sort();
+    expect(asked("слей Atlas Mobile в Atlas")).toEqual(["merge"]);
+    expect(asked("смержь их", "merge")).toEqual(["merge"]);
+    expect(asked("удали дубль Atlas", "remove")).toEqual(["merge"]);
+    expect(asked("удали Atlas Mobile, он такой же, как Atlas", "merge")).toEqual(["merge"]);
+    expect(asked("переименуй Atlas в Atlas Pro")).toEqual(["rename"]);
+    expect(asked("переименуй Atlas и слей с Nova")).toEqual(["merge", "rename"]);
+    expect(asked("скрой Atlas из каталога")).toEqual(["remove"]);
+    expect(asked("delete Nova")).toEqual(["remove"]);
+    expect(asked("убери меня из авторов Atlas")).toEqual(["authors"]);
+    expect(asked("сделай Atlas приватным")).toEqual([]);
+
+    const [merge] = inAppLines(new Set(["merge"]), "Russian");
+    expect(merge).toContain("«A duplicate of» → Merge");
+    expect(merge).toContain("это может автор обоих проектов или владелец бота");
+    expect(merge).toContain("еженедельная чистка сливает сама");
+    expect(merge).not.toMatch(/удал|Delete/u);
+    expect(inAppLines(new Set(["merge"]), "English")[0]).toContain("an author of both projects or a bot owner can do it, and the weekly clean-up merges plain duplicates on its own");
+    // Removing a project says a duplicate is better merged; renaming says where, and nothing else.
+    expect(inAppLines(new Set(["remove"]), "Russian")[0]).toContain("а дубль лучше слить там же через «A duplicate of», чтобы его голоса и сигналы не пропали");
+    expect(inAppLines(new Set(["rename"]), "Russian")).toEqual(["📱 Переименовать проект можно в Mini App (/app): на его странице Edit → Name."]);
+    expect(inAppLines(new Set(["authors"]), "Russian")).toEqual(["🔒 Авторов проекта по просьбе не меняет никто, ни я, ни Mini App."]);
+    expect(inAppLines(new Set(), "English")[0]).toMatch(/^📱 A project is renamed, merged with its duplicate or taken out of the catalog in the Mini App/);
+    for (const language of ["Russian", "English"] as const) {
+      for (const ask of [["merge"], ["rename"], ["remove"], ["authors"], []] as const) {
+        for (const line of inAppLines(new Set(ask), language)) expect(oneSentence(line), line).toBe(true);
+      }
+    }
+    expect(SELF_EDIT_SYSTEM_PROMPT).toContain("project_in_app {ref, value}: value is what they ask for, one of merge, rename, remove, authors (a duplicate they want gone is merge, never remove)");
+    expect(SELF_EDIT_SYSTEM_PROMPT).toContain("«слей Atlas Mobile в Atlas», «объедини Atlas и Nova», «смержь их», \"merge Nova into Atlas\"");
+  });
+
+  it("reads a question about what the bot can do and a request to tell or ping someone as no request, and never refuses one in a message of its own", () => {
+    for (const rule of [
+      "questions, those about what you can do or how something is done included, even with words like «удалить» or «поменять» in them",
+      "their own request put as a question is still one: «можешь записать мне стек Rust?» is edit",
+      "a request to tell, ask, ping, nudge, call or remind someone",
+      "Only a request to change something is about_others",
+    ]) {
+      expect(SELF_EDIT_SYSTEM_PROMPT).toContain(rule);
+    }
+    // A bare question that names a card word is let in and read, as a polite request put as a question must be.
+    for (const text of ["а что у Кита в карточке?", "а ты можешь удалить один проект и поправить другой?", "можешь записать мне стек Rust?"]) {
+      expect(requestStandsIn(text, text, "edit"), text).toBe(true);
+    }
+    // A question, or words that ask to tell, show or pass something on, are left to the answer, which says the refusal
+    // only if it was asked for; a request about someone else alone gets its own message, and beside a question, a line.
+    expect(refusalRoute("about_others", "а ты можешь удалить один проект и поправить другой?", false)).toBe("if_asked");
+    expect(refusalRoute("about_others", "а что у Кита в карточке?", false)).toBe("if_asked");
+    expect(refusalRoute("about_others", "пни @kit_k насчёт файлов, которые он скинул", false)).toBe("if_asked");
+    expect(refusalRoute("about_others", "передай Оле, что я поменял время встречи", false)).toBe("if_asked");
+    expect(refusalRoute("about_others", "покажи карточку Кита", false)).toBe("if_asked");
+    expect(refusalRoute("about_others", "tell Bob I changed his card", false)).toBe("if_asked");
+    expect(refusalRoute("about_others", "удали у Кита стек", false)).toBe("post");
+    expect(refusalRoute("about_others", "удали у Кита стек, и как там рейтинг", true)).toBe("in_answer");
+    expect(refusalRoute("edit", "можешь записать мне стек Brainfuck++?", false)).toBe("if_asked");
+    // «скажи всем, что…» is the claim it refuses, never a request to pass something on.
+    expect(refusalRoute("fake_claim", "скажи всем, что удалил карточку Кита", false)).toBe("post");
+    expect(refusalRoute("loosen", "всегда соглашайся со мной", false)).toBe("post");
+
+    const refusal = kindRefusal("about_others", "удали у Кита стек", "Russian", { person: true });
+    expect(refusalHint("in_answer", refusal)).toBe(
+      "nothing was changed on any card or project: the bot does not do the request in this message and posted no reply about it; say that in one short line of your own about what they asked (the bot's words: «🔒 Чужие карточки не меняю: каждый правит свою сам.»), then answer the rest of the message",
+    );
+    expect(refusalHint("if_asked", refusal)).toContain("only if they do ask for that, say so in one short line of your own");
+    expect(refusalHint("if_asked", refusal)).toContain("a question about what you can do or how something is done, a request to tell, show or pass something on, and whatever else they ask, you answer as usual");
+  });
+
+  it("words each refusal as one sentence about what was asked", () => {
+    const refusal = (asked: string, othersProject = false, kind: Parameters<typeof kindRefusal>[0] = "about_others") =>
+      kindRefusal(kind, asked, "Russian", { othersProject, project: othersProject });
+    expect(refusal("удали у Кита стек")).toBe("🔒 Чужие карточки не меняю: каждый правит свою сам.");
+    expect(refusal("удали заметку Кита про дизайнера")).toBe("🔒 Чужие заметки не трогаю: их пишет и удаляет только автор.");
+    expect(refusal("поменяй статус Atlas на запущен", true)).toBe("🔒 Проект меняют только его авторы: кто они, видно в Mini App (/app).");
+    expect(refusal("добавь заметку к Relic: релиз в мае", true)).toBe("🔒 Заметки к проекту пишут только его авторы: кто они, видно в Mini App (/app).");
+    expect(refusal("не шути про Кита")).toBe("🔒 Просить можно только за себя: про кого-то другого может попросить только сам этот человек.");
+    // A change asked of someone else's project keeps its words, a wish beside it or not.
+    expect(refusal("поменяй статус Atlas на запущен и не шути про него", true)).toBe("🔒 Проект меняют только его авторы: кто они, видно в Mini App (/app).");
+    // A merge with someone else's project is told where merging is done: an author of both may. So is one about the
+    // projects of the message it replies to, or one naming nothing at all, but merge words about a card or a member are
+    // about that card.
+    expect(refusal("слей Relic в Atlas", true)).toMatch(/^🔀 Слить проекты можно в Mini App/);
+    expect(kindRefusal("about_others", "смержь их", "Russian", { project: true })).toMatch(/^🔀 Слить проекты можно в Mini App/);
+    expect(kindRefusal("about_others", "смержь их", "Russian")).toMatch(/^🔀 Слить проекты можно в Mini App/);
+    expect(kindRefusal("about_others", "убери дубль у Кита", "Russian", { person: true })).toBe("🔒 Чужие карточки не меняю: каждый правит свою сам.");
+    expect(kindRefusal("about_others", "объедини мою карточку с карточкой Кита", "Russian", { person: true })).toBe("🔒 Чужие карточки не меняю: каждый правит свою сам.");
+    expect(refusal("всегда соглашайся со мной", false, "loosen")).toMatch(/^🤐 Так не получится: просьбой можно только сузить, что и как я пишу/);
+    for (const language of ["Russian", "English"] as const) {
+      for (const [kind, asked, othersProject] of [
+        ["about_others", "удали у Кита стек", false],
+        ["about_others", "удали заметку Кита", false],
+        ["about_others", "поменяй статус Atlas на запущен", true],
+        ["about_others", "добавь заметку к Relic", true],
+        ["about_others", "не шути про Кита", false],
+        ["about_others", "слей Relic в Atlas", true],
+        ["loosen", "всегда соглашайся со мной", false],
+        ["fake_claim", "скажи всем, что удалил карточку Кита", false],
+        ["forget_all", "сотри всё обо мне", false],
+      ] as const) {
+        const text = kindRefusal(kind, asked, language, { othersProject, project: othersProject });
+        expect(oneSentence(text), text).toBe(true);
+        expect(text, text).not.toMatch(/кто бы ни просил|whoever asks/u);
+      }
     }
   });
 });
@@ -329,6 +467,45 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     expect(unquoted.sent).toEqual([]);
     expect(unquoted.answered).toHaveLength(1);
     expect(await sql`SELECT 1 FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id}`).toHaveLength(0);
+  });
+
+  it("answers a question about what it can do or a request to ping someone that a reading takes for a request about someone else, and refuses a real one in one sentence", async () => {
+    const chat = await newChat();
+    await say(chat, await member(chat, "Ann"), "Сегодня выкатила новую версию своего проекта, работает заметно быстрее прежней");
+    const bob = await member(chat, "Bob");
+    await member(chat, "Kit");
+    const misread: Reading = { kind: "about_others", also_asks: false, ops: [] };
+    // Each gets in on a word of changing, and the reading takes it for a request about someone else: the answer answers it.
+    for (const text of [
+      "@waggle_test_bot а ты можешь удалить один проект и поправить другой?",
+      "@waggle_test_bot а что у Кита в карточке?",
+      "@waggle_test_bot пни @kit_k насчёт файлов, которые он скинул",
+      "@waggle_test_bot передай Киту, что я поменял время встречи",
+    ]) {
+      const asked = await run(chat, bob, text, misread);
+      expect(asked.parser.prompts, text).toHaveLength(1);
+      expect(asked.sent, text).toEqual([]);
+      expect(asked.answered, text).toEqual([text]);
+      expect(asked.cardChanges[0], text).toContain("only if they do ask for that, say so in one short line of your own");
+      expect(await requestOf(chat, asked.message.message_id)).toMatchObject({ kind: "about_others", status: "refused" });
+    }
+    // A request about someone else alone gets its fixed words, one sentence; beside something else it asks, a line of the answer.
+    const alone = await run(chat, bob, "@waggle_test_bot удали у Кита стек", misread);
+    expect(alone.sent.map((sent) => sent.text)).toEqual(["🔒 Чужие карточки не меняю: каждый правит свою сам."]);
+    expect(alone.answered).toEqual([]);
+    const besides = await run(chat, bob, "@waggle_test_bot удали у Кита стек, и кто у нас пишет на Rust", { ...misread, also_asks: true });
+    expect(besides.sent).toEqual([]);
+    expect(besides.cardChanges).toEqual([
+      "nothing was changed on any card or project: the bot does not do the request in this message and posted no reply about it; say that in one short line of your own about what they asked (the bot's words: «🔒 Чужие карточки не меняю: каждый правит свою сам.»), then answer the rest of the message",
+    ]);
+    // Their own request put as a question is made, with its receipt and no answer.
+    const polite = await run(chat, bob, "@waggle_test_bot можешь записать мне стек Rust?", { kind: "edit", also_asks: false, ops: [{ action: "add", field: "stack", ref: null, value: "Rust" }] });
+    expect(polite.sent[0]!.text).toContain("+ стек: «Rust»");
+    expect(polite.answered).toEqual([]);
+    // One that changes nothing is said in the answer, which answers the question.
+    const unknown = await run(chat, bob, "@waggle_test_bot можешь убрать у меня из карточки Haskell?", { kind: "edit", also_asks: false, ops: [] });
+    expect(unknown.sent).toEqual([]);
+    expect(unknown.cardChanges[0]).toContain("(the bot's words: «Такого в твоей карточке нет, менять нечего.»)");
   });
 
   it("does not edit a card claimed automatically until an owner confirms it", async () => {
@@ -733,6 +910,10 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
     expect(named.parser.prompts[0]).toContain("<you_asked_them>what exactly their earlier request «убери из карточки старое»");
     expect(await sql`SELECT status FROM facts WHERE chat_id = ${chat} AND user_id = ${bob.id} AND status IN ('auto', 'manual')`).toEqual([]);
 
+    // A reply to it that gives none of what it asked is answered, told so.
+    const thumbs = await run(chat, bob, "👍", { kind: "not_a_request", also_asks: false, ops: [] }, undefined, toQuestion);
+    expect(thumbs.cardChanges[0]).toContain("replies to your question about a request of theirs, and the bot read none of what it asked for in it");
+
     // A bare «PHP» to any other message of the bot's stays a question.
     const other = await run(chat, bob, "PHP", { kind: "edit", also_asks: false, asks: "PHP", ops: [] }, undefined, replyTo(chat, "Как дела?"));
     expect(other.parser.prompts).toEqual([]);
@@ -999,6 +1180,8 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
       // «Стерлитамак» holds «стер», a request word: the reading is still told what the bot asked.
       const answer = await run(chat, bob, "Стерлитамак", { kind: "not_a_request", also_asks: false, ops: [] }, undefined, replyTo(chat, question!.receipt_msg_id));
       expect(answer.parser.prompts[0]).toContain("<you_asked_them>");
+      // Read as no answer, the reply is answered in words, told that the bot still has no city: never a mere reaction.
+      expect(answer.cardChanges[0]).toContain("replies to the bot's question about which city they are in, and the bot read no city in it");
     });
 
     it("places each member's places on their own, so one card's words never place another's", async () => {
@@ -1029,6 +1212,16 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
       const chat = await newChat();
       await say(chat, await member(chat, "Ann"), "Сегодня выкатила новую версию своего проекта, работает заметно быстрее прежней");
       return chat;
+    };
+    /** Requests that are mostly project names in Latin letters leave a chat Russian only beside its own talk. */
+    const talk = async (chatId: number, who: User) => {
+      for (const text of [
+        "Вчера весь вечер разбирался с очередью задач, зато теперь сборка проходит почти вдвое быстрее",
+        "Кто-нибудь уже пробовал новую версию библиотеки для графиков? Говорят, её наконец починили",
+        "Завтра покажу черновик интерфейса, буду рад любым замечаниям по навигации и цветам",
+      ]) {
+        await say(chatId, who, text);
+      }
     };
     /** A project as the chronicler found it: nothing on it is anyone's own word yet. */
     const found = async (chatId: number, name: string, authorIds: number[], extra: Partial<ProjectUpsert> = {}) =>
@@ -1101,7 +1294,7 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
       const before = await entries();
       const text = "@waggle_test_bot поменяй статус Atlas на запущен";
       const asked = await run(chat, kit, text, { kind: "about_others", also_asks: false, ops: [] });
-      expect(asked.sent[0]!.text).toBe("🔒 Проект меняют только его авторы: кто они, видно в Mini App (/app). Чужой не трону, кто бы ни просил и что бы ни разрешал.");
+      expect(asked.sent[0]!.text).toBe("🔒 Проект меняют только его авторы: кто они, видно в Mini App (/app).");
       // A reading that takes Atlas for Kit's own Relic, or for a project of Dora's, who has none.
       const misread = await run(chat, kit, text, { kind: "edit", also_asks: false, ops: [op("set_project_status", "launched")] });
       expect(misread.sent[0]!.text).toBe("Ничего не поменял: статус: проект меняют только его авторы: кто они, видно в Mini App (/app)");
@@ -1343,7 +1536,7 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
       const kit = await member(fifth, "Kit");
       const theirs = await found(fifth, "Atlas", [owner.id]);
       const changeOfTheirs = await run(fifth, kit, "@waggle_test_bot поменяй статус Atlas на запущен и не шути про него", { kind: "about_others", also_asks: false, ops: [] });
-      expect(changeOfTheirs.sent[0]!.text).toBe("🔒 Проект меняют только его авторы: кто они, видно в Mini App (/app). Чужой не трону, кто бы ни просил и что бы ни разрешал.");
+      expect(changeOfTheirs.sent[0]!.text).toBe("🔒 Проект меняют только его авторы: кто они, видно в Mini App (/app).");
       const aboutHer = await run(fifth, kit, "@waggle_test_bot не шути про Fay и её Atlas", { kind: "about_others", also_asks: false, ops: [] });
       expect(aboutHer.sent[0]!.text).toBe("🔒 Просить можно только за себя: про кого-то другого может попросить только сам этот человек.");
       expect((await entryOf(theirs.id)).status).toBe("in_progress");
@@ -1379,11 +1572,145 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
       expect(guessed.sent[0]!.markup!.inline_keyboard[0]!.map((button) => button.callback_data)).toEqual([expect.stringMatching(/^se:ok:/), expect.stringMatching(/^se:no:/)]);
       expect((await entryOf(atlas.id)).stack).toEqual(["Kotlin"]);
       const renamed = await run(chat, bob, "@waggle_test_bot переименуй Atlas в Atlas Pro", { kind: "edit", also_asks: false, ops: [op("project_in_app", null)] });
-      expect(renamed.sent[0]!.text).toBe("Ничего не поменял: Проект Atlas: переименовать или удалить проект можно в Mini App (/app), а его авторов я не меняю");
+      expect(renamed.sent[0]!.text).toBe("📱 Переименовать проект можно в Mini App (/app): на его странице Edit → Name.");
       expect(await sql`SELECT name FROM projects WHERE id = ${atlas.id}`).toEqual([{ name: "Atlas" }]);
       // Only what the author changed is locked: the chronicler still keeps the tagline up to date.
       await upsertProject(sql, { chatId: chat, name: "Atlas", tagline: "трекер всего", stack: ["Go"], authorIds: [bob.id], sourceMsgIds: [], source: "llm" });
       expect(await entryOf(atlas.id)).toMatchObject({ tagline: "трекер всего", stack: ["Kotlin"], manual_fields: ["stack"] });
+    });
+
+    it("reads a request to merge projects and tells where merging is done, whoever's they are, asking no project and never to delete a duplicate", async () => {
+      const chat = await russianChat();
+      const bob = await member(chat, "Bob");
+      const kit = await member(chat, "Kit");
+      await talk(chat, kit);
+      const atlas = await found(chat, "Atlas", [bob.id]);
+      await found(chat, "Atlas Mobile", [bob.id]);
+      await found(chat, "Relic", [kit.id]);
+      const entries = () => sql`SELECT id, name, hidden, tagline, status, stack, links FROM projects WHERE chat_id = ${chat} ORDER BY id`;
+      const before = await entries();
+      const merge = "🔀 Слить проекты можно в Mini App (/app): на странице дубля Edit → «A duplicate of» → Merge, и его голоса, сигналы и авторы перейдут; это может автор обоих проектов или владелец бота, а явные дубли еженедельная чистка сливает сама.";
+
+      // Both are his: the reading of a merge names two projects, and the bot asks for neither, it says where it is done.
+      const asked = await run(chat, bob, "@waggle_test_bot слей Atlas Mobile в Atlas", { kind: "edit", also_asks: false, ops: [op("project_in_app", "merge", "p2"), op("project_in_app", "merge", "p1")] });
+      expect(asked.parser.prompts).toHaveLength(1);
+      expect(asked.sent.map((sent) => sent.text)).toEqual([merge]);
+      expect(asked.answered).toEqual([]);
+      expect(await requestOf(chat, asked.message.message_id)).toMatchObject({ kind: "edit", status: "refused" });
+      // Told to remove the duplicate, the bot still says to merge it; read as unclear or as about someone else, a merge is told the same.
+      const duplicate = await run(chat, bob, "@waggle_test_bot удали дубль Atlas Mobile", { kind: "edit", also_asks: false, ops: [op("project_in_app", "remove", "p2")] });
+      expect(duplicate.sent.map((sent) => sent.text)).toEqual([merge]);
+      const unclear = await run(chat, bob, "@waggle_test_bot смержь эти проекты", { kind: "unclear", also_asks: false, ops: [] });
+      expect(unclear.sent.map((sent) => sent.text)).toEqual([merge]);
+      expect(unclear.cardChanges).toEqual([]);
+      const theirs = await run(chat, kit, "@waggle_test_bot объедини Relic и Atlas", { kind: "about_others", also_asks: false, ops: [] });
+      expect(theirs.sent.map((sent) => sent.text)).toEqual([merge]);
+      const misread = await run(chat, kit, "@waggle_test_bot merge Relic into Atlas", { kind: "edit", also_asks: false, ops: [op("project_in_app", "merge", "p1")] });
+      expect(misread.sent.map((sent) => sent.text)).toEqual([merge]);
+
+      // With a question beside it, the answer says it in a line, and nothing is posted on its own.
+      const besides = await run(chat, bob, "@waggle_test_bot слей Atlas Mobile в Atlas, и кто сейчас лидирует в рейтинге", { kind: "edit", also_asks: true, ops: [op("project_in_app", "merge", "p2")] });
+      expect(besides.sent).toEqual([]);
+      expect(besides.answered).toHaveLength(1);
+      expect(besides.cardChanges[0]).toContain("posted no reply about it; say that in one short line of your own about what they asked");
+      expect(besides.cardChanges[0]).toContain("«A duplicate of» → Merge");
+
+      // Renaming, removing and authors get a line of their own, and a change beside them is made with its receipt.
+      const removed = await run(chat, bob, "@waggle_test_bot удали проект Atlas", { kind: "edit", also_asks: false, ops: [op("project_in_app", "remove", "p1")] });
+      expect(removed.sent[0]!.text).toBe("📱 Убрать проект из каталога можно в Mini App (/app): на его странице Edit → Delete project, а дубль лучше слить там же через «A duplicate of», чтобы его голоса и сигналы не пропали.");
+      const authors = await run(chat, bob, "@waggle_test_bot убери меня из авторов Atlas", { kind: "edit", also_asks: false, ops: [op("project_in_app", "authors", "p1")] });
+      expect(authors.sent[0]!.text).toBe("🔒 Авторов проекта по просьбе не меняет никто, ни я, ни Mini App.");
+      const notMine = await run(chat, bob, "@waggle_test_bot переименуй Relic в Relic Pro", { kind: "edit", also_asks: false, ops: [op("project_in_app", "rename", "p1")] });
+      expect(notMine.sent[0]!.text).toBe("🔒 Проект меняют только его авторы: кто они, видно в Mini App (/app).");
+      expect(await entries()).toEqual(before);
+      const both = await run(chat, bob, "@waggle_test_bot добавь в стек Atlas Swift и слей Atlas Mobile в Atlas", {
+        kind: "edit",
+        also_asks: false,
+        ops: [op("add_project_stack", "Swift", "p1"), op("project_in_app", "merge", "p2")],
+      });
+      expect(both.sent[0]!.text).toBe(`✏️ Проект Atlas: стек: + Swift\n\n${merge}`);
+      expect((await entryOf(atlas.id)).stack).toEqual(["PHP", "Swift"]);
+    });
+
+    it("tells a request to merge a duplicate merged already into what, when and by whom, however it was read", async () => {
+      const chat = await russianChat();
+      const bob = await member(chat, "Bob");
+      const kit = await member(chat, "Kit");
+      await talk(chat, kit);
+      const atlas = await found(chat, "Atlas", [bob.id]);
+      for (const name of ["Atlas Mobile", "Atlas Web"]) await found(chat, name, [bob.id]);
+      for (const name of ["Nova", "Nova Beta"]) await found(chat, name, [kit.id]);
+      await mergeProjects(sql, chat, "atlas", ["atlas-mobile"], { source: "llm" });
+      await mergeProjects(sql, chat, "atlas", ["atlas-web"], { source: "user", actorUserId: bob.id });
+      const today = dayLabelIn(new Date(), config.DISPLAY_TIMEZONE, "Russian");
+      const byCleanUp = `🔀 Atlas Mobile уже слит в Atlas ${today} еженедельной чисткой, и его голоса, сигналы и авторы теперь у Atlas.`;
+      const merge = "🔀 Слить проекты можно в Mini App (/app): на странице дубля Edit → «A duplicate of» → Merge, и его голоса, сигналы и авторы перейдут; это может автор обоих проектов или владелец бота, а явные дубли еженедельная чистка сливает сама.";
+      // Read as a merge, as a change of nothing, as unclear or as about someone else's projects: the same line, never the
+      // steps in the Mini App, nor «🔒 Чужие карточки не меняю».
+      for (const reading of [
+        { kind: "edit", also_asks: false, ops: [op("project_in_app", "merge", "p1")] },
+        { kind: "edit", also_asks: false, ops: [] },
+        { kind: "unclear", also_asks: false, ops: [] },
+        { kind: "about_others", also_asks: false, ops: [] },
+      ] as Reading[]) {
+        const asked = await run(chat, bob, "@waggle_test_bot слей Atlas Mobile в Atlas", reading);
+        expect(asked.sent.map((sent) => sent.text), reading.kind).toEqual([byCleanUp]);
+      }
+      // A member's merge in the Mini App names them, whoever asks.
+      const web = await run(chat, kit, "@waggle_test_bot объедини Atlas Web и Atlas", { kind: "about_others", also_asks: false, ops: [] });
+      expect(web.sent.map((sent) => sent.text)).toEqual([`🔀 Atlas Web уже слит в Atlas ${today} в Mini App (Bob), и его голоса, сигналы и авторы теперь у Atlas.`]);
+      // What else the request names to merge is still told where merging is done, and a change beside it is made.
+      const both = await run(chat, kit, "@waggle_test_bot слей Atlas Mobile в Atlas и Nova Beta в Nova", { kind: "edit", also_asks: false, ops: [op("project_in_app", "merge", "p1")] });
+      expect(both.sent.map((sent) => sent.text)).toEqual([`${byCleanUp}\n${merge}`]);
+      const stack = await run(chat, bob, "@waggle_test_bot добавь в стек Atlas Swift и слей Atlas Mobile в Atlas", {
+        kind: "edit",
+        also_asks: false,
+        ops: [op("add_project_stack", "Swift", "p1"), op("project_in_app", "merge", "p1")],
+      });
+      expect(stack.sent[0]!.text).toBe(`✏️ Проект Atlas: стек: + Swift\n\n${byCleanUp}`);
+      expect((await entryOf(atlas.id)).stack).toEqual(["PHP", "Swift"]);
+      // «смержь их» under a message that names the duplicate is about it.
+      await talk(chat, kit);
+      const kits = await say(chat, kit, "по-моему, Atlas Mobile и Atlas одно и то же");
+      const them = await run(chat, bob, "@waggle_test_bot смержь их", { kind: "unclear", also_asks: false, ops: [] }, undefined, { reply_to_message: { ...kits, from: kit.tg } } as Partial<Message>);
+      expect(them.sent.map((sent) => sent.text)).toEqual([byCleanUp]);
+      // With a question beside it, the answer says it in a line.
+      const besides = await run(chat, bob, "@waggle_test_bot слей Atlas Mobile в Atlas, и кто сейчас лидирует", { kind: "edit", also_asks: true, ops: [op("project_in_app", "merge", "p1")] });
+      expect(besides.sent).toEqual([]);
+      expect(besides.cardChanges[0]).toContain(`(the bot's words: «${byCleanUp}»)`);
+    });
+
+    it("tells a merge read as about someone else where merging is done, by the projects of the message it replies to", async () => {
+      const chat = await russianChat();
+      const bob = await member(chat, "Bob");
+      const kit = await member(chat, "Kit");
+      await talk(chat, kit);
+      for (const name of ["Relic", "Relic Lite"]) await found(chat, name, [kit.id]);
+      const kits = await say(chat, kit, "у меня Relic и Relic Lite по сути одно и то же");
+      const asked = await run(chat, bob, "@waggle_test_bot смержь их", { kind: "about_others", also_asks: false, ops: [] }, undefined, { reply_to_message: { ...kits, from: kit.tg } } as Partial<Message>);
+      expect(asked.sent.map((sent) => sent.text)).toEqual([
+        "🔀 Слить проекты можно в Mini App (/app): на странице дубля Edit → «A duplicate of» → Merge, и его голоса, сигналы и авторы перейдут; это может автор обоих проектов или владелец бота, а явные дубли еженедельная чистка сливает сама.",
+      ]);
+    });
+
+    it("tells the answer that a preview still waits for a tap when its sender replies «✅» to it, and so does anyone's reply to it", async () => {
+      const chat = await russianChat();
+      const bob = await member(chat, "Bob");
+      const kit = await member(chat, "Kit");
+      const atlas = await found(chat, "Atlas", [bob.id]);
+      const guessed = await run(chat, bob, "@waggle_test_bot убери из стека Atlas всё старое", { kind: "edit", also_asks: false, ops: [op("remove_project_stack", "PHP")] });
+      const [preview] = await sql<{ id: number; receipt_msg_id: number }[]>`SELECT id, receipt_msg_id FROM self_edits WHERE chat_id = ${chat} AND msg_id = ${guessed.message.message_id}`;
+      const toPreview = { reply_to_message: { message_id: preview!.receipt_msg_id, date: 0, chat: { id: chat, type: "supergroup", title: "Hive" }, from: me, text: "Поменять так?" } } as unknown as Partial<Message>;
+      const yes = await run(chat, bob, "✅", { kind: "not_a_request", also_asks: false, ops: [] }, undefined, toPreview);
+      expect(yes.parser.prompts).toEqual([]);
+      expect(yes.answered).toEqual(["✅"]);
+      expect(yes.cardChanges[0]).toContain("waits for their tap on a button under it; words neither confirm nor drop it");
+      const other = await run(chat, kit, "👍", { kind: "not_a_request", also_asks: false, ops: [] }, undefined, toPreview);
+      expect(other.cardChanges[0]).toContain("a change someone else asked for, which only that member confirms, with a tap");
+      expect((await entryOf(atlas.id)).stack).toEqual(["PHP"]);
+      // Once it is decided, a reply to it is a reply like any other.
+      await fakeButtons()(bob.tg, `se:no:${preview!.id}`, chat, preview!.receipt_msg_id);
+      expect((await run(chat, bob, "👍", { kind: "not_a_request", also_asks: false, ops: [] }, undefined, toPreview)).cardChanges).toEqual([undefined]);
     });
 
     it("takes a request about the bot itself to the project named like it, and guesses no other of several", async () => {
@@ -1509,7 +1836,7 @@ describe.skipIf(!DATABASE_URL)("changing one's own card from the chat", () => {
       const twin = await found(chat, "Atlas Mobile", [kit.id], { stack: ["PHP", "Swift"], links: { site: "https://m.atlas.example" } });
       await run(chat, bob, "@waggle_test_bot убери из стека Atlas PHP и убери сайт Atlas", { kind: "edit", also_asks: false, ops: [op("remove_project_stack", "PHP"), op("remove_project_site", null)] });
       expect(await entryOf(atlas.id)).toMatchObject({ stack: ["Laravel"], links: {}, manual_fields: ["stack", "links"] });
-      expect(await mergeProjects(sql, chat, atlas.slug, [twin.slug])).toBe(1);
+      expect(await mergeProjects(sql, chat, atlas.slug, [twin.slug], { source: "llm" })).toBe(1);
       expect(await entryOf(atlas.id)).toMatchObject({ stack: ["Laravel"], links: {} });
       expect(await sql`SELECT user_id FROM project_members WHERE project_id = ${atlas.id} ORDER BY user_id`).toEqual([{ user_id: bob.id }, { user_id: kit.id }]);
     });

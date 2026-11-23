@@ -7,19 +7,23 @@ interface SentPayload {
   reply_parameters?: { message_id?: number; chat_id?: number | string };
 }
 
+/** What the log keeps: messages, their edits, and the files of code an answer sends beside its message. */
+const LOGGED = new Set(["sendMessage", "editMessageText", "sendDocument"]);
+
 /**
  * Keeps what the bot posts in approved groups (see saveBotMessage), so an answer can follow a conversation with the
  * bot back to its start. grammY runs the transformer installed last first: this one has to be installed after the
- * transport it wraps, or it never sees a result. Storing never gets in the way of sending.
+ * transport it wraps, or it never sees a result. Storing never gets in the way of sending. A file is kept by its name,
+ * as a file: its code is the answer's, which the bot remembers on its own.
  */
 export function outgoingLog(sql: Sql, warn: (line: string) => void = console.warn): Transformer {
   return async (prev, method, payload, signal) => {
     const response = await prev(method, payload, signal);
-    if (!response.ok || (method !== "sendMessage" && method !== "editMessageText")) return response;
+    if (!response.ok || !LOGGED.has(method)) return response;
     try {
       const sent = response.result as Message | true;
       if (sent === true || (sent.chat?.type !== "group" && sent.chat?.type !== "supergroup")) return response;
-      const text = sent.text ?? sent.caption ?? "";
+      const text = sent.text ?? sent.caption ?? sent.document?.file_name ?? "";
       if (method === "editMessageText") {
         await updateBotMessage(sql, sent.chat.id, sent.message_id, text, sent.edit_date ? new Date(sent.edit_date * 1000) : new Date());
       } else {
@@ -31,6 +35,7 @@ export function outgoingLog(sql: Sql, warn: (line: string) => void = console.war
           text,
           replyToMsgId: reply?.message_id !== undefined && reply.chat_id === undefined ? reply.message_id : null,
           threadId: sent.is_topic_message ? (sent.message_thread_id ?? null) : null,
+          mediaType: sent.document ? "file" : null,
         });
       }
     } catch (error) {

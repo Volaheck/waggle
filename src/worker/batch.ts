@@ -46,7 +46,7 @@ export interface BatchData {
   notes?: PromptNote[];
   /** Telegram ids of the bot's owners: their word about a project's name counts like its authors'. */
   ownerTgIds?: number[];
-  /** For the date lines among the messages; UTC when not set. */
+  /** The chat's clock: the date lines among the messages, and the week a project signal counts in. UTC when not set. */
   timezone?: string;
   /** The zones of members whose own clock is known: a message of theirs sent on another day of theirs says so. */
   zones?: Map<number, string>;

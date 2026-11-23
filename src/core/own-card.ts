@@ -472,6 +472,11 @@ export async function aliasTaken(sql: Sql, subject: Subject, alias: string, othe
   return Boolean(project);
 }
 
+/** A change asked for in the chat can be undone, and brought back, this long after its request. */
+export const UNDO_HOURS = 24;
+/** An undone change can be asked back this long after its Undo without a reply to its receipt. */
+export const REDO_MINUTES = 30;
+
 /** A write as it was done, with what it replaced, so the subject can undo it. */
 export type Applied =
   | { kind: "fact_added"; factId: number; before: { status: string; value: string; confidence: number } | null; field: FactKind; value: string; unrejected: boolean }

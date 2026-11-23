@@ -93,7 +93,8 @@ describe("speaking up uninvited, without a database", () => {
   });
 
   it("keeps the interjection prompt compact and silence the usual answer", () => {
-    expect(INTERJECTION_SYSTEM_PROMPT.length).toBeLessThan(2000);
+    // The rule about criticism of someone's work (2026-11-23) took it past 2,000 characters; it stays short all the same.
+    expect(INTERJECTION_SYSTEM_PROMPT.length).toBeLessThan(2200);
     for (const rule of ["Nobody called you", "speak=false", "silence is the usual answer", "who said what before, and when", "at most about 40 words", "never mention notes", "staged ones included"]) {
       expect(INTERJECTION_SYSTEM_PROMPT).toContain(rule);
     }

@@ -9,7 +9,7 @@ import { detectLanguage } from "../src/core/language.js";
 import { assertBudget, BudgetExceededError, canonicalModelId, chatEndUserId, estimateCostUsd, isPricedModel, monthSpendUsd, structuredOutputFormat } from "../src/core/llm.js";
 import { clearExpiredTexts, saveMessage, type StoredMessage } from "../src/core/messages.js";
 import { NOTE_KINDS, NOTE_STATUSES } from "../src/core/notes.js";
-import { mergeProjects, PROJECT_STATUSES, upsertProject } from "../src/core/projects.js";
+import { listProjects, mergeProjects, PROJECT_STATUSES, upsertProject } from "../src/core/projects.js";
 import { getPerson, peopleOfChat, resolveUser, setOptOut } from "../src/core/users.js";
 import { applyConsolidation, CONSOLIDATION_SYSTEM_PROMPT, ConsolidationSchema, consolidationRetryDelayMs, loadConsolidationInput } from "../src/worker/consolidate.js";
 import {
@@ -313,7 +313,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     const bob = await person(chat.id, "Bob");
     const keeper = await project(chat.id, "lumen", "Lumen", [anna.id]);
     await project(chat.id, "lumen-app", "Lumen app", [anna.id]);
-    expect(await mergeProjects(sql, chat.id, "lumen", ["lumen-app"])).toBe(1);
+    expect(await mergeProjects(sql, chat.id, "lumen", ["lumen-app"], { source: "llm" })).toBe(1);
     await message(chat.id, 21, bob.id, "Lumen app is great, I use it every day");
     const result: ExtractionResult = {
       ...EMPTY_EXTRACTION,
@@ -1166,6 +1166,94 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     expect(authors.map((row) => row.user_id)).toEqual([author.id]);
   });
 
+  /** Midnight UTC on the Monday `weeksBack` weeks before this week's. */
+  function mondayUtc(weeksBack: number): number {
+    const now = new Date();
+    return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - ((now.getUTCDay() + 6) % 7) - 7 * weeksBack);
+  }
+
+  type SignalOf = Omit<ExtractionResult["project_signals"][number], "person" | "source_msg_ids">;
+
+  /** A pass over one message of the member's, sent at `sentAt`, in which the chronicler finds this signal; the signals it wrote. */
+  async function signalFrom(chatId: number, userId: number, signal: SignalOf, sentAt: Date, timezone?: string): Promise<number> {
+    const [last] = await sql<{ msg_id: number }[]>`SELECT coalesce(max(msg_id), 0)::int AS msg_id FROM messages WHERE chat_id = ${chatId}`;
+    const msgId = last!.msg_id + 1;
+    await message(chatId, msgId, userId, signal.note, sentAt);
+    const batch = await sql<StoredMessage[]>`SELECT * FROM messages WHERE chat_id = ${chatId} AND msg_id = ${msgId}`;
+    const data: BatchData = { chatId, batch, context: [], users: await peopleOfChat(sql, chatId), facts: [], projects: [], timezone };
+    const stats = await applyExtraction(sql, await newRun(chatId), data, { ...EMPTY_EXTRACTION, project_signals: [{ ...signal, person: `u${userId}`, source_msg_ids: [msgId] }] });
+    return stats.signals;
+  }
+
+  it("keeps an author's biggest milestone of the week: a bigger one replaces a smaller one, never the other way, and the rating counts it once", async () => {
+    const chat = await newChat("A week of milestones");
+    const kit = await person(chat.id, "Kit");
+    const dora = await person(chat.id, "Dora");
+    const atlas = await project(chat.id, "atlas", "Atlas", [kit.id]);
+    await project(chat.id, "nova", "Nova", [dora.id]);
+    // A week gone by, Monday to Sunday on the chat's clock (UTC here).
+    const monday = mondayUtc(2);
+    const day = (n: number, hour: number) => new Date(monday + n * DAY + hour * HOUR);
+    const milestone = (userId: number, project: string, impact: number, note: string, at: Date) => signalFrom(chat.id, userId, { project, kind: "milestone", impact, note }, at);
+    const atlasMilestones = () => sql<{ impact: number; note: string; happened_at: Date }[]>`SELECT impact, note, happened_at FROM project_signals WHERE project_id = ${atlas} ORDER BY happened_at`;
+
+    expect(await milestone(kit.id, "atlas", 2, "Atlas 0.3 fixes the login", day(0, 10))).toBe(1);
+    expect(await milestone(kit.id, "atlas", 5, "Atlas 1.0 is out", day(2, 12))).toBe(1);
+    expect(await atlasMilestones()).toEqual([{ impact: 5, note: "Atlas 1.0 is out", happened_at: day(2, 12) }]);
+    // A smaller report later in the week, or one just as big, leaves the week's milestone as it is…
+    expect(await milestone(kit.id, "atlas", 3, "Atlas got a dark theme", day(4, 18))).toBe(0);
+    expect(await milestone(kit.id, "atlas", 5, "Atlas runs on Android too", day(6, 20))).toBe(0);
+    expect(await atlasMilestones()).toEqual([{ impact: 5, note: "Atlas 1.0 is out", happened_at: day(2, 12) }]);
+    // …and is the project's latest activity all the same.
+    const [activity] = await sql<{ last_activity_at: Date }[]>`SELECT last_activity_at FROM projects WHERE id = ${atlas}`;
+    expect(activity!.last_activity_at).toEqual(day(6, 20));
+
+    // Four reports in a week weigh what the biggest of them would alone.
+    expect(await milestone(dora.id, "nova", 5, "Nova 1.0 is out", day(2, 12))).toBe(1);
+    const scores = new Map((await listProjects(sql, chat.id)).map((entry) => [entry.slug, entry.score]));
+    expect(scores.get("atlas")).toBeGreaterThan(0);
+    expect(scores.get("atlas")).toBe(scores.get("nova"));
+
+    // The next week has a milestone of its own.
+    expect(await milestone(kit.id, "atlas", 2, "Atlas 1.1 fixes sync", day(7, 10))).toBe(1);
+    expect((await atlasMilestones()).map((row) => row.note)).toEqual(["Atlas 1.0 is out", "Atlas 1.1 fixes sync"]);
+  });
+
+  it("gives every week of a member's signals of a kind its own, on the chat's clock, and lets a hidden one hold its week", async () => {
+    const chat = await newChat("Weeks of signals");
+    const kit = await person(chat.id, "Kit");
+    const bob = await person(chat.id, "Bob");
+    const atlas = await project(chat.id, "atlas", "Atlas", [kit.id]);
+    const relic = await project(chat.id, "relic", "Relic", [kit.id]);
+    const pulse = await project(chat.id, "pulse", "Pulse", [kit.id]);
+    const monday = mondayUtc(3);
+    const day = (n: number, hour: number) => new Date(monday + n * DAY + hour * HOUR);
+    const signalsOf = (projectId: number, kind: string) =>
+      sql<{ impact: number; note: string }[]>`SELECT impact, note FROM project_signals WHERE project_id = ${projectId} AND kind = ${kind} ORDER BY happened_at`;
+
+    // Bigger news six days on, in the next week, counts as that week's: it folds nothing of the week before into it.
+    expect(await signalFrom(chat.id, kit.id, { project: "atlas", kind: "milestone", impact: 2, note: "Atlas beta opens" }, day(4, 10))).toBe(1);
+    expect(await signalFrom(chat.id, kit.id, { project: "atlas", kind: "milestone", impact: 4, note: "Atlas 1.0 is out" }, day(10, 10))).toBe(1);
+    expect((await signalsOf(atlas, "milestone")).map((row) => row.impact)).toEqual([2, 4]);
+
+    // A member's praise keeps to the same rule: a review after real use replaces a passing word of the same week.
+    expect(await signalFrom(chat.id, bob.id, { project: "atlas", kind: "praise", impact: 1, note: "Bob likes the icon" }, day(14, 9))).toBe(1);
+    expect(await signalFrom(chat.id, bob.id, { project: "atlas", kind: "praise", impact: 4, note: "Bob praises Atlas after a week of use" }, day(16, 9))).toBe(1);
+    expect(await signalsOf(atlas, "praise")).toEqual([{ impact: 4, note: "Bob praises Atlas after a week of use" }]);
+    // A signal someone hid holds its week: nothing stronger takes its place or comes beside it.
+    await sql`UPDATE project_signals SET hidden = true WHERE project_id = ${atlas} AND kind = 'praise'`;
+    expect(await signalFrom(chat.id, bob.id, { project: "atlas", kind: "praise", impact: 5, note: "Bob calls Atlas the best tracker he has used" }, day(18, 9))).toBe(0);
+    expect(await signalsOf(atlas, "praise")).toEqual([{ impact: 4, note: "Bob praises Atlas after a week of use" }]);
+
+    // A week ends at midnight on the chat's clock: late on Sunday by UTC, it is Monday in Tokyo already.
+    for (const [slug, timezone] of [["relic", "Asia/Tokyo"], ["pulse", undefined]] as const) {
+      await signalFrom(chat.id, kit.id, { project: slug, kind: "milestone", impact: 2, note: "A fix on Sunday night" }, day(20, 14), timezone);
+      await signalFrom(chat.id, kit.id, { project: slug, kind: "milestone", impact: 4, note: "A launch past midnight" }, day(20, 16), timezone);
+    }
+    expect((await signalsOf(relic, "milestone")).map((row) => row.impact)).toEqual([2, 4]);
+    expect((await signalsOf(pulse, "milestone")).map((row) => row.impact)).toEqual([4]);
+  });
+
   it("marks a fact outdated when the chronicler updates it to null, and rewrites it otherwise", async () => {
     const chat = await newChat("Outdated facts");
     const anna = await person(chat.id, "Anna");
@@ -1393,7 +1481,7 @@ describe.skipIf(!DATABASE_URL)("pipeline with postgres", () => {
     const anna = await person(chat.id, "Anna");
     const keeper = await project(chat.id, "beacon", "Beacon", [anna.id]);
     await project(chat.id, "beacon-app", "Beacon app", [anna.id]);
-    await mergeProjects(sql, chat.id, "beacon", ["beacon-app"]);
+    await mergeProjects(sql, chat.id, "beacon", ["beacon-app"], { source: "llm" });
     const imported = await project(LEGACY_CHAT_ID, "beacon-app", "Beacon app (imported)", [anna.id]);
     await sql`INSERT INTO project_signals (project_id, user_id, kind, impact, note, happened_at) VALUES (${imported}, ${anna.id}, 'milestone', 3, 'Beacon 2 shipped', now())`;
     const moved = await attachLegacyData(sql, chat.id);

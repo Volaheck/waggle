@@ -12,6 +12,8 @@ import { asSubject, type Subject } from "./own-card.js";
 /** Reminders and actions a member may have waiting in one chat, both kinds together. */
 export const MAX_PENDING_REMINDERS = 20;
 export const MAX_REMINDER_CHARS = 500;
+/** At most this many other members a reminder is for, and tags. */
+export const MAX_OTHERS_REMINDED = 3;
 /** How much of the message a request replied to an action keeps, when it keeps it at all. */
 export const MAX_REPLY_CHARS = 3500;
 

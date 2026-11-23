@@ -474,9 +474,10 @@ export function createApi(deps: ApiDeps): Hono<Env> {
     const [into] = await sql<{ id: number; slug: string }[]>`SELECT id, slug FROM projects WHERE slug = ${body.data.into} AND chat_id = ${chatId} AND NOT hidden`;
     if (!from || !into) return c.json({ error: "not_found" }, 404);
     if (from.id === into.id) return c.json({ error: "same_project" }, 400);
-    const allowed = isOwner(user) || ((await canEditProject(sql, from.id, user.id, false)) && (await canEditProject(sql, into.id, user.id, false)));
-    if (!allowed) return c.json({ error: "forbidden" }, 403);
-    await mergeProjects(sql, chatId, into.slug, [from.slug]);
+    const authorOfBoth = (await canEditProject(sql, from.id, user.id, false)) && (await canEditProject(sql, into.id, user.id, false));
+    if (!authorOfBoth && !isOwner(user)) return c.json({ error: "forbidden" }, 403);
+    // The member's own merge, or a bot owner's of someone else's projects: the history says whose it was.
+    await mergeProjects(sql, chatId, into.slug, [from.slug], { source: authorOfBoth ? "user" : "admin", actorUserId: user.id });
     return c.json({ ok: true, slug: into.slug });
   });
 

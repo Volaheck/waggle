@@ -44,7 +44,7 @@ import { registerReminders } from "./reminders.js";
 import { createSelfEdits, registerSelfEdits, type SelfEdits } from "./self-edits.js";
 import { createInterjector, type Interjector } from "./interjector.js";
 import { createPerformer, topicGone, type Performed, type Replay } from "./later.js";
-import { commandArgs, createKit, decodeStartParam, encodeChat, realReply, type BotContext, type Scope } from "./kit.js";
+import { commandArgs, createKit, decodeStartParam, encodeChat, mediaTypeOf, realReply, type BotContext, type Scope } from "./kit.js";
 import { isInChat, MembershipCache } from "./membership.js";
 import { registerNotes } from "./notes.js";
 import { outgoingLog } from "./outgoing.js";
@@ -116,20 +116,6 @@ const HELP_TEXT = [
   "<b>Privacy</b>",
   "/whatyouknow — everything I know about you · /forgetme — delete it",
 ].join("\n");
-
-function mediaTypeOf(message: Message): string | null {
-  if (message.photo) return "photo";
-  if (message.video) return "video";
-  if (message.video_note) return "video note";
-  if (message.voice) return "voice";
-  if (message.audio) return "audio";
-  // A GIF also carries `document`, so it has to be recognized first.
-  if (message.animation) return "GIF";
-  if (message.document) return "file";
-  if (message.sticker) return "sticker";
-  if (message.poll) return "poll";
-  return null;
-}
 
 function forwardSourceOf(message: Message): string | null {
   const origin = message.forward_origin;

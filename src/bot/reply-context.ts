@@ -1,5 +1,6 @@
 import type { Message, User as TelegramUser, UserFromGetMe } from "grammy/types";
 import { ambiguousNames, chatAliases, nameForms, namedIn, type Named, type NamedAlias } from "../core/aliases.js";
+import { capabilityLines, limitLines } from "../core/capabilities.js";
 import type { Sql } from "../core/db.js";
 import { FACT_KINDS, MIN_VISIBLE_CONFIDENCE } from "../core/facts.js";
 import { memosOf, projectMemos, type Memo, type ProjectMemo } from "../core/memos.js";
@@ -7,11 +8,13 @@ import { CONSENT, type NoteKind, type NoteStatus } from "../core/notes.js";
 import { maskPersonalData } from "../core/privacy.js";
 import {
   ABANDONED_MULTIPLIER,
+  catalogHistory,
   formerNames,
   listProjects,
   projectForms,
   ratingBreakdown,
   STATUS_LABELS,
+  type CatalogEvent,
   type FormerName,
   type ProjectListItem,
   type RatingBreakdown,
@@ -22,7 +25,8 @@ import { peopleOfChat, SERVICE_TG_IDS, type Person } from "../core/users.js";
 import { wishesOfChat, wishKey, type ChatWishes, type NamedWish } from "../core/wishes.js";
 import { chatClocks, isoDayIn, localDay, localStamp, localTimeOf, offsetAt, zoneGap, zoneLabel, type MemberClock } from "../core/zones.js";
 import { skippedMessageIds } from "../worker/extract.js";
-import { realReply } from "./kit.js";
+import { emojiOnly } from "./banter.js";
+import { mediaTypeOf, realReply } from "./kit.js";
 
 /**
  * The data part of an answer's prompt: who the bot is, the members and the names they go by, the catalog and the
@@ -77,6 +81,8 @@ export interface ReplyContextOptions {
   recentAnswers?: RecentAnswer[];
   /** The motif for a comeback, should the question be an insult. */
   insultMotif: string;
+  /** The question is one more line of banter in a row: the answer is one short line (assistant.ts). */
+  shortLine?: boolean;
 }
 
 const CONTEXT_MESSAGES = 30;
@@ -137,6 +143,8 @@ const SAID_ABOUT_YOU = 5;
 const DETAIL_PROJECTS = 3;
 const DETAIL_SIGNALS_PER_KIND = 4;
 const AMBIGUOUS_NAMES = 10;
+/** The newest merges, renames and deletions the chat's memory shows; a project's details show all of its own. */
+const CATALOG_EVENTS = 30;
 
 /** Text from members can't open or close a section of the prompt. */
 export function safe(text: string): string {
@@ -154,8 +162,20 @@ function withoutMention(text: string, me: UserFromGetMe): string {
 }
 
 /** The question without the bot's @username. */
-export function questionText(message: Message, me: UserFromGetMe): string {
+export function questionText(message: Pick<Message, "text" | "caption">, me: UserFromGetMe): string {
   return withoutMention(message.text ?? message.caption ?? "", me);
+}
+
+/**
+ * A mention of the bot with nothing else, or nothing but emoji («@bot» or «@bot 🤔» under a question), in reply to
+ * someone's message calls it in on that message, which is then the question. Until 2026-11-23 such a call went
+ * unanswered. A bare mention in reply to the bot's own message calls it in on nothing.
+ */
+export function calledInOn(message: Message, me: UserFromGetMe): NonNullable<Message["reply_to_message"]> | undefined {
+  const replied = realReply(message);
+  const own = questionText(message, me);
+  if (!replied || replied.from?.id === me.id || (own && !emojiOnly(own)) || mediaTypeOf(message)) return undefined;
+  return replied;
 }
 
 /**
@@ -186,8 +206,10 @@ export function refersToConversation(text: string): boolean {
   return CONVERSATION.test(text);
 }
 
-const RATING_WORDS = /(?<!\p{L})(?:рейтинг|балл|очк|голос|топ(?:е|а|у|ом)?(?!\p{L})|rating|score|points?(?!\p{L})|vot(?:e|es|ed|ing)(?!\p{L}))/iu;
+const RATING_WORDS =
+  /(?<!\p{L})(?:рейтинг|балл|очк|голос|сигнал(?:ы|ов|ам|ами|ах|а|у|ом|е)?(?!\p{L})|топ(?:е|а|у|ом)?(?!\p{L})|rating|score|points?(?!\p{L})|signals?(?!\p{L})|vot(?:e|es|ed|ing)(?!\p{L}))/iu;
 
+/** The question is about the rating, its points, votes or signals: naming no project, it is about the asker's own. */
 export function asksAboutRating(text: string): boolean {
   return RATING_WORDS.test(text);
 }
@@ -388,6 +410,10 @@ const NOTE_COLUMNS = "id, user_id, kind, about, value, status, due_at, user_ids,
 
 const quoted = (note: ContextNote, max = 120) => `“${line(note.value, max)}”`;
 
+/**
+ * Who the bot is and what it can and cannot do (src/core/capabilities.ts, the one list the weekly idea is written from
+ * as well), its owners, its place in the catalog and what members say about it.
+ */
 export function aboutYouBlock(input: {
   me: UserFromGetMe;
   model: string;
@@ -406,11 +432,13 @@ export function aboutYouBlock(input: {
     "<about_you>",
     `You are ${safe(me.first_name)} (@${me.username}), the chat's chronicler bot; this answer is written by ${input.model}.`,
     owners.length ? `Your ${owners.length > 1 ? "owners, who built you and pay" : "owner, who built you and pays"} for you: ${owners.join("; ")}.` : "",
-    "You read the chat and keep the members' cards, the project catalog with its rating and the chronicle, and you answer when someone mentions you or replies to you. A member changes their own card, tagline, time zone, names and notes (about themselves or on a project of theirs), and a project's authors its tagline, status, stack and links, by asking you plainly in the chat: you do it and post a receipt with ↩️ Undo, and ↪️ Redo after an Undo; the Mini App (/app) does the same and also renames or removes a project; nobody changes a project's authors through you. Nobody needs a note to change a card or a project. A member asks you to remind them of something later the same way: you post a receipt with ✖️ Cancel and, when it is due, write to them in the chat and in a private message; only ever the person who asks, and once, never on repeat. They also ask you to do, at a later time, anything you do when asked (an answer, a summary of the chat, a change to their card, notes or projects, a reminder, a /command): you post a receipt with ✖️ Cancel and at that time do it as if they had just asked, once. Nobody changes anyone else's data, someone else's project, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets. /forgetme erases what you know about a person.",
     entry
       ? `In the catalog you are the project ${safe(entry.project.name)}: #${entry.rank} of ${entry.total}, ${entry.project.score} rating points, ${entry.project.votes} vote(s).`
       : "",
-    "A member also asks you plainly in the chat not to write something, or not to write in some way, to them or about them («не шути про мой вес», «пиши мне короче»), and a chat admin or an owner asks it for the whole chat («не пиши в этом чате про политику»): you keep it as a wish, post a receipt with ↩️ Undo and keep to it from then on, in your answers, when you speak up uninvited and in the weekly idea, never in the chronicle or reminders; «можно снова шутить про мой вес» takes one back, and a chat admin or an owner one for the whole chat. A wish only ever narrows what you write.",
+    "What you do, since the day it shipped, how members ask for it and its limits:",
+    ...capabilityLines(),
+    "What you cannot do:",
+    ...limitLines(),
     input.saidAboutYou.length ? `What members say about you: ${input.saidAboutYou.join("; ")}.` : "",
     "</about_you>",
   ]
@@ -572,8 +600,14 @@ function whoIsWhoBlock(input: {
     return known.length ? [`${safe(person.display_name)}: ${known.join(", ")}`] : [];
   });
   const projects = input.projects.flatMap((project) => {
-    const earlier = [...new Set((input.former.get(project.id) ?? []).map((entry) => entry.name).filter((name) => name.toLowerCase() !== project.name.toLowerCase()))];
-    const known = [...(input.projectAliases.get(project.id) ?? []).map(aliasLabel), ...earlier.map((name) => `was ${safe(name)}`)];
+    const former = (input.former.get(project.id) ?? []).filter((entry) => entry.name.toLowerCase() !== project.name.toLowerCase());
+    // A duplicate merged into a project is a name for it too, but never one it had: the merge is no rename.
+    const names = (merged: boolean) => [...new Set(former.filter((entry) => entry.merged === merged).map((entry) => safe(entry.name)))];
+    const known = [
+      ...(input.projectAliases.get(project.id) ?? []).map(aliasLabel),
+      ...names(false).map((name) => `was ${name}`),
+      ...names(true).map((name) => `${name} (a duplicate merged into it)`),
+    ];
     return known.length ? [`#${project.slug} ${safe(project.name)}: ${known.join(", ")}`] : [];
   });
   const flags = input.ambiguous
@@ -583,11 +617,47 @@ function whoIsWhoBlock(input: {
   return `<who_is_who note="other spellings and names people use; @usernames are in members">\n${[...people, ...projects, ...flags].join("\n")}\n</who_is_who>`;
 }
 
+/**
+ * Who changed the catalog, as an answer may say it: the weekly clean-up's merge, the chronicler's rename (taken from what
+ * the project's author or an owner said), or a member's change; a member who left or opted out goes unnamed, and so does
+ * whoever merged in the Mini App before the log kept who it was (catalogHistory).
+ */
+function catalogActor(event: Pick<CatalogEvent, "kind" | "source" | "actor_user_id">, names: Map<number, string>): string {
+  if (event.source === null) return "someone other than the clean-up (the log of then does not say who)";
+  if (event.source === "llm") return event.kind === "merge" ? "the weekly clean-up" : "the chronicler";
+  if (event.source === "seed") return "the catalog's import";
+  const name = event.actor_user_id === null ? undefined : names.get(event.actor_user_id);
+  if (event.source === "admin") return name ? `${safe(name)}, a bot owner` : "a bot owner";
+  return name ? safe(name) : "a member";
+}
+
+/**
+ * What happened to the catalog, newest first and dated: which duplicate went into which project and whose merge it was,
+ * renames and deletions. Without it the bot could not tell what had become of an entry: it had a member delete a
+ * duplicate they asked it to merge, and an hour later said the duplicate had never been in the catalog and nobody had
+ * done anything (2026-11-18).
+ */
+export function catalogHistoryBlock(events: CatalogEvent[], names: Map<number, string>, clock: Clock): string {
+  const lines = events.slice(0, CATALOG_EVENTS).map((event) => {
+    const what =
+      event.kind === "rename"
+        ? `${safe(event.former ?? "")} renamed to ${safe(event.project)}`
+        : event.kind === "merge"
+          ? `${safe(event.former ?? "")} merged into ${safe(event.project)}`
+          : `${safe(event.project)} deleted from the catalog`;
+    return `- ${dateLabel(event.at, clock)}: ${what} by ${catalogActor(event, names)}`;
+  });
+  return lines.length
+    ? `<catalog_history note="merges, renames and deletions in the catalog, newest first; a merge moved the duplicate's votes, signals, authors and notes into the project it went into">\n${lines.join("\n")}\n</catalog_history>`
+    : "";
+}
+
 function projectDetailsBlock(input: {
   ranked: ProjectListItem[];
   picked: ProjectListItem[];
   breakdown: Map<number, RatingBreakdown>;
-  former: Map<number, FormerName[]>;
+  history: Map<number, CatalogEvent[]>;
+  names: Map<number, string>;
   memos: Map<number, ProjectMemo[]>;
   statusSince: Map<number, Date>;
   clock: Clock;
@@ -618,15 +688,19 @@ function projectDetailsBlock(input: {
     const milestones = signals
       .filter((signal) => signal.kind === "milestone")
       .map((signal) => `${dateLabel(signal.happened_at, clock)} “${line(signal.note, 80)}” (${signal.points > 0 ? `counts ${points(signal.points)}` : "counts 0 now"})`);
-    const renames = (input.former.get(project.id) ?? [])
-      .filter((entry) => !entry.merged)
-      .map((entry) => `from ${safe(entry.name)} on ${dateLabel(entry.at, clock)}`);
+    // Oldest first: how the entry came to be what it is, and by whose hand.
+    const history = [...(input.history.get(project.id) ?? [])].reverse();
+    const when = (event: CatalogEvent) => `on ${dateLabel(event.at, clock)} by ${catalogActor(event, input.names)}`;
+    const renames = history.filter((event) => event.kind === "rename").map((event) => `from ${safe(event.former ?? "")} ${when(event)}`);
+    const merged = history.filter((event) => event.kind === "merge").map((event) => `${safe(event.former ?? "")} ${when(event)}`);
     return [
       `${safe(project.name)} (#${project.slug}): #${rank} of ${ranked.length}, ${project.score} rating points${standing ? `; ${standing}` : ""}. Status: ${STATUS_LABELS[project.status] ?? project.status}${input.statusSince.has(project.id) ? ` since ${dateLabel(input.statusSince.get(project.id)!, clock)}` : ""}.`,
       `Votes: ${votes.length}${votes.length ? ` (${votes.map((at) => dateLabel(at, clock)).join(", ")})` : ""}.`,
       kinds.length ? `Signals counted now, in points: ${kinds.join("; ")}.` : "No other signals count now.",
+      signals.length ? "A member's signals of one kind count once a week: that week's strongest, and a smaller one the same week adds nothing." : "",
       project.status === "abandoned" ? `Abandoned: the total is multiplied by ${ABANDONED_MULTIPLIER}.` : "",
-      renames.length ? `Renamed ${renames.join(", ")}.` : "",
+      renames.length ? `Renamed ${renames.join("; ")}.` : "",
+      merged.length ? `Duplicates merged into it: ${merged.join("; ")}.` : "",
       milestones.length ? `Milestones of all time: ${milestones.join("; ")}.` : "",
       memoLine("Notes its authors wrote", (input.memos.get(project.id) ?? []).slice(0, PROJECT_MEMOS), clock, (memo) => safe(memo.display_name)),
     ]
@@ -800,6 +874,28 @@ export function wishesBlock(chatWide: NamedWish[], people: (WishHolder & { wishe
   return lines.length ? `<wishes note="what people asked you not to write, or not to write in some way: each one narrows what you write">\n${lines.join("\n")}\n</wishes>` : "";
 }
 
+/**
+ * The message to answer and who wrote it, with what it carries besides its text (`media="photo"`): the model never sees
+ * the thing itself, and only the mark tells it there is one, so it says it can't see it instead of guessing. When a
+ * mention calls the bot in on someone's message (calledInOn), that message is the question: its words, its author and
+ * what it carries, and the emoji the mention came with (`their_emoji`), which say how its caller takes it.
+ */
+export function questionBlock(question: Pick<Question, "message" | "from">, asked: string, calledIn?: { author: string; message: Message; emoji?: string }): string {
+  const { from } = question;
+  const asker = `${from.first_name}${from.last_name ? ` ${from.last_name}` : ""}${from.username ? ` (@${from.username})` : ""}`;
+  const attribute = (value: string) => safe(value).replace(/"/g, "'");
+  const called = calledIn ? ` calls_you_in_on="${attribute(calledIn.author)}'s message"${calledIn.emoji ? ` their_emoji="${attribute(calledIn.emoji)}"` : ""}` : "";
+  const media = mediaTypeOf(calledIn?.message ?? question.message);
+  return `<question from="${attribute(asker)}"${called}${media ? ` media="${media}"` : ""}>\n${line(asked, 1500)}\n</question>`;
+}
+
+/**
+ * One more line of banter in a row, which the base model answers (assistant.ts): one short line, and the run ends there.
+ * Telling banter from a request is a guess (banter.ts), so a line that does ask for something after all gets it.
+ */
+export const SHORT_LINE_BLOCK =
+  "<short_line>they have sent you several lines in a row that ask nothing: answer this one with one short line, at most about 15 words, and no question back; but if this one does ask for something after all (more of the work, a change to it, a follow-up), do that in full</short_line>";
+
 /** When they asked for what is done now, by their own clock: «Thu 12 Nov 2026, 21:30». */
 export function askedEarlierBlock(askedAt: Date, zone: string): string {
   const when = `${localDay(askedAt, zone)} ${isoDayIn(askedAt, zone).slice(0, 4)}, ${localTimeOf(askedAt, zone)}`;
@@ -817,12 +913,14 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   // every message up to now, so it sees what was written after it was asked.
   const before = question.scheduled ? Number.MAX_SAFE_INTEGER : message.message_id;
   const clock: Clock = { timezone: options.timezone, today: dayOf(now, options.timezone) };
-  const asked = questionText(message, me);
+  // A bare mention in reply to someone's message calls the bot in on that message: its words are the question.
+  const calledIn = calledInOn(message, me);
+  const asked = questionText(calledIn ?? message, me);
   const aboutConversation = refersToConversation(asked);
   const replied = realReply(message);
   // Messages the chronicler skipped because the model refused them are kept out here too.
   const skipped = await skippedMessageIds(sql, chatId);
-  const [clocks, people, facts, projects, chronicle, latest, waiting, chain, aliases, former, owners, chatNotes] = await Promise.all([
+  const [clocks, people, facts, projects, chronicle, latest, waiting, chain, aliases, former, history, owners, chatNotes] = await Promise.all([
     chatClocks(sql, chatId, options.timezone),
     peopleOfChat(sql, chatId),
     sql<{ user_id: number; kind: string; value: string }[]>`
@@ -856,6 +954,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     replied ? replyChain(sql, chatId, replied.message_id) : Promise.resolve([]),
     chatAliases(sql, chatId),
     formerNames(sql, chatId),
+    catalogHistory(sql, chatId),
     options.ownerTgIds.length
       ? sql<{ id: number; display_name: string; username: string | null }[]>`
           SELECT id, display_name, username FROM users WHERE tg_id = ANY(${options.ownerTgIds}::bigint[]) ORDER BY id`
@@ -1060,7 +1159,6 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
   }
   const forgotten = new Set(blanked.map((row) => row.msg_id));
   const earlierAnswers = answers.filter((answer) => answer.msgId === undefined || (!visibleIds.has(answer.msgId) && !forgotten.has(answer.msgId)));
-  const askerName = `${question.from.first_name}${question.from.last_name ? ` ${question.from.last_name}` : ""}${question.from.username ? ` (@${question.from.username})` : ""}`;
   const conversationLines = conversation.map((row) => messageLine(row, clock, aboutConversation ? SEGMENT_CHARS : MESSAGE_CHARS));
 
   // The chat-wide lists are the same whoever asks; the focus repeats its people's own corrections and words about the bot.
@@ -1087,12 +1185,22 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     whoIsWhoBlock({ people: roster, aliasesOf, projects: projects.slice(0, MAX_PROJECTS), projectAliases, former: formerOf, ambiguous: ambiguousNames(rosterNamed) }),
     correctionsBlock(corrections, names, clock),
     `<projects rating="best first">\n${catalog.join("\n") || "(none yet)"}\n</projects>`,
+    catalogHistoryBlock(history, names, clock),
     `<chronicle days="${CHRONICLE_DAYS}" order="newest first">\n${topicsList.join("\n") || "(nothing yet)"}\n</chronicle>`,
     runningJokesBlock(jokes.slice(0, RUNNING_JOKES), names, clock),
   ];
   const aboutQuestion = [
     earlier.length ? "</earlier_messages>" : "",
-    projectDetailsBlock({ ranked: projects, picked, breakdown, former: formerOf, memos: groupBy(pickedMemos, (memo) => memo.project_id!), statusSince, clock }),
+    projectDetailsBlock({
+      ranked: projects,
+      picked,
+      breakdown,
+      history: groupBy(history, (event) => event.project_id),
+      names,
+      memos: groupBy(pickedMemos, (memo) => memo.project_id!),
+      statusSince,
+      clock,
+    }),
     inFocusBlock({
       focus: focusPeople,
       facts: groupBy(focusFacts, (fact) => fact.user_id),
@@ -1121,7 +1229,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     // A message of the bot's from before it kept its own messages: Telegram's copy stands in.
     repliedToBot && unstoredParent ? `<your_message_they_reply_to>\n${line(unstoredParent, 1500)}\n</your_message_they_reply_to>` : "",
     question.cardChange
-      ? `<card_change note="what the bot did about this message's request to change the sender's card or a project of theirs, to remind them of something or to do something for them later; its reply already said it">${line(question.cardChange, 600)}</card_change>`
+      ? `<card_change note="what the bot did, or did not do, about this message's request to change the sender's card or a project of theirs, to remind them of something or to do something for them later, and whether its own reply already said so">${line(question.cardChange, 1000)}</card_change>`
       : "",
     question.scheduled ? askedEarlierBlock(question.scheduled.askedAt, (asker && clocks.get(asker.id)?.zone) || options.timezone) : "",
     worn.length ? `<worn_out note="what your own answers kept coming back to lately: leave it out">${worn.map(safe).join(", ")}</worn_out>` : "",
@@ -1140,8 +1248,9 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
       ),
     ),
     // Right before the question, where a smaller model still has it in mind: the tone of the answer follows this message.
-    `<answer_in_kind>kindness, thanks or a gift: a short, warm thank-you about the gesture, never their projects or card, no jab, yet it buys no side; banter: light banter about what they just said, no nagging about work; an insult: one dry, unbothered comeback, no threats</answer_in_kind>`,
-    `<question from="${safe(askerName).replace(/"/g, "'")}">\n${line(asked, 1500)}\n</question>`,
+    `<answer_in_kind>kindness, thanks or a gift: a short, warm thank-you about the gesture, never their projects or card, no jab, yet it buys no side; banter: light banter about what they just said, no nagging about work; their work defended, or put up for another opinion: your own fair take, never a second critic; an insult: one dry, unbothered comeback, no threats</answer_in_kind>`,
+    options.shortLine ? SHORT_LINE_BLOCK : "",
+    questionBlock(question, asked, calledIn ? { author: authorOf(calledIn, me), message: calledIn, emoji: questionText(message, me) || undefined } : undefined),
   ];
   const text = (blocks: string[]) => blocks.filter(Boolean).join("\n\n");
   return [{ text: `${text(memory)}\n\n`, cached: true }, ...earlier, { text: text(aboutQuestion), cached: false }];

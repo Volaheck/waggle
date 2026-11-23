@@ -187,6 +187,70 @@ export async function formerNames(sql: Sql, chatId: number): Promise<FormerName[
     ORDER BY id`;
 }
 
+/** Something that happened to an entry of the catalog: renamed, a duplicate merged into it, or deleted. */
+export interface CatalogEvent {
+  kind: "rename" | "merge" | "delete";
+  /** The project it happened to: the one renamed, the one a duplicate went into, the one deleted. */
+  project_id: number;
+  /** That project's name: the one a rename gave it, the current one of the project a duplicate went into, a deleted one's. */
+  project: string;
+  /** The name a rename replaced, or the duplicate merged into the project; null for a deletion. */
+  former: string | null;
+  at: Date;
+  /**
+   * The chronicler's rename or the weekly clean-up's merge (llm), a member's change (user), a bot owner's (admin); null
+   * for a merge made before merges were logged with who made them, by someone other than the clean-up whom the log does
+   * not name.
+   */
+  source: ProjectUpsert["source"] | null;
+  actor_user_id: number | null;
+}
+
+/**
+ * Since when merges are logged with who made them (`app_state`, set by migration 018 as it ran). Before that every merge
+ * was logged as the clean-up's, those made in the Mini App too; of those, the clean-up's own were made within minutes
+ * after its call to the model in that chat, so the rest were made by someone the log does not name.
+ */
+const MERGE_MAKERS_KEY = "merge_makers_logged";
+const CLEAN_UP_TO_MERGE = "15 minutes";
+
+/**
+ * The catalog's history in a chat, newest first: renames, duplicates folded into another entry, and projects deleted and
+ * not brought back, each with when and by whom. A project folded into another is hidden too, but that is its merge.
+ */
+export async function catalogHistory(sql: Sql, chatId: number): Promise<CatalogEvent[]> {
+  return sql<CatalogEvent[]>`
+    SELECT kind, project_id, project, former, at, source, actor_user_id FROM (
+      SELECT l.id, 'rename' AS kind, p.id AS project_id, l.after->>'name' AS project, l.before->>'name' AS former, l.at, l.source, l.actor_user_id
+      FROM change_log l JOIN projects p ON p.id = l.entity_id
+      WHERE l.entity = 'project' AND l.op = 'rename' AND p.chat_id = ${chatId} AND l.before->>'name' IS NOT NULL
+      UNION ALL
+      SELECT l.id, 'merge', kept.id, kept.name, folded.name, l.at,
+             CASE
+               WHEN l.source <> 'llm' OR l.at >= coalesce((SELECT (value->>'at')::timestamptz FROM app_state WHERE key = ${MERGE_MAKERS_KEY}), '-infinity') THEN l.source
+               WHEN EXISTS (
+                 SELECT 1 FROM llm_usage u
+                 WHERE u.chat_id = folded.chat_id AND u.purpose = 'consolidate' AND u.at BETWEEN l.at - ${CLEAN_UP_TO_MERGE}::interval AND l.at
+               ) THEN 'llm'
+             END,
+             l.actor_user_id
+      FROM change_log l
+      JOIN projects folded ON folded.id = l.entity_id
+      JOIN projects kept ON kept.id = (l.after->>'into')::int
+      WHERE l.entity = 'project' AND l.op = 'merged_into' AND folded.chat_id = ${chatId}
+      UNION ALL
+      SELECT latest.id, 'delete', p.id, p.name, NULL, latest.at, latest.source, latest.actor_user_id
+      FROM projects p
+      JOIN LATERAL (
+        SELECT id, op, at, source, actor_user_id FROM change_log
+        WHERE entity = 'project' AND entity_id = p.id AND op IN ('hide', 'restore', 'merged_into')
+        ORDER BY id DESC LIMIT 1
+      ) AS latest ON latest.op = 'hide'
+      WHERE p.chat_id = ${chatId} AND p.hidden
+    ) AS history
+    ORDER BY id DESC`;
+}
+
 export const RATING_EXPLANATION = [
   "<b>How the rating works</b>",
   "",
@@ -778,10 +842,17 @@ export async function moveProjectAliases(tx: Queryable, fromId: number, intoId: 
 }
 
 /**
+ * Who folds duplicates together: the weekly clean-up, or a person in the Mini App (an author of both projects, or a bot
+ * owner). The history says which, and the answers tell the chat whose merge it was.
+ */
+export type MergedBy = { source: "llm" } | { source: "user" | "admin"; actorUserId: number };
+
+/**
  * Folds duplicate catalog entries into one: authors, votes, signals and aliases move over, and the stack and links too
  * unless a person set those of the entry they go into (manual_fields), which stay as they set them; the rest is hidden.
  */
-export async function mergeProjects(sql: Sql, chatId: number, intoSlug: string, fromSlugs: string[]): Promise<number> {
+export async function mergeProjects(sql: Sql, chatId: number, intoSlug: string, fromSlugs: string[], by: MergedBy): Promise<number> {
+  const actorUserId = by.source === "llm" ? null : by.actorUserId;
   return sql.begin(async (tx) => {
     const [into] = await tx<Project[]>`SELECT * FROM projects WHERE chat_id = ${chatId} AND slug = ${intoSlug} AND NOT hidden FOR UPDATE`;
     if (!into) return 0;
@@ -814,12 +885,12 @@ export async function mergeProjects(sql: Sql, chatId: number, intoSlug: string, 
         WHERE id = ${into.id}`;
       await tx`UPDATE projects SET hidden = true, updated_at = now() WHERE id = ${project.id}`;
       await tx`
-        INSERT INTO change_log (entity, entity_id, op, before, source)
-        VALUES ('project', ${into.id}, 'merge', ${tx.json({ merged: project.slug })}, 'llm')`;
+        INSERT INTO change_log (entity, entity_id, op, before, source, actor_user_id)
+        VALUES ('project', ${into.id}, 'merge', ${tx.json({ merged: project.slug })}, ${by.source}, ${actorUserId})`;
       // The folded entry remembers where it went, so a later mention of its old slug reaches the surviving project.
       await tx`
-        INSERT INTO change_log (entity, entity_id, op, after, source)
-        VALUES ('project', ${project.id}, 'merged_into', ${tx.json({ into: into.id, slug: into.slug })}, 'llm')`;
+        INSERT INTO change_log (entity, entity_id, op, after, source, actor_user_id)
+        VALUES ('project', ${project.id}, 'merged_into', ${tx.json({ into: into.id, slug: into.slug })}, ${by.source}, ${actorUserId})`;
     }
     return from.length;
   });

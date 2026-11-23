@@ -58,6 +58,8 @@ export interface OutgoingMessage {
   text: string;
   replyToMsgId: number | null;
   threadId?: number | null;
+  /** A file the bot sent (an answer's code), as members' media is marked. */
+  mediaType?: string | null;
 }
 
 /**
@@ -67,8 +69,8 @@ export interface OutgoingMessage {
  */
 export async function saveBotMessage(sql: Queryable, message: OutgoingMessage): Promise<boolean> {
   const inserted = await sql`
-    INSERT INTO messages (chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, from_bot, thread_id)
-    SELECT ${message.chatId}, ${message.msgId}, NULL, ${message.sentAt}, ${message.text}, ${message.replyToMsgId}, true, ${message.threadId ?? null}
+    INSERT INTO messages (chat_id, msg_id, user_id, sent_at, text, reply_to_msg_id, from_bot, thread_id, media_type)
+    SELECT ${message.chatId}, ${message.msgId}, NULL, ${message.sentAt}, ${message.text}, ${message.replyToMsgId}, true, ${message.threadId ?? null}, ${message.mediaType ?? null}
     WHERE EXISTS (SELECT 1 FROM chats WHERE id = ${message.chatId} AND status = 'approved')
     ON CONFLICT (chat_id, msg_id) DO NOTHING`;
   return inserted.count > 0;

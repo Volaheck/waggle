@@ -121,9 +121,9 @@ const MORE =
   /^(?:подробн|развернут|длинн|чаще|ссылк|реклам|промо|рассказыва|расскаж|раскрыва|раскро|выдава|выда[йт]|слива|слей|показыва|покаж|more|longer|detail|often|links?$|advert|promo|reveal|disclos|tell|show|share|leak)/u;
 /** Asking for something every time, or for mentions: more, unless the same clause narrows it («упоминай меня реже»). */
 const UNLESS_NARROWED = /^(?:всегда|кажд\p{L}*|упомина\p{L}*|упомян\p{L}*|т[еэ]га\p{L}*|пингу\p{L}*|always|every\w*|mention\w*|tag\w*|ping\w*)$/u;
-/** What makes a wish narrow what the bot writes: a word that says no, without or stop, or a narrower manner. */
+/** What makes a wish narrow what the bot writes: a word that says no, without or stop, or a narrower or gentler manner. */
 const NARROWING =
-  /(?<!\p{L})(?:не|ни|нет|никогда|никому|ничего|хватит|перестань(?:те)?|прекрати(?:те)?|завязывай|без|только|лишь|короче|покороче|кратко|кратче|проще|попроще|меньше|реже|вежлив\p{L}*|спокойн\p{L}*|по-русски|по-английски|на\s+(?:русском|английском|«?вы»?|«?ты»?))(?!\p{L})|\b(?:not|no|never|don'?t|doesn'?t|stop|quit|without|only|shorter|brief\w*|simpl\w*|less|fewer|polite\w*|formal\w*|in\s+(?:english|russian))\b/iu;
+  /(?<!\p{L})(?:не|ни|нет|никогда|никому|ничего|хватит|перестань(?:те)?|прекрати(?:те)?|завязывай|без|только|лишь|короче|покороче|кратко|кратче|проще|попроще|меньше|реже|(?:по)?вежлив\p{L}*|(?:по)?спокойн\p{L}*|(?:по)?мягче|(?:по)?добрее|(?:по)?культурн\p{L}*|по-русски|по-английски|на\s+(?:русском|английском|«?вы»?|«?ты»?))(?!\p{L})|\b(?:not|no|never|don'?t|doesn'?t|stop|quit|without|only|shorter|brief\w*|simpl\w*|less|fewer|polite\w*|politer|nicer|kinder|gentler|civil\w*|respectful\w*|formal\w*|in\s+(?:english|russian))\b/iu;
 
 /**
  * Whether a wish would loosen the bot rather than narrow it. It touches the bot's rules or prompt; takes away a limit, a
@@ -160,8 +160,9 @@ export function loosens(text: string): boolean {
         negated = true;
         return twice;
       }
-      // «больше не шути» is a stop: its «больше» asks for nothing more.
+      // «больше не шути» is a stop: its «больше» asks for nothing more; nor does the "more" of "be more polite".
       if (word === "больше" && (NEGATORS.has(words[index + 1] ?? "") || CONCORD.test(words[index + 1] ?? ""))) return false;
+      if (word === "more" && NARROWING.test(words[index + 1] ?? "")) return false;
       if (negated) return LIMITS.test(word) || (KEEPING.test(word) && /(?<!\p{L})(?:от\s+меня|from\s+me)(?!\p{L})/iu.test(clause));
       return AGREEING.test(word) || MORE.test(word) || word === "больше" || (!narrowed && UNLESS_NARROWED.test(word));
     });

@@ -10,6 +10,7 @@ import {
   addOwnReminder,
   cancelOwnReminder,
   markReminderRequest,
+  MAX_OTHERS_REMINDED,
   MAX_PENDING_REMINDERS,
   MAX_REMINDER_CHARS,
   ownPendingReminders,
@@ -435,9 +436,6 @@ const PROBLEMS: Record<Language, Record<Refusal, string>> = {
   },
 };
 
-/** At most this many other members a reminder tags. */
-export const MAX_OTHERS_REMINDED = 3;
-
 type WhomProblem = "not_found" | "ambiguous" | "too_many_people" | "nobody";
 
 const WHOM_PROBLEMS: Record<Language, Record<WhomProblem, string>> = {
@@ -472,6 +470,12 @@ const quoted = (text: string, max?: number) => escapeHtml((max === undefined ? t
 export function dueLabel(at: Date, zone: string, language: Language): string {
   const clock = wallClock(at, zone);
   return `${clock.day} ${MONTHS[language][clock.month - 1]} ${clock.year}, ${clockTime(clock)}`;
+}
+
+/** «16 ноября», «16 November», with the year when it is not this one. */
+export function dayLabelIn(at: Date, zone: string, language: Language, now = new Date()): string {
+  const clock = wallClock(at, zone);
+  return `${clock.day} ${MONTHS[language][clock.month - 1]}${clock.year === wallClock(now, zone).year ? "" : ` ${clock.year}`}`;
 }
 
 /** «3 ч 20 мин», «2 дн. 4 ч»; «3 h 20 min», «2 d 4 h». */

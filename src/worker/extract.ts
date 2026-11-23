@@ -455,7 +455,7 @@ export async function applyExtraction(sql: Sql, runId: number, data: BatchData, 
       else if (await rewriteFact(tx, item.fact_id, item.value, fact.kind === "timezone" ? ownSources(fact.user_id, sources) : sources, "llm")) stats.factsUpdated += 1;
     }
 
-    stats.signals += await applySignals(tx, data.chatId, runId, result, batchById, users, projectIdOf);
+    stats.signals += await applySignals(tx, data.chatId, runId, result, batchById, users, projectIdOf, data.timezone ?? "UTC");
 
     await markExtracted(tx, data.chatId, data.batch.map((message) => message.msg_id));
   });
@@ -559,8 +559,13 @@ async function applyRenames(
   }
 }
 
-const SIGNAL_DEDUPE_DAYS = 7;
-
+/**
+ * A member counts once a week (Monday to Sunday on the chat's clock) for each kind of signal on a project, and the week
+ * keeps its strongest: a stronger signal from that week takes the place of the one it holds, and a weaker or equal one
+ * changes nothing. An author's biggest milestone of the week counts however many smaller reports came before it, and a
+ * run of them never stacks up in the rating. A signal someone hid holds its week. In a batch only the first signal of a
+ * kind a person gives a project is taken, as the chronicler is asked for one. Returns the signals written.
+ */
 async function applySignals(
   sql: Queryable,
   chatId: number,
@@ -569,6 +574,7 @@ async function applySignals(
   batchById: Map<number, StoredMessage>,
   users: Map<number, Person>,
   projectIdOf: (slug: string) => Promise<number | null>,
+  timeZone: string,
 ): Promise<number> {
   let applied = 0;
   const seen = new Set<string>();
@@ -590,16 +596,26 @@ async function applySignals(
     if (seen.has(key)) continue;
     seen.add(key);
     const happenedAt = sources.map((id) => batchById.get(id)!.sent_at).sort((a, b) => b.getTime() - a.getTime())[0]!;
-    const [recent] = await sql`
-      SELECT 1 FROM project_signals
-      WHERE project_id = ${projectId} AND user_id = ${person.id} AND kind = ${signal.kind}
-        AND happened_at > ${happenedAt}::timestamptz - ${`${SIGNAL_DEDUPE_DAYS} days`}::interval`;
-    if (recent) continue;
-    const impact = Math.min(5, Math.max(1, Math.round(signal.impact)));
-    await sql`
-      INSERT INTO project_signals (project_id, user_id, kind, impact, note, source_msg_ids, happened_at, run_id)
-      VALUES (${projectId}, ${person.id}, ${signal.kind}, ${impact}, ${truncate(signal.note.trim(), 240)}, ${sources}, ${happenedAt}, ${runId})`;
+    // Progress its author reported keeps the project alive, whether or not it outweighs the week's milestone.
     if (signal.kind === "milestone") await sql`UPDATE projects SET last_activity_at = greatest(last_activity_at, ${happenedAt}) WHERE id = ${projectId}`;
+    const impact = Math.min(5, Math.max(1, Math.round(signal.impact)));
+    const note = truncate(signal.note.trim(), 240);
+    const [held] = await sql<{ id: number; impact: number; hidden: boolean }[]>`
+      SELECT id, impact, hidden FROM project_signals
+      WHERE project_id = ${projectId} AND user_id = ${person.id} AND kind = ${signal.kind}
+        AND date_trunc('week', happened_at AT TIME ZONE ${timeZone}) = date_trunc('week', ${happenedAt}::timestamptz AT TIME ZONE ${timeZone})
+      ORDER BY hidden DESC, impact DESC, id
+      LIMIT 1`;
+    if (held && (held.hidden || held.impact >= impact)) continue;
+    if (held) {
+      await sql`
+        UPDATE project_signals SET impact = ${impact}, note = ${note}, source_msg_ids = ${sources}, happened_at = ${happenedAt}, run_id = ${runId}
+        WHERE id = ${held.id}`;
+    } else {
+      await sql`
+        INSERT INTO project_signals (project_id, user_id, kind, impact, note, source_msg_ids, happened_at, run_id)
+        VALUES (${projectId}, ${person.id}, ${signal.kind}, ${impact}, ${note}, ${sources}, ${happenedAt}, ${runId})`;
+    }
     applied += 1;
   }
   return applied;

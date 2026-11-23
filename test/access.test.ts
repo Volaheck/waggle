@@ -312,7 +312,7 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
     it("sends the chronicler's mention of a merged-away duplicate to the project it was merged into", async () => {
       const one = await upsertProject(sql, { chatId: A, slug: "dup-one", name: "Dup One", authorIds: [ids.carol!], sourceMsgIds: [], source: "llm" });
       await upsertProject(sql, { chatId: A, slug: "dup-two", name: "Second Thing", authorIds: [ids.carol!], sourceMsgIds: [], source: "llm" });
-      expect(await mergeProjects(sql, A, "dup-one", ["dup-two"])).toBe(1);
+      expect(await mergeProjects(sql, A, "dup-one", ["dup-two"], { source: "llm" })).toBe(1);
       const again = await upsertProject(sql, { chatId: A, slug: "dup-two", name: "Second Thing", tagline: "fresh", authorIds: [ids.carol!], sourceMsgIds: [7], source: "llm" });
       expect(again.project.id).toBe(one.project.id);
       expect((await projectForSlug(sql, A, "dup-two"))?.id).toBe(one.project.id);
@@ -461,6 +461,10 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
     const dmClosed = new Set<number>();
     /** Basic groups that became supergroups: Telegram refuses every call to the old id and names the new one. */
     const upgraded = new Map<number, number>();
+    /** A chat that allows no reaction the bot picks: Telegram turns it down. */
+    let reactionsRefused = false;
+    /** Telegram's flood limit on reactions. */
+    let reactionsFlooded = false;
     let updateId = 1;
     let msgId = 5000;
     const botInfo = { id: 42, is_bot: true, first_name: "Waggle", username: "waggle_test_bot", can_join_groups: true, can_read_all_group_messages: true, supports_inline_queries: false };
@@ -483,6 +487,8 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       if (method === "sendMessage" && dmClosed.has(payload.chat_id)) {
         return { ok: false, error_code: 403, description: "Forbidden: bot can't initiate conversation with a user" };
       }
+      if (method === "setMessageReaction" && reactionsRefused) return { ok: false, error_code: 400, description: "Bad Request: REACTION_INVALID" };
+      if (method === "setMessageReaction" && reactionsFlooded) return { ok: false, error_code: 429, description: "Too Many Requests: retry after 5", parameters: { retry_after: 5 } };
       if (method === "sendMessage" || method === "editMessageText") {
         return { ok: true, result: { message_id: ++msgId, date: 0, chat: { id: payload.chat_id ?? 0, type: "private", first_name: "x" }, text: payload.text } };
       }
@@ -841,6 +847,192 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       expect(claude.requests[0]!.content.match(/<\/recent_messages>/g)).toHaveLength(1);
       const answer = calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === A).at(-1)!;
       expect(answer.payload.message_thread_id).toBe(4242);
+    });
+
+    /** A chat of its own for a test, so its messages crowd no other test's context. */
+    const ownChat = async (chatId: number, title: string) => {
+      await registerChat(sql, chatId, title, null);
+      await setChatStatus(sql, chatId, "approved", null);
+      return chatId;
+    };
+    const mentioned = { entities: [{ type: "mention", offset: 0, length: MENTION.length }] };
+    const askIn = (chatId: number, from: ReturnType<typeof tg>, question: string, extra: Record<string, unknown> = {}) =>
+      inGroup(chatId, from, `${MENTION} ${question}`, { ...mentioned, ...extra });
+
+    it("takes a bare mention in reply to someone's message as a call to answer that message", async () => {
+      const chat = await ownChat(-1001000000081, "Calls");
+      const claude = fakeClaude();
+      const { bot: answering, assistant } = answeringBot(claude);
+      const question = inGroup(chat, alice, "who here writes Rust?");
+      await answering.handleUpdate(question as never);
+      const called = inGroup(chat, bob, MENTION, { ...mentioned, reply_to_message: question.message });
+      await answering.handleUpdate(called as never);
+      await assistant.idle();
+      expect(claude.requests).toHaveLength(1);
+      expect(claude.requests[0]!.content).toContain(`<question from="Bob" calls_you_in_on="Alice's message">\nwho here writes Rust?\n</question>`);
+      expect(claude.requests[0]!.content).toMatch(/<thread note="[^"]*">\n\[\d+ [\d:]+\] Alice: who here writes Rust\?\n<\/thread>/);
+      const answer = calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === chat).at(-1)!;
+      expect(answer.payload.reply_parameters.message_id).toBe(called.message.message_id);
+
+      // In reply to the bot's own message a bare mention asks nothing, and gets no greeting either.
+      const botMessage = { message_id: 8899, date: now(), chat: { id: chat, type: "supergroup", title: "Calls" }, from: botInfo, text: "an earlier answer" };
+      const before = sent().length;
+      await answering.handleUpdate(inGroup(chat, bob, MENTION, { ...mentioned, reply_to_message: botMessage }) as never);
+      await assistant.idle();
+      expect(claude.requests).toHaveLength(1);
+      expect(sent()).toHaveLength(before);
+    });
+
+    it("answers a run of banter with one short line from the base model after its first two lines, and keeps the stronger one for questions", async () => {
+      const chat = await ownChat(-1001000000082, "Banter");
+      const claude = fakeClaude();
+      const premium = { REPLY_PREMIUM_MODEL: "claude-opus-5-5", REPLY_PREMIUM_PER_MEMBER_PER_HOUR: 10, REPLY_PREMIUM_MONTHLY_BUDGET_USD: 20 };
+      const { bot: answering, assistant } = answeringBot(claude, {}, premium);
+      const fran = tg(9311, "Fran");
+      for (const line of ["ахаха", "ТЫ ТОРМОЗ", "лол", "ну ты и пчела", "кто тут пишет на Rust?", "ахах"]) {
+        await answering.handleUpdate(askIn(chat, fran, line) as never);
+        await assistant.idle();
+      }
+      expect(claude.requests.map((request) => request.model)).toEqual(["claude-opus-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-haiku-5-5", "claude-opus-5-5", "claude-opus-5-5"]);
+      expect(claude.requests.map((request) => request.content.includes("<short_line>"))).toEqual([false, false, true, true, false, false]);
+      // The short lines spend nothing of the stronger model's hourly share.
+      const recorded = await sql<{ purpose: string }[]>`SELECT purpose FROM llm_usage WHERE chat_id = ${chat} ORDER BY id`;
+      expect(recorded.map((row) => row.purpose)).toEqual(["reply_premium", "reply_premium", "reply", "reply", "reply_premium", "reply_premium"]);
+    });
+
+    it("reacts to a message of nothing but emoji instead of calling the model, and answers it where the chat allows no such reaction", async () => {
+      const chat = await ownChat(-1001000000083, "Flowers");
+      const claude = fakeClaude();
+      const { bot: answering, assistant } = answeringBot(claude);
+      const gina = tg(9312, "Gina");
+      const flower = askIn(chat, gina, "🌸");
+      await answering.handleUpdate(flower as never);
+      const joke = { message_id: 8900, date: now(), chat: { id: chat, type: "supergroup", title: "Flowers" }, from: botInfo, text: "a joke" };
+      const laugh = inGroup(chat, gina, "😂😂", { reply_to_message: joke });
+      await answering.handleUpdate(laugh as never);
+      await assistant.idle();
+      expect(claude.requests).toHaveLength(0);
+      expect(calls.filter((call) => call.method === "setMessageReaction").map((call) => call.payload)).toEqual([
+        { chat_id: chat, message_id: flower.message.message_id, reaction: [{ type: "emoji", emoji: "❤" }] },
+        { chat_id: chat, message_id: laugh.message.message_id, reaction: [{ type: "emoji", emoji: "😁" }] },
+      ]);
+      expect(calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === chat)).toEqual([]);
+
+      reactionsRefused = true;
+      try {
+        await answering.handleUpdate(askIn(chat, gina, "🌸🌸") as never);
+        await assistant.idle();
+        expect(claude.requests).toHaveLength(1);
+        expect(claude.requests[0]!.content).toMatch(/<question from="Gina">\n🌸🌸\n<\/question>/);
+      } finally {
+        reactionsRefused = false;
+      }
+      // A flood limit is no refusal of the reaction: it is only logged, never answered with a model call instead.
+      reactionsFlooded = true;
+      try {
+        await answering.handleUpdate(askIn(chat, tg(9314, "Ivo"), "🌸") as never);
+        await assistant.idle();
+        expect(claude.requests).toHaveLength(1);
+      } finally {
+        reactionsFlooded = false;
+      }
+    });
+
+    it("keeps a member's gap after a reaction, so a stream of emoji gets one reaction a gap, to the latest", async () => {
+      const chat = await ownChat(-1001000000086, "Streams");
+      const claude = fakeClaude();
+      const { bot: answering, assistant } = answeringBot(claude, { memberGapMs: 300 });
+      const jun = tg(9315, "Jun");
+      const first = askIn(chat, jun, "🌸");
+      await answering.handleUpdate(first as never);
+      await assistant.idle();
+      // Sent within the gap after the first reaction: they wait for it and make one burst.
+      await answering.handleUpdate(askIn(chat, jun, "😂") as never);
+      const latest = askIn(chat, jun, "🔥");
+      await answering.handleUpdate(latest as never);
+      await assistant.idle();
+      expect(claude.requests).toHaveLength(0);
+      expect(reactionsIn(chat)).toEqual([
+        { message_id: first.message.message_id, emoji: "❤" },
+        { message_id: latest.message.message_id, emoji: "🔥" },
+      ]);
+    });
+
+    /** The reactions the bot set in a chat, in order. */
+    const reactionsIn = (chatId: number) =>
+      calls.filter((call) => call.method === "setMessageReaction" && call.payload.chat_id === chatId).map((call) => ({ message_id: call.payload.message_id, emoji: call.payload.reaction[0].emoji }));
+
+    it("answers the question of a burst and reacts to the emoji in it, whichever came last, so no question is lost", async () => {
+      const chat = await ownChat(-1001000000084, "Bursts");
+      const claude = fakeClaude();
+      const { bot: answering, assistant } = answeringBot(claude, { memberGapMs: 300 });
+      const hana = tg(9313, "Hana");
+      const answered = () => calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === chat).map((call) => call.payload.reply_parameters.message_id);
+      // The first question is answered at once; a question and a laugh after it wait for the gap and make one burst.
+      await answering.handleUpdate(askIn(chat, hana, "что нового?") as never);
+      const swift = askIn(chat, hana, "кто у нас знает Swift?");
+      await answering.handleUpdate(swift as never);
+      const laugh = askIn(chat, hana, "😂");
+      await answering.handleUpdate(laugh as never);
+      await assistant.idle();
+      expect(claude.requests).toHaveLength(2);
+      expect(claude.requests[1]!.content).toMatch(/<question from="Hana">\nкто у нас знает Swift\?\n<\/question>/);
+      expect(answered().at(-1)).toBe(swift.message.message_id);
+      expect(reactionsIn(chat)).toEqual([{ message_id: laugh.message.message_id, emoji: "😁" }]);
+
+      // A flower before a question: the question is answered, the flower gets its heart.
+      const flower = askIn(chat, hana, "🌸");
+      await answering.handleUpdate(flower as never);
+      const who = askIn(chat, hana, "а кто прав?");
+      await answering.handleUpdate(who as never);
+      await assistant.idle();
+      expect(claude.requests).toHaveLength(3);
+      expect(answered().at(-1)).toBe(who.message.message_id);
+      expect(reactionsIn(chat).at(-1)).toEqual({ message_id: flower.message.message_id, emoji: "❤" });
+
+      // A burst of nothing but emoji gets one reaction, to its latest, and no answer.
+      await answering.handleUpdate(askIn(chat, hana, "🌸") as never);
+      const last = askIn(chat, hana, "😂");
+      await answering.handleUpdate(last as never);
+      await assistant.idle();
+      expect(claude.requests).toHaveLength(3);
+      expect(reactionsIn(chat).slice(2)).toEqual([{ message_id: last.message.message_id, emoji: "😁" }]);
+    });
+
+    it("takes a mention with nothing but emoji under someone's message as a call to answer it, never as a line to react to", async () => {
+      const chat = await ownChat(-1001000000085, "Pointing");
+      const claude = fakeClaude();
+      const { bot: answering, assistant } = answeringBot(claude);
+      const question = inGroup(chat, alice, "кто тут пишет на Rust?");
+      await answering.handleUpdate(question as never);
+      const called = inGroup(chat, bob, `${MENTION} 🤔`, { ...mentioned, reply_to_message: question.message });
+      await answering.handleUpdate(called as never);
+      await assistant.idle();
+      expect(reactionsIn(chat)).toEqual([]);
+      expect(claude.requests).toHaveLength(1);
+      expect(claude.requests[0]!.content).toContain(`<question from="Bob" calls_you_in_on="Alice's message" their_emoji="🤔">\nкто тут пишет на Rust?\n</question>`);
+    });
+
+    it("carries a task's work on in a reply to its answer, whatever the reply's words, and counts banter elsewhere as before", async () => {
+      const chat = await ownChat(-1001000000086, "Follow-ups");
+      const claude = fakeClaude();
+      const { bot: answering, assistant } = answeringBot(claude);
+      const ivy = tg(9314, "Ivy");
+      claude.answerWith({ stop_reason: "end_turn", text: "Держи:\n```python\nprint('logs')\n```" });
+      await answering.handleUpdate(askIn(chat, ivy, "напиши скрипт, который чистит старые логи") as never);
+      await assistant.idle();
+      // The answer is the last message the fake Telegram numbered.
+      const work = { message_id: msgId, date: now(), chat: { id: chat, type: "supergroup", title: "Follow-ups" }, from: botInfo, text: "Держи:\nprint('logs')" };
+      claude.answerWith({ stop_reason: "end_turn", text: "ok" });
+      for (const line of ["ахаха, а на Go", "лол, без print", "ору, короче давай"]) {
+        await answering.handleUpdate(inGroup(chat, ivy, line, { reply_to_message: work }) as never);
+        await assistant.idle();
+      }
+      for (const line of ["ахаха", "лол", "ору"]) {
+        await answering.handleUpdate(askIn(chat, ivy, line) as never);
+        await assistant.idle();
+      }
+      expect(claude.requests.map((request) => request.content.includes("<short_line>"))).toEqual([false, false, false, false, false, false, true]);
     });
 
     it("without answers (no key or a zero cap), a mention still gets the help text", async () => {
@@ -1333,8 +1525,11 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       expect((await projectRow(nova.project.id)).name).toBe("Nova Pro");
     });
 
-    it("merges a duplicate only for the owner or someone who authors both projects", async () => {
-      await person(OWNER, "Owner", [A], { admins: [OWNER] });
+    it("merges a duplicate only for the owner or someone who authors both projects, and keeps whose merge it was", async () => {
+      const owner = await person(OWNER, "Owner", [A], { admins: [OWNER] });
+      const mergedBy = async (projectId: number) =>
+        sql<{ op: string; source: string; actor_user_id: number | null }[]>`
+          SELECT op, source, actor_user_id FROM change_log WHERE entity = 'project' AND entity_id = ${projectId} AND op IN ('merge', 'merged_into') ORDER BY id`;
       const first = await addUserProject(sql, { chatId: A, name: "Tandem", actorUserId: ids.anna! });
       const second = await addUserProject(sql, { chatId: A, name: "Movie Night", actorUserId: ids.anna! });
       const foreign = await addUserProject(sql, { chatId: A, name: "Mallory Tool", actorUserId: ids.mallory! });
@@ -1354,6 +1549,13 @@ describe.skipIf(!DATABASE_URL)("access and data integrity", () => {
       const byOwner = await merge(OWNER, foreign.project.id, "tandem");
       expect(byOwner.status).toBe(200);
       expect((await projectRow(foreign.project.id)).hidden).toBe(true);
+      // A member's own merge is theirs, and an owner's of someone else's project an owner's: never the clean-up's.
+      expect(await mergedBy(second.project.id)).toEqual([{ op: "merged_into", source: "user", actor_user_id: ids.anna }]);
+      expect(await mergedBy(foreign.project.id)).toEqual([{ op: "merged_into", source: "admin", actor_user_id: owner.id }]);
+      expect(await mergedBy(first.project.id)).toEqual([
+        { op: "merge", source: "user", actor_user_id: ids.anna },
+        { op: "merge", source: "admin", actor_user_id: owner.id },
+      ]);
     });
   });
 });

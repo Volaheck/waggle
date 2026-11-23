@@ -1,9 +1,11 @@
 import type Anthropic from "@anthropic-ai/sdk";
+import { readFileSync } from "node:fs";
 import type { Message, UserFromGetMe } from "grammy/types";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createBot } from "../src/bot/bot.js";
 import { asksAboutRating, buildReplyContext, promptText, refersToConversation, type Question } from "../src/bot/reply-context.js";
 import { addAlias, ambiguousNames, mentionsName, nameForms, namedIn, wordsOf } from "../src/core/aliases.js";
+import { capabilityLines, limitLines } from "../src/core/capabilities.js";
 import { migrateChat } from "../src/core/chat-migration.js";
 import { attachLegacyData, LEGACY_CHAT_ID, registerChat, setChatStatus } from "../src/core/chats.js";
 import { catchupFor } from "../src/core/chronicle.js";
@@ -12,7 +14,7 @@ import { createSql, migrate, type Sql } from "../src/core/db.js";
 import { proposeFact, type FactKind } from "../src/core/facts.js";
 import { mergeSeedUser } from "../src/core/merge.js";
 import { saveBotMessage, saveMessage } from "../src/core/messages.js";
-import { addUserProject, mergeProjects, renameProject, updateProject } from "../src/core/projects.js";
+import { addUserProject, catalogHistory, hideProject, mergeProjects, renameProject, updateProject } from "../src/core/projects.js";
 import { hasForbiddenTopic, transliterateName } from "../src/core/text.js";
 import { forgetUser, getPerson, resolveUser, setOptOut, type User } from "../src/core/users.js";
 import { EXTRACTABLE_KINDS, EXTRACTION_SYSTEM_PROMPT, INTERRUPTED_PASS_ERROR, runExtractionPass, type ExtractionResult } from "../src/worker/extract.js";
@@ -75,8 +77,20 @@ describe("names in messages", () => {
       expect(refersToConversation(text), text).toBe(true);
     }
     for (const text of ["потерял рассудок", "кто правда так думает", "иду на спорт", "речка рядом", "что нового?"]) expect(refersToConversation(text), text).toBe(false);
-    for (const text of ["почему такой рейтинг?", "сколько баллов у меня", "кто в топе", "what's my score", "how many votes"]) expect(asksAboutRating(text), text).toBe(true);
-    for (const text of ["топить за Claude", "что нового?"]) expect(asksAboutRating(text), text).toBe(false);
+    for (const text of [
+      "почему такой рейтинг?",
+      "сколько баллов у меня",
+      "кто в топе",
+      "what's my score",
+      "how many votes",
+      "а релиз в сигналы попал?",
+      "сколько у меня сигналов",
+      "why isn't my launch a signal?",
+      "show my project's signals",
+    ]) {
+      expect(asksAboutRating(text), text).toBe(true);
+    }
+    for (const text of ["топить за Claude", "что нового?", "сигнализация опять орёт", "кто-то сигналит под окном", "signaling theory"]) expect(asksAboutRating(text), text).toBe(false);
   });
 });
 
@@ -195,12 +209,16 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
       expect(about).toContain("You are Waggle (@waggle_test_bot)");
       expect(about).toContain("written by claude-opus-5-5");
       expect(about).toContain("Your owner, who built you and pays for you: Maestro (@maestro_owner), also called Капитан.");
-      expect(about).toContain("by asking you plainly in the chat: you do it and post a receipt with ↩️ Undo");
-      expect(about).toContain("and a project's authors its tagline, status, stack and links, by asking you plainly in the chat");
-      expect(about).toContain("also renames or removes a project; nobody changes a project's authors through you. Nobody needs a note to change a card or a project.");
-      expect(about).toContain("Nobody changes anyone else's data, someone else's project, votes or the rating through you, and you do not vote, run code, browse the web or send images or widgets.");
+      // What it can and cannot do comes from the one list the weekly idea reads as well.
+      for (const text of [...capabilityLines(), ...limitLines()]) expect(about).toContain(text);
+      expect(about).toContain("- Project changes from the chat (since 12 Nov 2026): a project's authors change its tagline, status, stack and links by asking you plainly");
+      expect(about).toContain("- You cannot see photos, screenshots");
       expect(about).toContain("/forgetme");
       expect(about).toContain("In the catalog you are the project Waggle: #2 of 2, 0 rating points, 0 vote(s).");
+
+      // A question that carries a photo says so, since the bot never sees the photo itself.
+      const screenshot = await contextFor(asking(chat, kit, "что на скрине?", { photo: [{ file_id: "p", file_unique_id: "p", width: 1, height: 1 }] }));
+      expect(screenshot).toContain('<question from="Kit" media="photo">\nчто на скрине?\n</question>');
     });
 
     it("lists who is who: other spellings, aliases with who gave them, a project's old name, and names that fit several people", async () => {
@@ -341,15 +359,115 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
       expect(details).toMatch(/^Votes: 1 \(\d{1,2} \w{3,4}(?: \d{4})?\)\.$/m);
       expect(details).toContain("usage 11.2 (impact 4, ");
       expect(details).toContain("praise 3.2 (impact 2, ");
-      expect(details).toMatch(/Renamed from Orbit on \d{1,2} \w{3,4}\./);
+      expect(details).toMatch(/Renamed from Orbit on \d{1,2} \w{3,4} by Kit\./);
       expect(details).toMatch(/Milestones of all time: \d{1,2} \w{3,4} \d{4} “first 1000 users” \(counts 0 now\)\./);
+      expect(details).toContain("A member's signals of one kind count once a week: that week's strongest, and a smaller one the same week adds nothing.");
       expect(details).not.toMatch(/Ann|Ben|weight|decay|per vote|180|45 days/);
 
       const own = block(await contextFor(asking(chat, kit, "почему у меня так мало баллов?")), "project_details")!;
       expect(own).toContain("Atlas (#atlas): #2 of 3");
+      // Asked about signals, an author sees their projects' signals and milestones, and how a week of them counts.
+      const signals = block(await contextFor(asking(chat, kit, "а мой релиз в сигналы попал?")), "project_details")!;
+      expect(signals).toContain("Atlas (#atlas): #2 of 3");
+      expect(signals).toContain("Milestones of all time: ");
+      expect(signals).toContain("count once a week");
+      expect(block(await contextFor(asking(chat, dora, "почему у Nova нет сигналов?")), "project_details")).not.toContain("count once a week");
       const abandoned = block(await contextFor(asking(chat, kit, "что с Relic?")), "project_details")!;
       expect(abandoned).toContain("Abandoned: the total is multiplied by 0.3.");
       expect(await contextFor(asking(chat, kit, "как дела у всех?"))).not.toContain("<project_details>");
+    });
+
+    it("shows what happened to the catalog, dated and whose: the clean-up's merges and a member's, renames and deletions", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      const bob = await member(chat, "Bob");
+      const atlas = await addUserProject(sql, { chatId: chat, name: "Atlas", actorUserId: kit.id });
+      const mobile = await addUserProject(sql, { chatId: chat, name: "Atlas Mobile", actorUserId: kit.id });
+      const web = await addUserProject(sql, { chatId: chat, name: "Atlas Web", actorUserId: kit.id });
+      const beta = await addUserProject(sql, { chatId: chat, name: "Nova Beta", actorUserId: bob.id });
+      const orbit = await addUserProject(sql, { chatId: chat, name: "Orbit", actorUserId: bob.id });
+      await mergeProjects(sql, chat, atlas.project.slug, [mobile.project.slug], { source: "llm" });
+      await mergeProjects(sql, chat, atlas.project.slug, [web.project.slug], { source: "user", actorUserId: kit.id });
+      await hideProject(sql, beta.project.id, bob.id);
+      await renameProject(sql, { chatId: chat, projectId: orbit.project.id, name: "Nova", source: "user", actorUserId: bob.id });
+      // A project deleted and brought back has no deletion to tell.
+      const relic = await addUserProject(sql, { chatId: chat, name: "Relic", actorUserId: bob.id });
+      await hideProject(sql, relic.project.id, bob.id);
+      expect((await addUserProject(sql, { chatId: chat, name: "Relic", actorUserId: bob.id })).outcome).toBe("restored");
+
+      const history = await catalogHistory(sql, chat);
+      expect(history.map(({ kind, project, former, source, actor_user_id }) => ({ kind, project, former, source, actor_user_id }))).toEqual([
+        { kind: "rename", project: "Nova", former: "Orbit", source: "user", actor_user_id: bob.id },
+        { kind: "delete", project: "Nova Beta", former: null, source: "user", actor_user_id: bob.id },
+        { kind: "merge", project: "Atlas", former: "Atlas Web", source: "user", actor_user_id: kit.id },
+        { kind: "merge", project: "Atlas", former: "Atlas Mobile", source: "llm", actor_user_id: null },
+      ]);
+
+      // Asked to merge what the clean-up merged already, the answer sees that it did, and when.
+      const context = await contextFor(asking(chat, kit, "слей Atlas Mobile в Atlas"));
+      expect(block(context, "catalog_history")!.split("\n")).toEqual([
+        expect.stringMatching(/^- \d{1,2} \w{3,4}: Orbit renamed to Nova by Bob$/),
+        expect.stringMatching(/^- \d{1,2} \w{3,4}: Nova Beta deleted from the catalog by Bob$/),
+        expect.stringMatching(/^- \d{1,2} \w{3,4}: Atlas Web merged into Atlas by Kit$/),
+        expect.stringMatching(/^- \d{1,2} \w{3,4}: Atlas Mobile merged into Atlas by the weekly clean-up$/),
+      ]);
+      expect(block(context, "project_details")).toMatch(/Duplicates merged into it: Atlas Mobile on \d{1,2} \w{3,4} by the weekly clean-up; Atlas Web on \d{1,2} \w{3,4} by Kit\./);
+      // A merged duplicate is still a name for the project, never a name it had.
+      const who = block(context, "who_is_who")!;
+      expect(who).toContain("#atlas Atlas: Atlas Mobile (a duplicate merged into it), Atlas Web (a duplicate merged into it)");
+      expect(who).toContain("#nova Nova: was Orbit");
+      // The chat's memory is the same whoever asks, and names nobody who opted out.
+      await setOptOut(sql, bob.id, true, chat);
+      expect(block(await contextFor(asking(chat, kit, "что нового?")), "catalog_history")).toContain("Nova Beta deleted from the catalog by a member");
+    });
+
+    it("gives a merge logged before the folded entry kept where it went that entry's row, once, so the history shows it", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      const comet = await addUserProject(sql, { chatId: chat, name: "Comet", actorUserId: kit.id });
+      const watch = await addUserProject(sql, { chatId: chat, name: "Comet Watch", actorUserId: kit.id });
+      await mergeProjects(sql, chat, comet.project.slug, [watch.project.slug], { source: "llm" });
+      // A merge as the first version of mergeProjects logged it: the kept entry's row alone.
+      await sql`DELETE FROM change_log WHERE entity = 'project' AND entity_id = ${watch.project.id} AND op = 'merged_into'`;
+      expect(await catalogHistory(sql, chat)).toEqual([]);
+      const backfill = readFileSync(new URL("../migrations/018_merge_makers.sql", import.meta.url), "utf8");
+      await sql.unsafe(backfill);
+      await sql.unsafe(backfill);
+      const history = await catalogHistory(sql, chat);
+      expect(history.map(({ kind, former, project }) => ({ kind, former, project }))).toEqual([{ kind: "merge", former: "Comet Watch", project: "Comet" }]);
+      const [row] = await sql<{ after: { into: number; slug: string } }[]>`
+        SELECT after FROM change_log WHERE entity = 'project' AND entity_id = ${watch.project.id} AND op = 'merged_into'`;
+      expect(row!.after).toEqual({ into: comet.project.id, slug: comet.project.slug });
+    });
+
+    it("tells the clean-up's merges from the Mini App's among those logged before merges kept who made them", async () => {
+      const chat = await newChat();
+      const kit = await member(chat, "Kit");
+      const relic = await addUserProject(sql, { chatId: chat, name: "Relic", actorUserId: kit.id });
+      const lite = await addUserProject(sql, { chatId: chat, name: "Relic Lite", actorUserId: kit.id });
+      const orbit = await addUserProject(sql, { chatId: chat, name: "Orbit", actorUserId: kit.id });
+      const pro = await addUserProject(sql, { chatId: chat, name: "Orbit Pro", actorUserId: kit.id });
+      // Until migration 018 every merge was logged as the clean-up's: one came right after the clean-up's call in the
+      // chat, the other was made in the Mini App, by whom the log does not say.
+      await mergeProjects(sql, chat, relic.project.slug, [lite.project.slug], { source: "llm" });
+      await mergeProjects(sql, chat, orbit.project.slug, [pro.project.slug], { source: "llm" });
+      const [marker] = await sql<{ at: Date }[]>`SELECT (value->>'at')::timestamptz AS at FROM app_state WHERE key = 'merge_makers_logged'`;
+      const before = (days: number) => new Date(marker!.at.getTime() - days * 86_400_000);
+      await sql`UPDATE change_log SET at = ${before(9)} WHERE entity = 'project' AND entity_id IN (${relic.project.id}, ${lite.project.id}) AND op IN ('merge', 'merged_into')`;
+      await sql`UPDATE change_log SET at = ${before(5)} WHERE entity = 'project' AND entity_id IN (${orbit.project.id}, ${pro.project.id}) AND op IN ('merge', 'merged_into')`;
+      await sql`
+        INSERT INTO llm_usage (at, purpose, model, input_tokens, output_tokens, chat_id)
+        VALUES (${new Date(before(9).getTime() - 60_000)}, 'consolidate', 'claude-haiku-5-5', 1000, 100, ${chat}),
+               (${new Date(before(5).getTime() - 2 * 3_600_000)}, 'consolidate', 'claude-haiku-5-5', 1000, 100, ${chat})`;
+      const history = await catalogHistory(sql, chat);
+      expect(history.map(({ former, source }) => ({ former, source }))).toEqual([
+        { former: "Orbit Pro", source: null },
+        { former: "Relic Lite", source: "llm" },
+      ]);
+      expect(block(await contextFor(asking(chat, kit, "что с Orbit?")), "catalog_history")!.split("\n")).toEqual([
+        expect.stringMatching(/^- \d{1,2} \w{3,4}: Orbit Pro merged into Orbit by someone other than the clean-up \(the log of then does not say who\)$/),
+        expect.stringMatching(/^- \d{1,2} \w{3,4}: Relic Lite merged into Relic by the weekly clean-up$/),
+      ]);
     });
 
     it("lets neither its own earlier lines in a thread nor its own day of answers keep a project on its tongue", async () => {
@@ -482,6 +600,10 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
         const text = payload.parse_mode === "HTML" ? String(payload.text).replace(/<[^>]*>/g, "") : String(payload.text);
         const messageId = method === "editMessageText" ? payload.message_id : ++nextMsgId;
         return { ok: true, result: { message_id: messageId, date: now(), chat, text, ...(method === "editMessageText" ? { edit_date: now() } : {}) } };
+      }
+      if (method === "sendDocument") {
+        const document = { file_id: "f", file_unique_id: "f", file_name: payload.document.filename };
+        return { ok: true, result: { message_id: ++nextMsgId, date: now(), chat: { id: payload.chat_id, type: "supergroup", title: "Hive" }, document } };
       }
       return { ok: true, result: true };
     };
@@ -666,6 +788,38 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
       expect(lastSent()).toContain("You asked me not to collect anything about you here");
       await setOptOut(sql, aliceUser!.id, false, chat);
     });
+
+    it("sends long code as a file named after its language, right after the message with the rest of the answer, and keeps both", async () => {
+      const code = Array.from({ length: 30 }, (_, index) => `print(${index})`).join("\n");
+      answer = `Держи скрипт:\n\n\`\`\`python\n${code}\n\`\`\`\n\nЭто фрагмент: вставь его в свой main.py.`;
+      try {
+        await bot.handleUpdate(ask(gleb, "напиши скрипт, который печатает числа") as never);
+        await assistant!.idle();
+        const message = calls.find((call) => call.method === "sendMessage" && call.payload.chat_id === chat)!;
+        expect(message.payload.text).toBe("Держи скрипт:\n\n📎 script.py\n\nЭто фрагмент: вставь его в свой main.py.");
+        const [document, ...more] = calls.filter((call) => call.method === "sendDocument");
+        expect(more).toEqual([]);
+        expect(document!.payload.document.filename).toBe("script.py");
+        expect(new TextDecoder().decode((await document!.payload.document.toRaw()) as Uint8Array)).toBe(`${code}\n`);
+        // The file replies to the message it goes with, and both are kept, so a reply to the file finds the whole answer.
+        const [prose] = await sql<{ msg_id: number; reply_to_msg_id: number }[]>`
+          SELECT msg_id, reply_to_msg_id FROM messages WHERE chat_id = ${chat} AND from_bot AND text LIKE 'Держи скрипт:%'`;
+        expect(document!.payload.reply_parameters.message_id).toBe(prose!.msg_id);
+        expect(await sql`SELECT text, media_type, reply_to_msg_id FROM messages WHERE chat_id = ${chat} AND from_bot AND media_type = 'file'`).toEqual([
+          { text: "script.py", media_type: "file", reply_to_msg_id: prose!.msg_id },
+        ]);
+
+        // Short code stays in the message, as a code block.
+        answer = "Вот:\n```python\nprint('hi')\n```";
+        await bot.handleUpdate(ask(gleb, "а покороче?") as never);
+        await assistant!.idle();
+        const short = calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === chat).at(-1)!;
+        expect(short.payload).toMatchObject({ text: "Вот:\nprint('hi')", entities: [{ type: "pre", offset: 5, length: 11, language: "python" }] });
+        expect(calls.filter((call) => call.method === "sendDocument")).toHaveLength(1);
+      } finally {
+        answer = "Bob writes Rust 🐝";
+      }
+    });
   });
 
   describe("privacy and moves", () => {
@@ -704,7 +858,7 @@ describe.skipIf(!DATABASE_URL)("memory of the conversation", () => {
       const lumen = await addUserProject(sql, { chatId: chat, name: "Lumen", actorUserId: account.id });
       const copy = await addUserProject(sql, { chatId: chat, name: "Lumen app", actorUserId: account.id });
       await addAlias(sql, { chatId: chat, target: { projectId: copy.project.id }, alias: "Люмен", source: "person" });
-      await mergeProjects(sql, chat, lumen.project.slug, [copy.project.slug]);
+      await mergeProjects(sql, chat, lumen.project.slug, [copy.project.slug], { source: "user", actorUserId: account.id });
       expect((await sql<{ project_id: number }[]>`SELECT project_id FROM aliases WHERE alias = 'Люмен'`)[0]!.project_id).toBe(lumen.project.id);
 
       const upgraded = chat - 900_000;

@@ -64,6 +64,21 @@ export function realReply(message: Message | undefined): Message["reply_to_messa
   return replied;
 }
 
+/** What a message carries besides its text, as stored and shown to the model, which never sees the thing itself. */
+export function mediaTypeOf(message: Message): string | null {
+  if (message.photo) return "photo";
+  if (message.video) return "video";
+  if (message.video_note) return "video note";
+  if (message.voice) return "voice";
+  if (message.audio) return "audio";
+  // A GIF also carries `document`, so it has to be recognized first.
+  if (message.animation) return "GIF";
+  if (message.document) return "file";
+  if (message.sticker) return "sticker";
+  if (message.poll) return "poll";
+  return null;
+}
+
 /** Who is acting and in which chat: the group itself, or the chat picked in DM. */
 export interface Scope {
   user: User;

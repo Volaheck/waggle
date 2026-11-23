@@ -8,6 +8,7 @@ import { createInterjector, INTERJECTION_SYSTEM_PROMPT } from "../src/bot/interj
 import type { BotContext } from "../src/bot/kit.js";
 import { buildReplyContext, promptText, type Question } from "../src/bot/reply-context.js";
 import { createSelfEdits, parserPrompt, registerSelfEdits, requestStandsIn, SELF_EDIT_SYSTEM_PROMPT, type SelfEditResult } from "../src/bot/self-edits.js";
+import { CAPABILITIES } from "../src/core/capabilities.js";
 import { migrateChat } from "../src/core/chat-migration.js";
 import { getChat, registerChat, setChatStatus } from "../src/core/chats.js";
 import type { Config } from "../src/core/config.js";
@@ -40,6 +41,9 @@ describe("reading a wish", () => {
       "хватит вклиниваться в наши споры", "никогда не вклинивайся в мои разговоры", "не отвечай в моих разговорах", "don't reply in my conversations",
       "don't interject in my conversations", "stop interjecting", "stay out of my conversations", "don’t joke about my weight", "don’t mention me in answers to others",
       "давай без шуток про мой вес", "можешь не тегать меня?", "давай не будем шутить про мой вес",
+      // Not to be cheeky or rude, however they put it.
+      "не дерзи", "не хами", "не груби мне", "не дерзите", "перестань дерзить", "хватит хамить", "не надо грубить", "можешь не язвить?", "не огрызайся", "не будь таким дерзким",
+      "давай без хамства", "будь повежливее", "пиши мне помягче", "stop being cheeky", "stop being rude to me", "don't be rude", "please don't be so cheeky", "no more rudeness", "be nicer to me",
     ]) {
       expect(requestStandsIn(text, text, "edit"), text).toBe(true);
     }
@@ -48,6 +52,7 @@ describe("reading a wish", () => {
       "я не шучу", "да не говори!", "не рассказывай сказки", "почему ты не отвечаешь?", "ты не прав", "не знаю, как быть", "какие у меня просьбы к тебе?", "кто у нас пишет на Rust?", "I don't know", "never mind", "stop it",
       "хватит ли 16 гигов для локальной llm?", "я никогда не писал на Rust, с чего начать?", "без шуток, кто лучше пишет фронтенд?", "можно снова глянуть рейтинг?",
       "what's the best laptop for no more than $1000?", "why don't you answer my questions?", "я больше не пишу на PHP, теперь только Go", "я не люблю писать тесты",
+      "он не грубит", "я не хамлю, я честный", "он мне нагрубил", "не дерзко ли так?", "be careful with that",
     ]) {
       expect(requestStandsIn(text, text, "edit"), text).toBe(false);
     }
@@ -81,6 +86,8 @@ describe("reading a wish", () => {
       "не хвали меня", "не льсти мне", "stop praising me", "не раскрывай мои секреты", "stop calling me Shorty", "всегда пиши мне по-русски", "обращайся ко мне на вы",
       "пиши мне без мата", "не пиши мне больше одного раза в день", "упоминай меня реже", "не шути про мой вес, без обид", "никому не рассказывай про мой провал",
       "перестань со мной соглашаться", "не пиши про меня без моего разрешения",
+      // Not to be cheeky or rude, and a gentler manner, narrow it too: the "more" of "more polite" asks for nothing more.
+      "не дерзи", "перестань хамить", "не будь таким грубым", "давай без хамства", "будь повежливее", "пиши мне помягче", "stop being rude to me", "be more polite", "write to me more briefly",
     ]) {
       expect(loosens(text), text).toBe(false);
     }
@@ -309,6 +316,23 @@ describe.skipIf(!DATABASE_URL)("wishes", () => {
     await expect(asSubject(sql, subject, (tx) => tx`UPDATE wishes SET text = 'x' WHERE user_id = ${bob.id}`)).rejects.toThrow();
     expect(await asSubject(sql, subject, async (tx) => (await tx`DELETE FROM wishes WHERE user_id = ${kit.id}`).count)).toBe(0);
     expect(await wishesIn(chat)).toHaveLength(4);
+  });
+
+  it("reads a wish not to be cheeky or rude and keeps it, in Russian and in English", async () => {
+    const chat = await russianChat();
+    const bob = await member(chat, "Bob");
+    for (const text of ["не дерзи", "перестань хамить", "не будь таким грубым со мной"]) {
+      const asked = await run(chat, bob, `${MENTION} ${text}`, wish(text));
+      expect(asked.parser.prompts, text).toHaveLength(1);
+      expect(asked.sent.map((sent) => sent.text), text).toEqual([`🤐 Запомнил: «${text}».`]);
+      expect(asked.answered, text).toEqual([]);
+    }
+    expect((await wishesIn(chat)).map((row) => row.text)).toEqual(["не дерзи", "перестань хамить", "не будь таким грубым со мной"]);
+    const english = await newChat();
+    const ann = await member(english, "Ann");
+    const asked = await run(english, ann, `${MENTION} stop being rude to me`, wish("stop being rude to me"));
+    expect(asked.sent.map((sent) => sent.text)).toEqual(["🤐 Noted: «stop being rude to me»."]);
+    expect(SELF_EDIT_SYSTEM_PROMPT).toContain("not to be cheeky or rude to them");
   });
 
   it("keeps a wish for the whole chat from those who may ask for it, and one from anyone else as theirs alone, saying so", async () => {
@@ -614,7 +638,8 @@ describe.skipIf(!DATABASE_URL)("wishes", () => {
       "- Maestro, for writing to them or about them: «не называй никого Шуриком»",
     ]);
     expect(context).not.toContain("развод");
-    expect(block(context, "about_you")).toContain("you keep it as a wish, post a receipt with ↩️ Undo and keep to it from then on");
+    expect(block(context, "about_you")).toContain(`- Wishes about how you write (since 12 Nov 2026): ${CAPABILITIES.wishes.does}.`);
+    expect(CAPABILITIES.wishes.does).toContain("you keep it, post a receipt, and keep to it in your answers, uninvited lines and the weekly idea");
     // An answer to someone else about anything still holds Bob's, which it may break by naming him, but not what he keeps quiet.
     const other = promptText(await buildReplyContext(sql, asking(chat, kit, "кто у нас лидирует в рейтинге?"), options));
     expect(block(other, "wishes")!.split("\n")).toContain("- Bob, for writing to them or about them: «не шути про мой вес»; «пиши мне короче»");

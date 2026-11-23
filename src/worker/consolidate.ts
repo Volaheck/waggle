@@ -113,7 +113,7 @@ export async function applyConsolidation(sql: Sql, input: ConsolidationInput, re
   const slugs = new Set(input.projects.map((project) => project.slug));
   for (const merge of result.project_merges) {
     if (!slugs.has(merge.into)) continue;
-    stats.projectsMerged += await mergeProjects(sql, input.chatId, merge.into, merge.from.filter((slug) => slugs.has(slug)));
+    stats.projectsMerged += await mergeProjects(sql, input.chatId, merge.into, merge.from.filter((slug) => slugs.has(slug)), { source: "llm" });
   }
   for (const update of result.project_updates) {
     const project = input.projects.find((candidate) => candidate.slug === update.slug);
