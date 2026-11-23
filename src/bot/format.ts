@@ -1,6 +1,7 @@
 import { FACT_KIND_LABELS, type Fact, type FactKind } from "../core/facts.js";
 import { STATUS_LABELS, type Project, type ProjectListItem, type ProjectStatus } from "../core/projects.js";
 import type { CatchupData, ChronicleEntry } from "../core/chronicle.js";
+import { commitUrl, type RepoHint, type RepoSnapshot } from "../core/repos.js";
 import { escapeHtml, messageLink, safeHttpUrl, truncate } from "../core/text.js";
 import type { Person, User } from "../core/users.js";
 
@@ -80,7 +81,31 @@ export function projectLine(project: ProjectListItem, index: number): string {
   return `${index}. ${STATUS_EMOJI[project.status] ?? ""} <b>${escapeHtml(project.name)}</b> · 🏆${project.score}${tagline}${authors ? ` <i>(${authors})</i>` : ""}`;
 }
 
-export function projectCard(project: ProjectListItem, chatId: number): string {
+/** «21 Nov», or «3 Mar 2024» in another year. */
+function dayOfYear(at: Date | string, timeZone: string): string {
+  const date = new Date(at);
+  const year = (moment: Date) => moment.toLocaleDateString("en-CA", { timeZone }).slice(0, 4);
+  return date.toLocaleDateString("en-GB", { day: "numeric", month: "short", ...(year(date) === year(new Date()) ? {} : { year: "numeric" }), timeZone });
+}
+
+/** What the bot read of the project's GitHub repository, for its card: the latest commit, the release, a hint, the latest commits. */
+function repoLines(github: { repo: RepoSnapshot; hint: RepoHint | null; timeZone: string }, status: ProjectStatus): string[] {
+  const { repo, hint, timeZone } = github;
+  if (!repo.full_name) return ["💻 GitHub: no public repository at the link"];
+  const day = (at: Date | string) => dayOfYear(at, timeZone);
+  const release = repo.release ? `release ${escapeHtml(repo.release.tag)}${repo.release.prerelease ? " (pre-release)" : ""}, ${day(repo.release.at)}` : "";
+  const latest = repo.committed_at ? `last commit ${day(repo.committed_at)}` : repo.pushed_at ? "" : "nothing pushed yet";
+  const facts = [latest, release, repo.archived ? "archived" : ""].filter(Boolean);
+  const lines = facts.length ? [`💻 GitHub: ${facts.join(" · ")}`] : [];
+  if (hint?.kind === "quiet") lines.push(`💤 Looks paused: no commits for ${hint.days} days, though it says ${STATUS_LABELS[status]}`);
+  if (hint?.kind === "active_again") lines.push(`⚡️ Committed to again, though it says ${STATUS_LABELS[status]}`);
+  for (const commit of repo.commits.slice(0, 3)) {
+    lines.push(`• ${day(commit.at)} <a href="${escapeHtml(commitUrl(repo.full_name, commit.sha))}">${escapeHtml(truncate(commit.title, 80))}</a>`);
+  }
+  return lines;
+}
+
+export function projectCard(project: ProjectListItem, chatId: number, github?: { repo: RepoSnapshot; hint: RepoHint | null; timeZone: string }): string {
   const lines = [`${STATUS_EMOJI[project.status] ?? ""} <b>${escapeHtml(project.name)}</b> · ${escapeHtml(STATUS_LABELS[project.status] ?? project.status)}`];
   if (project.tagline) lines.push(escapeHtml(project.tagline));
   if (project.authors.length) {
@@ -92,6 +117,7 @@ export function projectCard(project: ProjectListItem, chatId: number): string {
     .map((link) => safeHttpUrl(link))
     .filter((link): link is string => link !== null);
   if (links.length) lines.push(links.map((link) => `<a href="${escapeHtml(link)}">${escapeHtml(link.replace(/^https?:\/\//, ""))}</a>`).join(" · "));
+  if (github) lines.push(...repoLines(github, project.status));
   lines.push(`🏆 Rating ${project.score} · 👍 ${project.votes}`);
   if (project.recent_signals.length) {
     lines.push("", "<b>What people say</b>");

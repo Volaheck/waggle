@@ -467,6 +467,19 @@ select.input { appearance: none; -webkit-appearance: none; padding-right: 38px; 
 .signal-kind { margin-bottom: 2px; font: 600 10px var(--font-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--tone); }
 .signal-note { font-size: 14px; line-height: 1.5; color: var(--text); overflow-wrap: anywhere; }
 
+/* ---------- github ---------- */
+
+.badge.repo-hint { margin-left: 6px; }
+.repo-meta { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13.5px; color: var(--muted); }
+.repo-meta > span { min-width: 0; overflow-wrap: anywhere; }
+.repo-meta b { color: var(--text); font-weight: 600; }
+.repo-note { margin-top: 8px; font-size: 12.5px; }
+.commits { margin-top: 8px; }
+.commit { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 4px 0; border-top: 1px solid var(--border); }
+.commit:first-child { border-top: 0; }
+.commit-day { flex: none; min-width: 46px; white-space: nowrap; font: 500 11.5px var(--font-mono); color: var(--meta); }
+.commit .go { min-width: 0; font-weight: 500; }
+
 /* ---------- chronicle ---------- */
 
 .entry-head { display: flex; align-items: flex-start; gap: 10px; }

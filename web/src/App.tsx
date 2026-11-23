@@ -1321,8 +1321,86 @@ function burstFrom(element: HTMLElement) {
   }
 }
 
+/** What the bot read of the project's public GitHub repository once a day (src/core/repos.ts); full_name is null when the link leads to none. */
+interface RepoView {
+  full_name: string | null;
+  url?: string;
+  archived?: boolean;
+  pushed_at?: string | null;
+  /** The latest commit on the default branch that no bot made. */
+  committed_at?: string | null;
+  release?: { tag: string; name: string | null; at: string; prerelease: boolean } | null;
+  commits?: { sha: string; title: string; at: string; url: string }[];
+  checked_at: string;
+}
+
+/** Where the repository says otherwise than the status, which stays its authors' word. */
+interface RepoHint {
+  kind: "quiet" | "active_again";
+  /** Days from the latest commit to the reading. */
+  days: number;
+}
+
+const REPO_HINTS: Record<RepoHint["kind"], { label: string; tone: string }> = {
+  quiet: { label: "looks paused", tone: "var(--meta)" },
+  active_again: { label: "active again", tone: "var(--green)" },
+};
+
+function RepoSection({ repo, hint, index, timeZone }: { repo: RepoView; hint: RepoHint | null; index: number; timeZone?: string }) {
+  const year = (date: Date) => date.toLocaleDateString("en-CA", { timeZone }).slice(0, 4);
+  const day = (at: string) => {
+    const date = new Date(at);
+    return date.toLocaleDateString("en-GB", { day: "numeric", month: "short", ...(year(date) === year(new Date()) ? {} : { year: "numeric" }), timeZone });
+  };
+  return (
+    <Section label="github" index={index}>
+      <Card>
+        {!repo.full_name ? (
+          <div className="hint">No public repository at this link · checked {day(repo.checked_at)}</div>
+        ) : (
+          <>
+            <div className="repo-meta">
+              <span>
+                Last commit <b>{repo.committed_at ? day(repo.committed_at) : "—"}</b>
+              </span>
+              {repo.release && (
+                <span>
+                  {repo.release.prerelease ? "Pre-release" : "Release"} <b>{repo.release.tag}</b> · {day(repo.release.at)}
+                </span>
+              )}
+              {repo.archived && <span>Archived</span>}
+            </div>
+            {hint && (
+              <div className="hint repo-note">
+                {hint.kind === "quiet"
+                  ? `No commits for ${plural(hint.days, "day", "days")} — the status is its authors’ to change.`
+                  : `A commit of its own ${hint.days === 0 ? "the day it was read" : `${plural(hint.days, "day", "days")} before it was read`}, after the status was set.`}
+              </div>
+            )}
+            {(repo.commits ?? []).length > 0 && (
+              <div className="commits">
+                {(repo.commits ?? []).map((commit) => (
+                  <div key={commit.sha} className="commit">
+                    <span className="commit-day">{day(commit.at)}</span>
+                    <ExternalLink href={commit.url}>
+                      <span lang={langOf(commit.title)}>{commit.title}</span>
+                    </ExternalLink>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="hint repo-note">Read {day(repo.checked_at)} from the public repository: commit titles only, never the code; bots’ commits left out.</div>
+          </>
+        )}
+      </Card>
+    </Section>
+  );
+}
+
 interface ProjectResponse {
   project: Project;
+  repo?: RepoView | null;
+  repo_hint?: RepoHint | null;
   can_edit: boolean;
   first_seen_url: string | null;
   discussions: { msg_id: number; text: string; display_name: string | null; url: string }[];
@@ -1407,6 +1485,11 @@ function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
               {project.name}
             </h1>
             <StatusBadge status={project.status} />
+            {data.repo_hint && (
+              <span className="badge repo-hint" style={{ ["--tone" as string]: REPO_HINTS[data.repo_hint.kind].tone }}>
+                {REPO_HINTS[data.repo_hint.kind].label}
+              </span>
+            )}
           </div>
           <div className="score-block">
             <HexScore score={project.score} max={Math.max(project.score, 30)} big />
@@ -1544,6 +1627,7 @@ function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
           </Card>
         </Section>
       )}
+      {data.repo && <RepoSection repo={data.repo} hint={data.repo_hint ?? null} index={3} timeZone={timeZone} />}
       {history.length > 0 && (
         <Section label="history" index={3}>
           <ChronicleList entries={allHistory ? history : history.slice(0, 3)} compact />

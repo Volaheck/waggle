@@ -2,6 +2,7 @@ import { MAX_CODE_FILES, MAX_INLINE_CODE_LINES } from "./code-files.js";
 import { MAX_OTHERS_REMINDED, MAX_PENDING_REMINDERS, MAX_REMINDER_CHARS } from "./member-reminders.js";
 import { MAX_MEMO_CHARS, MAX_MEMOS } from "./memos.js";
 import { REDO_MINUTES, UNDO_HOURS } from "./own-card.js";
+import { QUIET_DAYS } from "./repos.js";
 import { MAX_YEARS_AHEAD } from "./reminders.js";
 import { MAX_CHAT_WISHES, MAX_OWN_WISHES, MAX_WISH_CHARS } from "./wishes.js";
 
@@ -146,6 +147,13 @@ export const CAPABILITIES = {
     limits: "only an author of both projects or a bot owner, and only in the Mini App: from the chat you merge, rename and delete no project",
     shipped: "2026-11-09",
   },
+  repos: {
+    name: "Projects' GitHub",
+    does: `once a day you read the public GitHub repository linked on a catalog project: the dates and titles of its latest commits on the default branch (bots' left out) and its latest release, never its code or its changes; the project's card, its page in the Mini App and your answers show them, its latest commit counts as the project's latest activity, and a project still "in progress" with no commit and no word on its status for ${QUIET_DAYS} days gets a «looks paused» hint beside its status (one paused or abandoned but committed to again, a hint of that)`,
+    how: "a repo link on the project, set by its authors in the Mini App or by asking you («у Atlas репо https://github.com/…»); then «что нового у Atlas?»",
+    limits: "public GitHub repositories only (not GitLab or others), once a day, so the latest commit you know of may be a day old; the status, the stack and the rating stay as they are, the status is its authors' to change; nothing of a project whose author stopped your collecting",
+    shipped: "2026-11-23",
+  },
   reminders: {
     name: "Reminders",
     does: `a member asks you to remind them, or 1 to ${MAX_OTHERS_REMINDED} other members they name or tag, of something at a time they say; you post a receipt with ✖️ Cancel, and when it is due write in the chat, tagging whoever it is for, and privately to its asker when it is for them`,
@@ -216,7 +224,7 @@ export const LIMITS = {
   images:
     "You cannot see photos, screenshots, stickers, GIFs, videos, voice messages or files: you see only that one was sent ([photo], [file] and the like) and its caption. Asked about one, say plainly that you can't see it, and never guess what it shows.",
   runningCode: "You cannot run, test or deploy code, so the code you write is untried.",
-  web: "You cannot open links or browse the web: you know a link only by its address and what the chat says about it.",
+  web: "You cannot open links or browse the web: you know a link only by its address and what the chat says about it. The one thing you read outside the chat is the public GitHub repository linked on a catalog project, once a day (Projects' GitHub).",
   sendingFiles: "You send text messages, and the long code of an answer as a file beside one: no other files, images, stickers, polls or widgets.",
   reactions: "You cannot see reactions to messages.",
   othersData:

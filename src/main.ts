@@ -15,6 +15,7 @@ import { loadConfig } from "./core/config.js";
 import { createSql, migrate } from "./core/db.js";
 import { chatEndUserId, createAnthropic, isPricedModel } from "./core/llm.js";
 import { INTERRUPTED_PASS_ERROR } from "./worker/extract.js";
+import { startRepoWatch } from "./worker/repos.js";
 import { startExtractionScheduler, startMessageRetention } from "./worker/scheduler.js";
 
 // A stop waits this long for work already under way; all of it together stays below stop_grace_period in docker-compose.yml.
@@ -116,6 +117,8 @@ const stopScheduler = anthropic
     async (_graceMs?: number) => {});
 
 const stopRetention = startMessageRetention(sql, config.MESSAGE_RETENTION_DAYS);
+// Reading the catalog's public GitHub repositories needs no model either.
+const stopRepoWatch = startRepoWatch({ sql, checkHours: config.REPO_CHECK_HOURS });
 const stopBusinessRetention = startBusinessRetention(sql, config.BUSINESS_MESSAGE_RETENTION_DAYS);
 const stopBusinessReminders =
   anthropic && businessRemindersOn(anthropic, config) ? startBusinessReminders({ sql, anthropic, api: bot.api, config }) : async () => {};
@@ -134,7 +137,7 @@ const shutdown = async (signal: string) => {
   stopNameSync();
   stopRetention();
   stopBusinessRetention();
-  await settledWithin(REPLIES_WAIT_MS, [stopBusinessReminders(), stopPortraits(), stopWeeklyIdeas(), stopMemberReminders()]);
+  await settledWithin(REPLIES_WAIT_MS, [stopBusinessReminders(), stopPortraits(), stopWeeklyIdeas(), stopMemberReminders(), stopRepoWatch()]);
   // The bot does not start speaking up uninvited any more; a check under way finishes with the answers below.
   interjector?.stop();
   // The bot keeps serving while the chronicler call under way finishes; no new call starts. A call that takes longer

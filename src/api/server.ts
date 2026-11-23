@@ -7,7 +7,8 @@ import { z } from "zod";
 import { memberAliases } from "../core/aliases.js";
 import type { Sql } from "../core/db.js";
 import { FACT_KINDS, getFact, ownFacts, proposeFact, rejectFact, setFactHidden, visibleFacts } from "../core/facts.js";
-import { addUserProject, canEditProject, getProjectBySlug, hideProject, listProjects, mergeProjects, PROJECT_STATUSES, projectsOfUser, renameProject, setVote, updateProject } from "../core/projects.js";
+import { addUserProject, canEditProject, getProjectBySlug, hideProject, listProjects, mergeProjects, PROJECT_STATUSES, projectsOfUser, renameProject, setVote, statusDates, updateProject } from "../core/projects.js";
+import { commitUrl, repoHint, repoSnapshots, type RepoSnapshot } from "../core/repos.js";
 import { topChronicle, topLimitFor } from "../core/chronicle.js";
 import { addMemo, canNoteProject, deleteMemo, MAX_MEMO_CHARS, memosOf, ownMemos, projectMemos } from "../core/memos.js";
 import { cleanText, memoProblem, othersOf } from "../core/own-card.js";
@@ -17,6 +18,22 @@ import { approvedChats, chatsOfUser, setCurrentChat, type Chat } from "../core/c
 import { ensureMember, getPerson, peopleOfChat, resolveUser, setOptOut, setTagline, type Person, type User } from "../core/users.js";
 import { avatarPath, isAvatarSignature, type AvatarCache } from "./avatars.js";
 import { validateInitData } from "./init-data.js";
+
+/** What the bot read of a project's GitHub repository, as the project's page shows it: never more than the API gave. */
+function repoView(repo: RepoSnapshot) {
+  const { full_name: fullName } = repo;
+  if (!fullName) return { full_name: null, checked_at: repo.checked_at };
+  return {
+    full_name: fullName,
+    url: `https://github.com/${fullName}`,
+    archived: repo.archived,
+    pushed_at: repo.pushed_at,
+    committed_at: repo.committed_at,
+    release: repo.release,
+    commits: repo.commits.map((commit) => ({ ...commit, url: commitUrl(fullName, commit.sha) })),
+    checked_at: repo.checked_at,
+  };
+}
 
 export interface ApiDeps {
   sql: Sql;
@@ -408,9 +425,17 @@ export function createApi(deps: ApiDeps): Hono<Env> {
       WHERE project_id = ${project.id} AND chat_id = ${chatId}
       ORDER BY period_to DESC
       LIMIT 10`;
-    const [memos, canNote] = await Promise.all([projectMemos(sql, [project.id]), canNoteProject(sql, chatId, project.id, user.id)]);
+    const [memos, canNote, repos, statusSince] = await Promise.all([
+      projectMemos(sql, [project.id]),
+      canNoteProject(sql, chatId, project.id, user.id),
+      repoSnapshots(sql, [project.id]),
+      statusDates(sql, [project.id]),
+    ]);
+    const repo = repos.get(project.id);
     return c.json({
       project: withAuthorAvatars(project),
+      repo: repo ? repoView(repo) : null,
+      repo_hint: repo ? repoHint(project.status, statusSince.get(project.id), repo) : null,
       can_edit: await canEditProject(sql, project.id, user.id, isOwner(user)),
       memos,
       can_note: canNote,

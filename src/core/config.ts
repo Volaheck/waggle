@@ -64,6 +64,11 @@ const EnvSchema = z.object({
   PORTRAIT_MONTHLY_BUDGET_USD: z.coerce.number().min(0).default(20),
   /** Cap for one person's portrait a month; owners have only the caps above. */
   PORTRAIT_PERSON_MONTHLY_USD: z.coerce.number().min(0).default(3),
+  /**
+   * Every this many hours, at most 24, the bot reads the public GitHub repositories linked on catalog projects
+   * (src/worker/repos.ts); 0 turns it off. What the bot says of itself has it read them at least once a day.
+   */
+  REPO_CHECK_HOURS: z.coerce.number().min(0).max(24).default(24),
   WEB_DIST_DIR: z.string().default("web/dist"),
   /** Local development only: open the Mini App in a plain browser via a secret link printed at startup. */
   DEV_BROWSER_LOGIN: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),

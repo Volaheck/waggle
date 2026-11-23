@@ -76,6 +76,7 @@ describe("what the bot can and cannot do", () => {
       catalog: "2026-11-09",
       projectEdits: "2026-11-12",
       projectMerges: "2026-11-09",
+      repos: "2026-11-23",
       reminders: "2026-11-12",
       later: "2026-11-12",
       wishes: "2026-11-12",

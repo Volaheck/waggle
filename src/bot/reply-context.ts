@@ -14,11 +14,13 @@ import {
   projectForms,
   ratingBreakdown,
   STATUS_LABELS,
+  statusDates,
   type CatalogEvent,
   type FormerName,
   type ProjectListItem,
   type RatingBreakdown,
 } from "../core/projects.js";
+import { repoHint, repoSnapshots, type RepoSnapshot } from "../core/repos.js";
 import { hasForbiddenTopic, slugify, transliterateName, truncate } from "../core/text.js";
 import { recurringThemes, wordTerms, type Theme } from "../core/themes.js";
 import { peopleOfChat, SERVICE_TG_IDS, type Person } from "../core/users.js";
@@ -652,6 +654,38 @@ export function catalogHistoryBlock(events: CatalogEvent[], names: Map<number, s
     : "";
 }
 
+/**
+ * What the bot read of a project's public GitHub repository, for its line in <projects>: its latest commit (bots' left
+ * out), its latest release, and where the repository says otherwise than the status (repoHint), which stays its
+ * authors' word.
+ */
+function repoPart(project: ProjectListItem, statusSince: Date | undefined, repo: RepoSnapshot | undefined, clock: Clock): string {
+  if (!repo) return "";
+  const read = `github, read ${dateLabel(repo.checked_at, clock)}`;
+  if (!repo.full_name) return `${read}: no public repository at the link`;
+  const hint = repoHint(project.status, statusSince, repo);
+  const release = repo.release
+    ? `latest release ${line(repo.release.tag, 60)}${repo.release.prerelease ? " (a pre-release)" : ""} on ${dateLabel(new Date(repo.release.at), clock)}`
+    : "no releases";
+  const status = STATUS_LABELS[project.status] ?? project.status;
+  return `${read}: ${[
+    repo.committed_at ? `last commit ${dateLabel(repo.committed_at, clock)}` : repo.pushed_at ? "" : "nothing pushed yet",
+    release,
+    repo.archived ? "archived on GitHub" : "",
+    hint?.kind === "quiet" ? `no commit for ${hint.days} days while the status says ${status}: it looks paused, but the status is its authors' word` : "",
+    hint?.kind === "active_again" ? `committed to again while the status says ${status}` : "",
+  ]
+    .filter(Boolean)
+    .join(", ")}`;
+}
+
+/** The titles of a project's latest commits, for <project_details>: what is new in it, never its code. */
+function commitsLine(repo: RepoSnapshot | undefined, clock: Clock): string {
+  if (!repo?.full_name || repo.commits.length === 0) return "";
+  const commits = repo.commits.map((commit) => `${dateLabel(new Date(commit.at), clock)} “${line(commit.title, 100)}”`);
+  return `Latest commits in ${safe(repo.full_name)} on GitHub, newest first, bots' left out (read ${dateLabel(repo.checked_at, clock)}; titles only, you never see the code): ${commits.join("; ")}.`;
+}
+
 function projectDetailsBlock(input: {
   ranked: ProjectListItem[];
   picked: ProjectListItem[];
@@ -660,6 +694,7 @@ function projectDetailsBlock(input: {
   names: Map<number, string>;
   memos: Map<number, ProjectMemo[]>;
   statusSince: Map<number, Date>;
+  repos: Map<number, RepoSnapshot>;
   clock: Clock;
 }): string {
   const { ranked, clock } = input;
@@ -703,43 +738,12 @@ function projectDetailsBlock(input: {
       merged.length ? `Duplicates merged into it: ${merged.join("; ")}.` : "",
       milestones.length ? `Milestones of all time: ${milestones.join("; ")}.` : "",
       memoLine("Notes its authors wrote", (input.memos.get(project.id) ?? []).slice(0, PROJECT_MEMOS), clock, (memo) => safe(memo.display_name)),
+      commitsLine(input.repos.get(project.id), clock),
     ]
       .filter(Boolean)
       .join("\n");
   });
   return sections.length ? `<project_details>\n${sections.join("\n\n")}\n</project_details>` : "";
-}
-
-/**
- * When each project's status last changed: the first of the latest run of logged changes with that status (imports and
- * the chronicler log what a project became, people what it was too), else when the project was made. A change an
- * author asked for in the chat and took back with Undo never happened, nor did its Undo (the same request's message,
- * src/core/own-card.ts): a Redo is a change of its own.
- */
-async function statusDates(sql: Sql, projectIds: number[]): Promise<Map<number, Date>> {
-  if (projectIds.length === 0) return new Map();
-  const rows = await sql<{ id: number; since: Date }[]>`
-    SELECT p.id, coalesce(changed.at, p.created_at) AS since
-    FROM projects p
-    LEFT JOIN LATERAL (
-      SELECT at FROM (
-        SELECT c.at, c.after->>'status' AS status, lag(c.after->>'status') OVER (ORDER BY c.at, c.id) AS previous
-        FROM change_log c
-        WHERE c.entity = 'project' AND c.entity_id = p.id AND c.after ? 'status' AND c.op <> 'undo'
-          AND NOT EXISTS (
-            SELECT 1 FROM change_log u
-            WHERE u.entity = 'project' AND u.entity_id = c.entity_id AND u.op = 'undo' AND u.id > c.id AND c.source = 'user'
-              AND u.source_msg_ids = c.source_msg_ids AND u.actor_user_id IS NOT DISTINCT FROM c.actor_user_id
-              AND NOT EXISTS (
-                SELECT 1 FROM change_log redone
-                WHERE redone.entity = 'project' AND redone.entity_id = c.entity_id AND redone.op = 'update'
-                  AND redone.source_msg_ids = c.source_msg_ids AND redone.id > c.id AND redone.id < u.id))
-      ) AS logged
-      WHERE previous IS DISTINCT FROM status AND status = p.status
-      ORDER BY at DESC LIMIT 1
-    ) AS changed ON true
-    WHERE p.id = ANY(${projectIds}::int[])`;
-  return new Map(rows.map((row) => [row.id, row.since]));
 }
 
 /** Notes people wrote themselves, each with its date: their own word, current unless they say otherwise. */
@@ -1129,7 +1133,9 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
     return `- ${who}${tagline}${card.length ? ` | ${card.join("; ")}` : ""}`;
   });
 
-  const statusSince = await statusDates(sql, projects.slice(0, MAX_PROJECTS).map((project) => project.id));
+  // The catalog's lines, and the details of a project the question names wherever it stands in the rating.
+  const describedIds = [...new Set([...projects.slice(0, MAX_PROJECTS), ...picked].map((project) => project.id))];
+  const [statusSince, repos] = await Promise.all([statusDates(sql, describedIds), repoSnapshots(sql, describedIds)]);
   const catalog = projects.slice(0, MAX_PROJECTS).map((project, index) => {
     const links = [project.links.repo, project.links.site, ...(project.links.other ?? [])].filter(Boolean).join(" ");
     // A tagline written while a project stood still outlives its comeback: the status says where it is now.
@@ -1142,6 +1148,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
         project.tagline ? `“${project.tagline}”${stale ? ` (an old tagline: it says «${stale[0]}», but the status, ${project.status.replace("_", " ")}, is current)` : ""}` : "",
         project.stack.length ? `stack: ${project.stack.join(", ")}` : "",
         links ? `links: ${links}` : "",
+        repoPart(project, statusSince.get(project.id), repos.get(project.id), clock),
         signals.length ? `recent: ${signals.join("; ")}` : "",
       ]
         .filter(Boolean)
@@ -1199,6 +1206,7 @@ export async function buildReplyContext(sql: Sql, question: Question, options: R
       names,
       memos: groupBy(pickedMemos, (memo) => memo.project_id!),
       statusSince,
+      repos,
       clock,
     }),
     inFocusBlock({

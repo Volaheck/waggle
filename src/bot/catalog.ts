@@ -13,10 +13,12 @@ import {
   RATING_EXPLANATION,
   setVote,
   STATUS_LABELS,
+  statusDates,
   updateProject,
   type ProjectSort,
 } from "../core/projects.js";
 import { topChronicle, topLimitFor } from "../core/chronicle.js";
+import { repoHint, repoSnapshots } from "../core/repos.js";
 import {
   escapeHtml,
   isRepoHost,
@@ -384,7 +386,10 @@ export function registerCatalog(kit: BotKit): CatalogHandlers {
       `p_${project.slug}`,
     );
     if (app) keyboard.add(app);
-    await kit.show(ctx, projectCard(project, scope.chatId), keyboard, { edit });
+    const [repos, since] = await Promise.all([repoSnapshots(sql, [project.id]), statusDates(sql, [project.id])]);
+    const repo = repos.get(project.id);
+    const github = repo ? { repo, hint: repoHint(project.status, since.get(project.id), repo), timeZone: config.DISPLAY_TIMEZONE } : undefined;
+    await kit.show(ctx, projectCard(project, scope.chatId, github), keyboard, { edit });
   }
 
   const projects = scoped(projectsScreen);

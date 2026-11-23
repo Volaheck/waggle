@@ -259,6 +259,38 @@ export const RATING_EXPLANATION = [
   "Members' 👍 votes count too. Recent activity weighs more than old, and repeated mentions won't inflate the rating.",
 ].join("\n");
 
+/**
+ * When each project's status last changed: the first of the latest run of logged changes with that status (imports and
+ * the chronicler log what a project became, people what it was too), else when the project was made. A change an
+ * author asked for in the chat and took back with Undo never happened, nor did its Undo (the same request's message,
+ * src/core/own-card.ts): a Redo is a change of its own.
+ */
+export async function statusDates(sql: Queryable, projectIds: number[]): Promise<Map<number, Date>> {
+  if (projectIds.length === 0) return new Map();
+  const rows = await sql<{ id: number; since: Date }[]>`
+    SELECT p.id, coalesce(changed.at, p.created_at) AS since
+    FROM projects p
+    LEFT JOIN LATERAL (
+      SELECT at FROM (
+        SELECT c.at, c.after->>'status' AS status, lag(c.after->>'status') OVER (ORDER BY c.at, c.id) AS previous
+        FROM change_log c
+        WHERE c.entity = 'project' AND c.entity_id = p.id AND c.after ? 'status' AND c.op <> 'undo'
+          AND NOT EXISTS (
+            SELECT 1 FROM change_log u
+            WHERE u.entity = 'project' AND u.entity_id = c.entity_id AND u.op = 'undo' AND u.id > c.id AND c.source = 'user'
+              AND u.source_msg_ids = c.source_msg_ids AND u.actor_user_id IS NOT DISTINCT FROM c.actor_user_id
+              AND NOT EXISTS (
+                SELECT 1 FROM change_log redone
+                WHERE redone.entity = 'project' AND redone.entity_id = c.entity_id AND redone.op = 'update'
+                  AND redone.source_msg_ids = c.source_msg_ids AND redone.id > c.id AND redone.id < u.id))
+      ) AS logged
+      WHERE previous IS DISTINCT FROM status AND status = p.status
+      ORDER BY at DESC LIMIT 1
+    ) AS changed ON true
+    WHERE p.id = ANY(${projectIds}::int[])`;
+  return new Map(rows.map((row) => [row.id, row.since]));
+}
+
 export async function getProjectBySlug(sql: Sql, chatId: number, slug: string, viewerUserId?: number): Promise<ProjectListItem | undefined> {
   const all = await listProjects(sql, chatId, { viewerUserId });
   const wanted = slug.toLowerCase();

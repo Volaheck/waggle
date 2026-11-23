@@ -217,6 +217,10 @@ async function applyOptOut(tx: Queryable, userId: number, optedOut: boolean, sco
     // So are their wishes, those they asked for the whole chat included.
     await tx`DELETE FROM wishes WHERE user_id = ${userId} AND (${scope}::bigint IS NULL OR chat_id = ${scope}::bigint)`;
     await forgetNotes(tx, userId, scope);
+    // What the bot read of their projects' repositories goes too, and src/worker/repos.ts reads them no more.
+    await tx`
+      DELETE FROM project_repos r USING project_members pm, projects p
+      WHERE r.project_id = pm.project_id AND p.id = pm.project_id AND pm.user_id = ${userId} AND (${scope}::bigint IS NULL OR p.chat_id = ${scope}::bigint)`;
     // Notes on how the person uses others' projects are shown on those project cards, so they go as well.
     await tx`
       DELETE FROM project_signals s USING projects p
