@@ -639,7 +639,7 @@ describe.skipIf(!DATABASE_URL)("wishes", () => {
     ]);
     expect(context).not.toContain("развод");
     expect(block(context, "about_you")).toContain(`- Wishes about how you write (since 12 Nov 2026): ${CAPABILITIES.wishes.does}.`);
-    expect(CAPABILITIES.wishes.does).toContain("you keep it, post a receipt, and keep to it in your answers, uninvited lines and the weekly idea");
+    expect(CAPABILITIES.wishes.does).toContain("you keep it, post a receipt, and keep to it in your answers, uninvited lines, the weekly idea and, a wish for the whole chat, in your notes on what you learned");
     // An answer to someone else about anything still holds Bob's, which it may break by naming him, but not what he keeps quiet.
     const other = promptText(await buildReplyContext(sql, asking(chat, kit, "кто у нас лидирует в рейтинге?"), options));
     expect(block(other, "wishes")!.split("\n")).toContain("- Bob, for writing to them or about them: «не шути про мой вес»; «пиши мне короче»");

@@ -54,9 +54,10 @@ async function carryStanding(tx: Queryable, oldChatId: number, newChatId: number
   const carried: ChatStatus | null = old.status === "left" ? (holdsData ? "approved" : null) : old.status;
   if (carried) {
     await tx`
-      INSERT INTO chats (id, title, status, added_by, decided_by, decided_at, monthly_budget_usd, chronicle_paused_at, chronicle_pause_reason, chronicle_resumed_at, interjections)
+      INSERT INTO chats (id, title, status, added_by, decided_by, decided_at, monthly_budget_usd, chronicle_paused_at, chronicle_pause_reason, chronicle_resumed_at,
+                         interjections, ideas, announcements)
       VALUES (${newChatId}, ${old.title}, ${carried}, ${old.added_by}, ${old.decided_by}, ${old.decided_at}, ${old.monthly_budget_usd},
-              ${old.chronicle_paused_at}, ${old.chronicle_pause_reason}, ${old.chronicle_resumed_at}, ${old.interjections})
+              ${old.chronicle_paused_at}, ${old.chronicle_pause_reason}, ${old.chronicle_resumed_at}, ${old.interjections}, ${old.ideas}, ${old.announcements})
       ON CONFLICT (id) DO UPDATE SET
         status = CASE WHEN chats.status IN ('pending', 'left') THEN excluded.status ELSE chats.status END,
         decided_by = CASE WHEN chats.status IN ('pending', 'left') THEN excluded.decided_by ELSE chats.decided_by END,
@@ -68,8 +69,10 @@ async function carryStanding(tx: Queryable, oldChatId: number, newChatId: number
         chronicle_paused_at = coalesce(chats.chronicle_paused_at, excluded.chronicle_paused_at),
         chronicle_pause_reason = coalesce(chats.chronicle_pause_reason, excluded.chronicle_pause_reason),
         chronicle_resumed_at = greatest(chats.chronicle_resumed_at, excluded.chronicle_resumed_at),
-        -- An owner who turned the bot's interjections off on either id keeps them off.
-        interjections = chats.interjections AND excluded.interjections`;
+        -- An owner who turned the bot's interjections, weekly ideas or notes off on either id keeps them off.
+        interjections = chats.interjections AND excluded.interjections,
+        ideas = chats.ideas AND excluded.ideas,
+        announcements = chats.announcements AND excluded.announcements`;
   }
   await tx`UPDATE chats SET status = 'left' WHERE id = ${oldChatId}`;
   return carried;
@@ -167,6 +170,8 @@ async function moveChatData(tx: Queryable, from: number, to: number): Promise<Ch
   await tx`DELETE FROM reminders r USING members m WHERE r.chat_id = ${to} AND m.chat_id = ${to} AND m.user_id = r.user_id AND m.opted_out`;
   await moveWishes(tx, from, to, (column) => shiftedId(tx, column));
   await tx`UPDATE ideas SET chat_id = ${to}, msg_id = ${shiftedId(tx, "msg_id")}, evidence_msg_ids = ${shiftedIds(tx, "evidence_msg_ids")} WHERE chat_id = ${from}`;
+  // What the chat was told of stays told under the new id.
+  await tx`UPDATE announcements SET chat_id = ${to}, msg_id = ${shiftedId(tx, "msg_id")} WHERE chat_id = ${from}`;
   await tx`UPDATE llm_usage SET chat_id = ${to} WHERE chat_id = ${from}`;
   await tx`UPDATE users SET current_chat_id = ${to} WHERE current_chat_id = ${from}`;
 

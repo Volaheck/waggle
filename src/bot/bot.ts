@@ -12,6 +12,7 @@ import {
   legacyStats,
   registerChat,
   resumeChronicle,
+  setAnnouncements,
   setChatStatus,
   setCurrentChat,
   setIdeas,
@@ -31,6 +32,7 @@ import { chatWishes, keepsOut } from "../core/wishes.js";
 import { memberClock, PLACE_ZONES_PURPOSE, PLACE_ZONES_TIMEOUT_MS, placeZones } from "../core/zones.js";
 import { nextConsolidationRetryAt } from "../worker/consolidate.js";
 import { lastSuccessfulRunAt, passDueAt, pendingStats } from "../worker/extract.js";
+import type { Note, NoteStatus } from "../worker/announcements.js";
 import { setIdeaStatus, type IdeaStatus } from "../worker/ideas.js";
 import { chatBudgetUsd, nextExtractionRetryAt, passSchedule } from "../worker/scheduler.js";
 import { registerCatalog } from "./catalog.js";
@@ -163,6 +165,13 @@ const CARD_OFFER_BUTTONS = 6;
 const CARD_OFFERS_PER_CHAT_PER_DAY = 10;
 
 const CHAT_LABELS: Record<string, string> = { pending: "⏳ pending", approved: "✅ active", rejected: "🚫 rejected", left: "👋 left" };
+const NOTE_STATUS_LABELS: Record<NoteStatus, string> = {
+  pending: "still to be posted",
+  sending: "being posted",
+  posted: "posted",
+  failed: "not posted; its news waits for the next day",
+  held_back: "held back",
+};
 
 /** Calls that delete, edit, pin or react to a message: none of them may touch the request a later action came from. */
 const MESSAGE_CHANGES = new Set([
@@ -612,10 +621,12 @@ export function createBot(deps: BotDeps): {
     const nowhere = interjector ? "" : " (the bot speaks up nowhere: answers are off or INTERJECTIONS_PER_CHAT_PER_DAY is 0)";
     const interjections = chat.interjections ? `🗣 Speaks up uninvited: on${nowhere}` : `🤐 Speaks up uninvited: off${nowhere}`;
     const ideas = chat.ideas ? "💡 Weekly idea for improving the bot: on" : "💡 Weekly idea for improving the bot: off";
+    const notes = chat.announcements ? "📣 Notes on what the bot learned: on" : "📣 Notes on what the bot learned: off";
     const keyboard = (paused ? resumeButton(chat.id) : await legacyOffer(chat.id))?.row() ?? new InlineKeyboard();
     keyboard.text(chat.interjections ? "🤐 Stop speaking up" : "🗣 Let it speak up", `interject:${encodeChat(chat.id)}:${chat.interjections ? "off" : "on"}`);
     keyboard.row().text(chat.ideas ? "💡 No weekly ideas" : "💡 Weekly ideas", `ideas:${encodeChat(chat.id)}:${chat.ideas ? "off" : "on"}`);
-    return { html: `${head}\n${interjections}\n${ideas}`, keyboard };
+    keyboard.row().text(chat.announcements ? "📣 No notes on what it learned" : "📣 Notes on what it learned", `announce:${encodeChat(chat.id)}:${chat.announcements ? "off" : "on"}`);
+    return { html: `${head}\n${interjections}\n${ideas}\n${notes}`, keyboard };
   }
 
   bot.command("chats", async (ctx) => {
@@ -646,6 +657,16 @@ export function createBot(deps: BotDeps): {
     const chat = await setIdeas(sql, -Number(ctx.match[1]), ctx.match[2] === "on");
     if (!chat) return ctx.answerCallbackQuery({ text: "I don't know that chat" });
     await ctx.answerCallbackQuery({ text: chat.ideas ? "A weekly idea goes there" : "No more weekly ideas there" });
+    const { html, keyboard } = await chatEntry(chat);
+    return kit.show(ctx, html, keyboard, { edit: true });
+  });
+
+  bot.callbackQuery(/^announce:c(\d+):(on|off)$/, async (ctx) => {
+    const owner = await kit.identity(ctx.from);
+    if (!kit.isOwner(owner)) return ctx.answerCallbackQuery({ text: "That's up to the bot owner" });
+    const chat = await setAnnouncements(sql, -Number(ctx.match[1]), ctx.match[2] === "on");
+    if (!chat) return ctx.answerCallbackQuery({ text: "I don't know that chat" });
+    await ctx.answerCallbackQuery({ text: chat.announcements ? "It tells them when it learns something new" : "No more notes there" });
     const { html, keyboard } = await chatEntry(chat);
     return kit.show(ctx, html, keyboard, { edit: true });
   });
@@ -918,6 +939,8 @@ export function createBot(deps: BotDeps): {
         WHERE chat_id = ${chat.id} AND created_at >= (date_trunc('day', now() AT TIME ZONE ${zone}) AT TIME ZONE ${zone})`;
       const [idea] = await sql<{ title: string; status: string; created_at: Date }[]>`
         SELECT title, status, created_at FROM ideas WHERE chat_id = ${chat.id} ORDER BY created_at DESC LIMIT 1`;
+      const [note] = await sql<Pick<Note, "capabilities" | "ruled_out" | "status" | "reason" | "created_at">[]>`
+        SELECT capabilities, ruled_out, status, reason, created_at FROM announcements WHERE chat_id = ${chat.id} ORDER BY created_at DESC, id DESC LIMIT 1`;
       // A wish of the chat's to stay out of its conversations turns interjections off there, whatever /chats says.
       const keptOut = (await chatWishes(sql, chat.id)).find((wish) => keepsOut(wish.text));
       const lastLine = last
@@ -945,6 +968,11 @@ export function createBot(deps: BotDeps): {
             : idea
               ? `💡 Last weekly idea: “${escapeHtml(idea.title)}”, ${formatDate(idea.created_at, zone)}, ${idea.status === "proposed" ? "no decision yet" : idea.status}`
               : "💡 Weekly ideas: none yet; the first comes on an active week's afternoon",
+          !chat.announcements
+            ? "📣 Notes on what the bot learned: off here (/chats)"
+            : note
+              ? `📣 Last note on what the bot learned: ${formatDate(note.created_at, zone)}, ${countOf(note.capabilities.length + note.ruled_out.length, "new thing")}, ${NOTE_STATUS_LABELS[note.status]}${note.reason ? ` (${escapeHtml(note.reason)})` : ""}`
+              : "📣 Notes on what the bot learned: none yet; one comes the afternoon after it learns something new",
           counts?.unlinked?.length
             ? `Unlinked cards: ${counts.unlinked.map(escapeHtml).join(", ")} — /link @username Name in the chat, or /link Name as a reply to the person`
             : "All cards are linked",

@@ -111,16 +111,16 @@ export interface IdeaData {
 
 const attemptKey = (chatId: number) => `idea_attempt:${chatId}`;
 
-/** The hour of the day in `timeZone`. */
-function localHour(now: Date, timeZone: string): number {
-  return Number(new Intl.DateTimeFormat("en-GB", { hour: "2-digit", hourCycle: "h23", timeZone }).format(now));
+/** Whether it is the chat's afternoon or early evening in `timeZone`, when the bot posts what nobody asked for. */
+export function isPostingHour(now: Date, timeZone: string): boolean {
+  const hour = Number(new Intl.DateTimeFormat("en-GB", { hour: "2-digit", hourCycle: "h23", timeZone }).format(now));
+  return hour >= POST_FROM_HOUR && hour < POST_UNTIL_HOUR;
 }
 
 /** A week after the last attempt (a posted idea or a week with nothing to suggest), in the chat's afternoon. */
 export async function isIdeaDue(sql: Sql, chat: Chat, timeZone: string, now = new Date()): Promise<boolean> {
   if (!chat.ideas || chat.status !== "approved" || chat.chronicle_paused_at) return false;
-  const hour = localHour(now, timeZone);
-  if (hour < POST_FROM_HOUR || hour >= POST_UNTIL_HOUR) return false;
+  if (!isPostingHour(now, timeZone)) return false;
   const [attempt] = await sql<{ updated_at: Date }[]>`SELECT updated_at FROM app_state WHERE key = ${attemptKey(chat.id)}`;
   return !attempt || now.getTime() - attempt.updated_at.getTime() >= WEEK_MS;
 }

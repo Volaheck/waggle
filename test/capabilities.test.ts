@@ -51,7 +51,7 @@ describe("what the bot can and cannot do", () => {
     expect(Object.keys(CAPABILITIES)).toEqual(
       expect.arrayContaining([
         "answers", "taskMode", "chronicle", "cards", "factReview", "cardEdits", "notes", "notesFromMessages", "projectEdits", "projectMerges",
-        "reminders", "later", "wishes", "portraits", "interjections", "weeklyIdea", "miniApp",
+        "reminders", "later", "wishes", "portraits", "interjections", "weeklyIdea", "announcements", "miniApp",
       ]),
     );
     expect(Object.keys(LIMITS)).toEqual(expect.arrayContaining(["images", "runningCode", "sendingFiles"]));
@@ -83,6 +83,7 @@ describe("what the bot can and cannot do", () => {
       portraits: "2026-11-10",
       interjections: "2026-11-09",
       weeklyIdea: "2026-11-10",
+      announcements: "2026-11-23",
       miniApp: "2026-11-09",
       privacy: "2026-11-09",
       owners: "2026-11-09",

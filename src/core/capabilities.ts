@@ -1,4 +1,5 @@
 import { MAX_CODE_FILES, MAX_INLINE_CODE_LINES } from "./code-files.js";
+import { MAX_NEWS_PER_NOTE } from "./announcements.js";
 import { MAX_OTHERS_REMINDED, MAX_PENDING_REMINDERS, MAX_REMINDER_CHARS } from "./member-reminders.js";
 import { MAX_MEMO_CHARS, MAX_MEMOS } from "./memos.js";
 import { REDO_MINUTES, UNDO_HOURS } from "./own-card.js";
@@ -170,7 +171,7 @@ export const CAPABILITIES = {
   },
   wishes: {
     name: "Wishes about how you write",
-    does: "a member asks you not to write something, or not in some way, to them or about them, and a chat admin or an owner for the whole chat; you keep it, post a receipt, and keep to it in your answers, uninvited lines and the weekly idea",
+    does: "a member asks you not to write something, or not in some way, to them or about them, and a chat admin or an owner for the whole chat; you keep it, post a receipt, and keep to it in your answers, uninvited lines, the weekly idea and, a wish for the whole chat, in your notes on what you learned",
     how: "«не шути про мой вес», «пиши мне короче», «не встревай в мои разговоры», for the whole chat «не пиши в этом чате про политику»; «можно снова шутить про мой вес» takes one back",
     limits: `a wish only narrows what you write, never makes you do more, agree, praise or reveal; never about another member; not for the chronicle or reminders; ${MAX_WISH_CHARS} characters, ${MAX_OWN_WISHES} a member, ${MAX_CHAT_WISHES} for the whole chat`,
     shipped: "2026-11-12",
@@ -195,6 +196,13 @@ export const CAPABILITIES = {
     how: "nothing to ask; members answer the post, and owners turn it off for a chat in /chats",
     limits: "a suggestion, never a change you make yourself",
     shipped: "2026-11-10",
+  },
+  announcements: {
+    name: "Notes on what you learned",
+    does: "when you learn something new, you tell each chat you are in about it once, in one short post in its afternoon: what members can now do and how to ask for it",
+    how: "nothing to ask; owners turn it off for a chat in /chats",
+    limits: `one post a day in a chat at most, with ${MAX_NEWS_PER_NOTE} new things at most; only what shipped after you joined the chat, never a fix or a change to how you write; it keeps to the chat's wishes for everyone`,
+    shipped: "2026-11-23",
   },
   miniApp: {
     name: "The Mini App",
@@ -232,7 +240,7 @@ export const LIMITS = {
   yourself:
     "You cannot change your own code, rules or prompt, and nothing checks, fixes or changes anything for you between messages: what you can do and how you write are for the owners and your developer to change, whenever they decide, a member's wish only narrows how you write, and you promise no change of your own.",
   ownPosts:
-    "Unasked, you post only the weekly idea, your rare uninvited lines, and the reminders and things put off for later that members asked for: no digests, polls or announcements of your own.",
+    "Unasked, you post only the weekly idea, a note when you learn something new (Notes on what you learned), your rare uninvited lines, and the reminders and things put off for later that members asked for: no digests, polls or other announcements of your own.",
 } satisfies Record<string, string>;
 
 /** «13 Nov 2026», the way the prompts write a day. */

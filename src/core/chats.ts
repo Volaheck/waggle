@@ -28,6 +28,8 @@ export interface Chat {
   interjections: boolean;
   /** Whether the bot suggests an improvement to itself here once a week (src/worker/ideas.ts); an owner turns it off. */
   ideas: boolean;
+  /** Whether the bot tells the chat when it learns something new (src/worker/announcements.ts); an owner turns it off. */
+  announcements: boolean;
 }
 
 /** Rows imported before multi-chat support carry this chat id until an owner attaches them. */
@@ -83,6 +85,12 @@ export async function setInterjections(sql: Sql, chatId: number, on: boolean): P
 /** An owner lets the bot post its weekly idea in a chat, or stops it; undefined for an unknown chat. */
 export async function setIdeas(sql: Sql, chatId: number, on: boolean): Promise<Chat | undefined> {
   const [chat] = await sql<Chat[]>`UPDATE chats SET ideas = ${on} WHERE id = ${chatId} RETURNING *`;
+  return chat;
+}
+
+/** An owner lets the bot tell a chat what it newly learned, or stops it; undefined for an unknown chat. */
+export async function setAnnouncements(sql: Sql, chatId: number, on: boolean): Promise<Chat | undefined> {
+  const [chat] = await sql<Chat[]>`UPDATE chats SET announcements = ${on} WHERE id = ${chatId} RETURNING *`;
   return chat;
 }
 
