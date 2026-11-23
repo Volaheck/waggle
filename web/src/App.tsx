@@ -1346,12 +1346,19 @@ const REPO_HINTS: Record<RepoHint["kind"], { label: string; tone: string }> = {
   active_again: { label: "active again", tone: "var(--green)" },
 };
 
+/**
+ * «21 Nov», or «3 Mar 2024» in another year: a repository's dates go back years. `month`: «Mar 2024» in another year,
+ * for a stat's narrow cell.
+ */
+function shortDate(at: string, timeZone: string | undefined, { month = false }: { month?: boolean } = {}): string {
+  const date = new Date(at);
+  const year = (moment: Date) => moment.toLocaleDateString("en-CA", { timeZone }).slice(0, 4);
+  if (year(date) === year(new Date())) return date.toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone });
+  return date.toLocaleDateString("en-GB", { ...(month ? {} : { day: "numeric" }), month: "short", year: "numeric", timeZone });
+}
+
 function RepoSection({ repo, hint, index, timeZone }: { repo: RepoView; hint: RepoHint | null; index: number; timeZone?: string }) {
-  const year = (date: Date) => date.toLocaleDateString("en-CA", { timeZone }).slice(0, 4);
-  const day = (at: string) => {
-    const date = new Date(at);
-    return date.toLocaleDateString("en-GB", { day: "numeric", month: "short", ...(year(date) === year(new Date()) ? {} : { year: "numeric" }), timeZone });
-  };
+  const day = (at: string) => shortDate(at, timeZone);
   return (
     <Section label="github" index={index}>
       <Card>
@@ -1521,7 +1528,7 @@ function ProjectScreen({ slug, go }: { slug: string; go: Go }) {
         )}
         <div className="stats">
           <Stat value={project.signals_count ?? project.recent_signals.length} label="signals" />
-          <Stat value={project.last_activity_at ? new Date(project.last_activity_at).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone }) : "—"} label="active" />
+          <Stat value={project.last_activity_at ? shortDate(project.last_activity_at, timeZone, { month: true }) : "—"} label="active" />
           <Stat value={project.authors.length} label={project.authors.length === 1 ? "author" : "authors"} />
         </div>
         <div className="hero-actions">
